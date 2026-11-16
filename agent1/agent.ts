@@ -5,7 +5,7 @@ import { Vercel, type VProject } from './vercel.js'
 import { GitHub, type RepoReport } from './github.js'
 import { Q, SCHEMA_ALLOW, SupaMgmt, probeAnon } from './supa.js'
 import { summarize } from './gemini.js'
-import { analyzeProject, analyzeRls, classifyDbChange, countIssues, overall, PUBLIC_PREFIX, type DeployItem, type EnvItem, type Issue } from './checks.js'
+import { analyzeProject, analyzeRls, classifyDbChange, countIssues, overall, sortIssues, PUBLIC_PREFIX, type DeployItem, type EnvItem, type Issue } from './checks.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
@@ -56,19 +56,25 @@ async function collectVercel(ctx: Ctx, o: { deployments: boolean; env: boolean }
   const v = new Vercel(ctx.cfg, ctx.calls)
   const projects = await v.listProjects()
   const issues: Issue[] = []
-  const data = []
-  for (const p of projects) {
-    let deployments: DeployItem[] | null = null
-    let env: EnvItem[] | null = null
-    if (o.deployments) deployments = await v.listDeployments(p.id)
-    if (o.env) env = await v.listEnv(p.id)
-    issues.push(...analyzeProject(p.name, deployments, env, ctx.cfg.requiredEnv[p.name] || []))
-    data.push({
-      id: p.id, name: p.name, framework: p.framework, repo: p.repo,
-      deployments: deployments ? deployments.slice(0, 5).map(d => ({ state: d.state, target: d.target, branch: d.branch, error: d.error || undefined, at: new Date(d.createdAt).toISOString() })) : undefined,
-      env: env ? env.map(e => ({ key: e.key, type: e.type, targets: e.targets })) : undefined
-    })
-  }
+  const per = await Promise.all(projects.map(async p => {
+    try {
+      const deployments = o.deployments ? await v.listDeployments(p.id) : null
+      const env = o.env ? await v.listEnv(p.id) : null
+      return {
+        issues: analyzeProject(p.name, deployments, env, ctx.cfg.requiredEnv[p.name] || []),
+        entry: {
+          id: p.id, name: p.name, framework: p.framework, repo: p.repo,
+          deployments: deployments ? deployments.slice(0, 5).map(d => ({ state: d.state, target: d.target, branch: d.branch, error: d.error || undefined, at: new Date(d.createdAt).toISOString() })) : undefined,
+          env: env ? env.map(e => ({ key: e.key, type: e.type, targets: e.targets })) : undefined
+        } as any
+      }
+    } catch (e) {
+      // one slow/failed project must not hide the others
+      return { issues: [{ severity: 'warn', area: 'vercel', message: 'Could not read project: ' + errMsg(e), target: p.name } as Issue], entry: { id: p.id, name: p.name, error: errMsg(e) } as any }
+    }
+  }))
+  const data = per.map(x => x.entry)
+  for (const x of per) issues.push(...x.issues)
   if (!projects.length) issues.push({ severity: 'warn', area: 'vercel', message: 'No Vercel projects visible to this token' + (ctx.cfg.vercelProjects.length ? ' (check AGENT1_VERCEL_PROJECTS)' : '') })
   return { available: true, data: { projects: data }, issues }
 }
@@ -114,11 +120,12 @@ async function healthReport(ctx: Ctx): Promise<Out> {
     safe('Supabase', 'supabase', collectRls(ctx)),
     safe('GitHub', 'github', collectGithub(ctx))
   ])
-  const issues = [...vercel.issues, ...rls.issues, ...gh.issues]
+  const issues = sortIssues([...vercel.issues, ...rls.issues, ...gh.issues])
   const comp = (name: string, p: Part<unknown>) => ({ component: 'agent1_' + name, status: (!p.available ? 'degraded' : p.issues.some(i => i.severity === 'critical' || i.severity === 'error') ? 'degraded' : 'ok') as 'ok' | 'degraded', details: { reason: p.reason || null } })
   await ctx.store.health([comp('vercel', vercel), comp('supabase', rls), comp('github', gh)])
   const counts = countIssues(issues)
-  const digest = { overall: overall(issues), counts, issues: issues.slice(0, 40), vercel_projects: (vercel.data?.projects || []).map((p: any) => ({ name: p.name, latest: p.deployments?.[0]?.state })) }
+  const digest = { overall: overall(issues), counts, issues: issues.slice(0, 40), // already sorted: critical first
+    vercel_projects: (vercel.data?.projects || []).map((p: any) => ({ name: p.name, latest: p.deployments?.[0]?.state })) }
   const ai = await summarize(ctx.cfg, digest)
   if (ai.status || ai.error) await ctx.store.usage({ provider: 'gemini', model: ai.model, endpoint: 'generateContent', tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, status_code: ai.status || null, cost_estimate: (ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1e6 })
   return { result: { generated_at: now(), overall: overall(issues), counts, issues, vercel, supabase: rls, github: gh, ai_summary: ai.text, ai_note: ai.text ? undefined : ai.error } }
@@ -126,7 +133,7 @@ async function healthReport(ctx: Ctx): Promise<Out> {
 
 async function partReport(ctx: Ctx, p: Part<any>): Promise<Out> {
   if (!p.available && p.reason) throw new AgentError(p.reason, 503, 'not_configured')
-  return { result: { generated_at: now(), overall: overall(p.issues), counts: countIssues(p.issues), issues: p.issues, ...p.data } }
+  return { result: { generated_at: now(), overall: overall(p.issues), counts: countIssues(p.issues), issues: sortIssues(p.issues), ...p.data } }
 }
 
 async function schemaReport(ctx: Ctx, params: any): Promise<Out> {

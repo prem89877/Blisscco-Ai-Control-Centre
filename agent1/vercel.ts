@@ -15,11 +15,14 @@ export class Vercel {
     for (const [k, v] of Object.entries(q)) u.searchParams.set(k, String(v))
     if (this.cfg.vercelTeamId) u.searchParams.set('teamId', this.cfg.vercelTeamId)
     this.calls.vercel = (this.calls.vercel || 0) + 1
-    const r = await jfetch(u.toString(), {
+    const init = {
       method,
       headers: { Authorization: 'Bearer ' + this.cfg.vercelToken, 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body)
-    })
+    }
+    let r
+    try { r = await jfetch(u.toString(), init, 30000) } // slow mobile networks: 30s
+    catch (e) { if (method !== 'GET') throw e; r = await jfetch(u.toString(), init, 30000) } // one retry, reads only
     if (r.status === 401 || r.status === 403) throw new AgentError('Vercel token invalid or lacks access (' + r.status + ')', 502, 'vercel_auth')
     if (!r.ok) throw new AgentError('Vercel API ' + r.status + ': ' + String(r.body && r.body.error && r.body.error.message || 'request failed'), 502, 'vercel')
     return r.body

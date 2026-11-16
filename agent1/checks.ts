@@ -55,11 +55,23 @@ export function analyzeRls(tables: TableRow[], policies: PolicyRow[]): Issue[] {
   const out: Issue[] = []
   const add = (severity: Sev, message: string, target: string) => out.push({ severity, area: 'supabase', message, target })
   const polCount = new Map<string, number>()
-  for (const p of policies) polCount.set(p.schema + '.' + p.tbl, (polCount.get(p.schema + '.' + p.tbl) || 0) + 1)
+  const anonPol = new Map<string, { write: boolean; read: boolean }>()
+  for (const p of policies) {
+    const id = p.schema + '.' + p.tbl
+    polCount.set(id, (polCount.get(id) || 0) + 1)
+    if (/(anon|public)/.test(p.roles)) {
+      const a = anonPol.get(id) || { write: false, read: false }
+      if (['ALL', 'INSERT', 'UPDATE', 'DELETE'].includes(p.cmd)) a.write = true
+      if (['ALL', 'SELECT'].includes(p.cmd)) a.read = true
+      anonPol.set(id, a)
+    }
+  }
+  const denyAll: string[] = []
 
   for (const t of tables) {
     const id = t.schema + '.' + t.tbl
     const sens = SENSITIVE_NAME.test(t.tbl)
+    const ap = anonPol.get(id) || { write: false, read: false }
     if (!t.rls && t.schema !== 'storage') {
       add(t.schema === 'ai_control' || sens ? 'critical' : t.schema === 'public' ? 'error' : 'warn', 'RLS is disabled', id)
     }
@@ -67,25 +79,37 @@ export function analyzeRls(tables: TableRow[], policies: PolicyRow[]): Issue[] {
     if (t.schema === 'ai_control' && anonAny) add('critical', 'anon role has privileges on an ai_control table', id)
     if (t.schema === 'ai_control' && (t.auth_delete || t.auth_truncate)) add('error', 'authenticated role can delete/truncate (Phase 1 design grants none)', id)
     if (t.schema !== 'ai_control' && t.schema !== 'storage') {
-      if (t.anon_insert || t.anon_update || t.anon_delete || t.anon_truncate) add(sens ? 'critical' : 'error', 'anon role has write privileges', id)
-      else if (t.anon_select && sens) add('error', 'anon role can SELECT a sensitive table', id)
+      const live = !t.rls || ap.write // anon writes can actually succeed
+      if (t.anon_insert || t.anon_update || t.anon_delete || t.anon_truncate) {
+        if (live) add(sens ? 'critical' : 'error', 'anon role has write privileges AND no RLS barrier (writes can succeed)', id)
+        else add('warn', 'anon has write GRANT but RLS currently blocks it (defense-in-depth only; check the app before revoking)', id)
+      } else if (t.anon_select && sens) {
+        if (!t.rls || ap.read) add('error', 'anon role can read a sensitive table', id)
+        else add('warn', 'anon has SELECT GRANT on a sensitive table but RLS blocks it (defense-in-depth only)', id)
+      }
       if (t.auth_truncate && sens) add('warn', 'authenticated role has TRUNCATE on a sensitive table', id)
     }
-    if (t.rls && !polCount.get(id)) add('info', 'RLS on with no policies (deny-all)', id)
+    if (t.rls && !polCount.get(id)) denyAll.push(id)
   }
+  if (denyAll.length) out.push({ severity: 'info', area: 'supabase', target: denyAll.length + ' tables', message: 'RLS on with no policies = deny-all (normal for server-only tables): ' + denyAll.join(', ').slice(0, 700) })
 
   for (const p of policies) {
     const id = p.schema + '.' + p.tbl + ' / ' + p.policy
     const open = /^\(?\s*true\s*\)?$/i.test(p.using_expr.trim()) || /^\(?\s*true\s*\)?$/i.test(p.check_expr.trim())
     const pub = /(anon|public)/.test(p.roles)
     const write = ['ALL', 'INSERT', 'UPDATE', 'DELETE'].includes(p.cmd)
-    if (open && pub && write) add('critical', 'Policy allows anonymous/public writes with no condition', id)
+    if (open && pub && write) add('critical', `Policy allows anonymous/public ${p.cmd} with no condition (fine only if intentional, e.g. a public signup form; add rate limits)`, id)
     else if (open && pub && SENSITIVE_NAME.test(p.tbl)) add('error', 'Policy exposes a sensitive table to anon/public with no condition', id)
     if (p.schema === 'ai_control' && p.policy !== 'owners_select_self' && !/is_owner/.test(p.using_expr + p.check_expr)) {
       add('error', 'ai_control policy does not use is_owner()', id)
     }
   }
   return out
+}
+
+const RANK: Record<Sev, number> = { critical: 0, error: 1, warn: 2, info: 3 }
+export function sortIssues(issues: Issue[]): Issue[] {
+  return [...issues].sort((a, b) => RANK[a.severity] - RANK[b.severity])
 }
 
 export function countIssues(issues: Issue[]) {

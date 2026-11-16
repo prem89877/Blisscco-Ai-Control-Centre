@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { loadConfig } from './config.js'
 import { redact, fingerprint } from './util.js'
-import { analyzeProject, analyzeRls, assertReadOnlySql, classifyDbChange } from './checks.js'
+import { analyzeProject, analyzeRls, assertReadOnlySql, classifyDbChange, sortIssues } from './checks.js'
 import { isEnvFile } from './github.js'
 import { handleRequest } from './server.js'
 import { makeCtx, runAction } from './agent.js'
@@ -128,6 +128,14 @@ test('analyzeProject flags failures, missing and exposed env', () => {
   const m = i.map(x => x.severity + ':' + x.message).join('|')
   assert.match(m, /error:Latest production deployment failed/); assert.match(m, /critical:VITE_SERVICE_ROLE_KEY/); assert.match(m, /error:Required env var missing: MISSING_ONE/); assert.match(m, /warn:DB_PASSWORD is stored as plain/)
 })
+test('analyzeRls: grant-only anon writes are warn, deny-all info is collapsed, critical sorts first', () => {
+  const t = (o: any) => ({ schema: 'public', tbl: 'x', rls: true, anon_select: false, anon_insert: false, anon_update: false, anon_delete: false, auth_select: true, auth_insert: false, auth_update: false, auth_delete: false, ...o })
+  const i = analyzeRls([t({ tbl: 'admins', anon_insert: true }), t({ tbl: 'a1' }), t({ tbl: 'a2' }), t({ tbl: 'push', anon_insert: true })], [{ schema: 'public', tbl: 'push', policy: 'open', cmd: 'INSERT', roles: '{anon}', using_expr: '', check_expr: 'true' }])
+  assert.equal(i.find(x => x.target === 'public.admins')!.severity, 'warn')
+  assert.equal(i.find(x => x.target === 'public.push')!.severity, 'error')
+  assert.equal(i.filter(x => x.severity === 'info').length, 1)
+  assert.equal(sortIssues(i)[0].severity, 'critical')
+})
 test('analyzeRls flags disabled RLS, anon grants and open policies', () => {
   const t = (o: any) => ({ schema: 'public', tbl: 'x', rls: true, anon_select: false, anon_insert: false, anon_update: false, anon_delete: false, auth_select: true, auth_insert: false, auth_update: false, auth_delete: false, ...o })
   const i = analyzeRls([t({ tbl: 'financial_ledger', rls: false }), t({ schema: 'ai_control', tbl: 'tasks', anon_select: true }), t({ tbl: 'ads', anon_insert: true })], [{ schema: 'public', tbl: 'ads', policy: 'p', cmd: 'ALL', roles: '{anon}', using_expr: 'true', check_expr: '' }])
@@ -171,6 +179,17 @@ test('health_report: tasks/logs/usage/health written, read-only calls, no secret
   assert.equal(vercelWrites.length, 0)
   const everything = JSON.stringify([r.body, db])
   for (const s of [SERVICE, VTOKEN, SBTOKEN, GHTOKEN, GEMKEY]) assert.ok(!everything.includes(s), 'leaked ' + s.slice(0, 6))
+})
+test('one failing Vercel project does not hide the others', async () => {
+  reset()
+  const orig = globalThis.fetch
+  globalThis.fetch = (async (u: any, i: any) => String(u).includes('/v9/projects/prj_1/env') && (i?.method || 'GET') === 'GET' ? new Response('{"error":{"message":"boom"}}', { status: 500 }) : fake(u, i)) as any
+  try {
+    const r: any = await post({ action: 'env_audit' })
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.ok(r.body.result.issues.some((i: any) => /Could not read project/.test(i.message)))
+    assert.equal(r.body.result.projects[0].name, 'ai-control-center')
+  } finally { globalThis.fetch = orig }
 })
 test('env_audit returns key names only, never values', async () => {
   reset(); envs[0].value = 'LEAKME_VALUE'
