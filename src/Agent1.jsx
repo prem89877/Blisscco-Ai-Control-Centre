@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
-import { Badge, Err, Empty, usePoll, q, timeAgo } from './ui.jsx'
+import { Badge, Err, CodeBlock, usePoll, q, timeAgo } from './ui.jsx'
 
 export async function callAgent1(action, params = {}) {
   const { data } = await supabase.auth.getSession()
@@ -35,26 +35,31 @@ export function useAgent1Heartbeat(enabled) {
 
 function Report({ res }) {
   const r = res.result || {}
+  const tone = r.overall === 'critical' ? 'bad' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'info' : 'good'
+  const badge = r.overall === 'critical' ? 'error' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'awaiting_approval' : 'ok'
+  const issues = (r.issues || []).map(i => '[' + String(i.severity).toUpperCase() + '] ' + (i.target ? i.target + ': ' : '') + i.message).join('\n')
   return (
     <div className="card">
-      <div className="row"><b>Result</b><Badge s={r.overall === 'critical' ? 'error' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'awaiting_approval' : 'ok'} /></div>
-      {r.ai_summary && <pre>{r.ai_summary}</pre>}
-      {r.ai_note && <div className="sub">AI summary unavailable: {r.ai_note}</div>}
-      {res.status === 'awaiting_approval' && <div className="sub">{r.next}</div>}
-      {(r.issues || []).map((i, n) => (
-        <div key={n} style={{ marginTop: 6 }}><span className={'badge ' + (SEV[i.severity] || 'mute')}>{i.severity}</span> <span className="sub">{i.target ? i.target + ': ' : ''}{i.message}</span></div>
-      ))}
-      {r.issues && r.issues.length === 0 && <div className="sub">No issues found.</div>}
+      <div className="row"><b>Result</b><Badge s={badge} /></div>
+      {r.ai_summary && <CodeBlock label="summary" tone={tone} text={r.ai_summary} />}
+      {r.ai_note && <CodeBlock label="ai note" tone="warn" text={'AI summary unavailable: ' + r.ai_note} />}
+      {res.status === 'awaiting_approval' && r.next && <CodeBlock label="next step" tone="info" text={r.next} />}
+      {issues && <CodeBlock label={'issues (' + r.issues.length + ')'} tone={tone === 'good' ? 'warn' : tone} text={issues} />}
+      {r.issues && r.issues.length === 0 && <CodeBlock label="status" tone="good" text="No issues found." />}
       {(r.deployments || []).map((d, n) => (
-        <div key={n} style={{ marginTop: 8 }}><b>{d.project}</b> <span className="sub">{d.state} {d.target} {d.branch || ''}</span><pre>{(d.log_tail || []).join('\n')}</pre></div>
+        <CodeBlock key={n} label={'error log - ' + d.project + ' - ' + d.state + ' ' + (d.target || '') + ' ' + (d.branch || '')} tone="bad" wrap={false}
+          text={(d.log_tail || []).join('\n') || 'No log lines.'} />
       ))}
-      {(r.repos || []).map((g, n) => (
-        <div key={n} style={{ marginTop: 8 }}><b>{g.repo}</b> <span className="sub">{g.found ? 'branch ' + g.defaultBranch : 'not found'}</span>
-          {(g.lastCommits || []).map((c, i) => <div key={'c' + i} className="sub">commit {c.sha} {c.message}</div>)}
-          {(g.runs || []).map((x, i) => <div key={'r' + i} className="sub">run {x.name}: {x.status}/{x.conclusion || '-'} ({x.branch})</div>)}
-        </div>
-      ))}
-      <details style={{ marginTop: 8 }}><summary className="sub">Raw data</summary><pre>{JSON.stringify(r, null, 2).slice(0, 8000)}</pre></details>
+      {(r.repos || []).map((g, n) => {
+        const lines = [g.found ? 'branch: ' + g.defaultBranch : 'not found']
+        ;(g.lastCommits || []).forEach(c => lines.push('commit ' + c.sha + ' ' + c.message))
+        ;(g.runs || []).forEach(x => lines.push('run ' + x.name + ': ' + x.status + '/' + (x.conclusion || '-') + ' (' + x.branch + ')'))
+        return <CodeBlock key={n} label={'github - ' + g.repo} tone={g.found ? 'good' : 'bad'} text={lines.join('\n')} />
+      })}
+      <details style={{ marginTop: 8 }}>
+        <summary className="sub" style={{ cursor: 'pointer' }}>Raw data</summary>
+        <CodeBlock label="json" wrap={false} text={JSON.stringify(r, null, 2).slice(0, 8000)} />
+      </details>
     </div>
   )
 }
@@ -120,10 +125,10 @@ function ApplyDb({ a, onDone, setErr }) {
   return (
     <div className="card">
       <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
-      <pre>{a.details.sql}</pre>
+      <CodeBlock label="sql" wrap={false} text={a.details.sql} />
       <label className="sub" style={{ display: 'block', marginBottom: 8 }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> I confirm Agent 1 may run this SQL on the ai_control schema</label>
       <button className="btn ok" disabled={busy || !ack} onClick={go}>{busy ? 'Running...' : 'Run SQL now'}</button>
-      {out && <div className="sub" style={{ marginTop: 6 }}>{out}</div>}
+      {out && <CodeBlock label="success" tone="good" text={out} />}
     </div>
   )
 }
@@ -194,7 +199,7 @@ function ApplyRedeploy({ a, onDone, setErr }) {
       <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
       {d.production && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> I confirm this PRODUCTION redeploy</label>}
       <button className="btn ok" disabled={busy || (d.production && !ack)} onClick={go}>{busy ? 'Starting...' : 'Redeploy now'}</button>
-      {out && <div className="sub" style={{ marginTop: 6 }}>{out}</div>}
+      {out && <CodeBlock label="success" tone="good" text={out} />}
     </div>
   )
 }
@@ -239,19 +244,19 @@ export default function Agent1Panel() {
 
   return (
     <>
-      <h2>Agent 1 console</h2>
       <Err msg={err} />
       {hb && (
         <div className="card">
-          <div className="row"><b>Setup</b><span className="sub">model: {hb.model}</span></div>
+          <div className="row"><b>Setup</b><span className="sub">{hb.model}</span></div>
           <div className="filters" style={{ marginTop: 6 }}>{SETUP.map(([k, l]) => <span key={k} className={'badge ' + (hb.ready[k] ? 'good' : 'mute')}>{l}{hb.ready[k] ? ' ✓' : ' ✗'}</span>)}</div>
         </div>
       )}
+      <div className="sec-title">Run a check</div>
       <div className="actions" style={{ marginBottom: 10 }}>
-        {RUNS.map(([a, l]) => <button key={a} className="btn" disabled={!!busy} onClick={() => run(a)}>{busy === a ? 'Running...' : l}</button>)}
+        {RUNS.map(([a, l]) => <button key={a} className="btn ghost" disabled={!!busy} onClick={() => run(a)}>{busy === a ? 'Running...' : l}</button>)}
       </div>
       {res && <Report res={res} />}
-      {applicable.length > 0 && <><h2>Approved - ready to apply</h2>{applicable.map(a => a.details.kind === 'db_change' ? <ApplyDb key={a.id} a={a} onDone={reload} setErr={setErr} /> : a.details.kind === 'redeploy' ? <ApplyRedeploy key={a.id} a={a} onDone={reload} setErr={setErr} /> : <Apply key={a.id} a={a} onDone={reload} setErr={setErr} />)}</>}
+      {applicable.length > 0 && <><div className="sec-title">Approved - ready to apply</div>{applicable.map(a => a.details.kind === 'db_change' ? <ApplyDb key={a.id} a={a} onDone={reload} setErr={setErr} /> : a.details.kind === 'redeploy' ? <ApplyRedeploy key={a.id} a={a} onDone={reload} setErr={setErr} /> : <Apply key={a.id} a={a} onDone={reload} setErr={setErr} />)}</>}
       <EnvRequest onResult={setRes} setErr={setErr} />
       <RedeployRequest onResult={setRes} setErr={setErr} />
       <DbProposal onResult={setRes} setErr={setErr} />

@@ -10,16 +10,17 @@ import ApiUsage from './ApiUsage.jsx'
 import Health from './Health.jsx'
 import Settings from './Settings.jsx'
 import { useAgent1Heartbeat } from './Agent1.jsx'
+import { Icon } from './ui.jsx'
 
 const TABS = [
-  ['overview', '🏠', 'Overview'],
-  ['agents', '🤖', 'Agents'],
-  ['tasks', '✅', 'Tasks'],
-  ['logs', '📜', 'Logs'],
-  ['approvals', '🛡️', 'Approvals'],
-  ['usage', '📊', 'API Usage'],
-  ['health', '❤️', 'Health'],
-  ['settings', '⚙️', 'Settings']
+  ['overview', 'home', 'Overview'],
+  ['agents', 'bot', 'Agents'],
+  ['tasks', 'tasks', 'Tasks'],
+  ['logs', 'logs', 'Logs'],
+  ['approvals', 'shield', 'Approvals'],
+  ['usage', 'chart', 'API Usage'],
+  ['health', 'heart', 'Health'],
+  ['settings', 'gear', 'Settings']
 ]
 
 export default function App() {
@@ -77,12 +78,12 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="top"><span>AI Control Center</span><span className="sub">{TABS.find(t => t[0] === tab)[2]}</span></div>
+      <div className="top"><span>Blisscco AI</span><span className="sub">{TABS.find(t => t[0] === tab)[2]}</span></div>
       <div className="main">{page}</div>
       <div className="nav">
         {TABS.map(([id, icon, label]) => (
           <button key={id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>
-            <span>{icon}</span>{label}
+            <Icon n={icon} />{label}
           </button>
         ))}
       </div>
