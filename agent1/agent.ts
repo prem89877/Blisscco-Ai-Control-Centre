@@ -5,11 +5,11 @@ import { Vercel, type VProject } from './vercel.js'
 import { GitHub, type RepoReport } from './github.js'
 import { Q, SCHEMA_ALLOW, SupaMgmt, probeAnon } from './supa.js'
 import { summarize } from './gemini.js'
-import { analyzeProject, analyzeRls, classifyDbChange, countIssues, overall, sortIssues, PUBLIC_PREFIX, type DeployItem, type EnvItem, type Issue } from './checks.js'
+import { analyzeProject, analyzeRls, classifyDbChange, classifyExecutableSql, countIssues, overall, sortIssues, PUBLIC_PREFIX, type DeployItem, type EnvItem, type Issue } from './checks.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
-export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change'] as const
+export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'deploy_logs', 'request_redeploy', 'apply_redeploy'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -215,12 +215,102 @@ async function proposeDbChange(ctx: Ctx, p: any): Promise<Out> {
   const title = String(p.title || '').trim().slice(0, 120)
   const sql = String(p.sql || '')
   if (!title) throw new AgentError('title required')
-  const c = classifyDbChange(sql)
+  const c = classifyExecutableSql(sql)
   if (!c.ok) throw new AgentError('DB change blocked: ' + c.reason, 403, 'db_change_blocked')
   return withTask(ctx, 'propose_db_change', 'DB change proposal: ' + title, { title }, async taskId => {
-    const ap = await ctx.store.createApproval({ task_id: taskId, title: 'DB change: ' + title, details: { kind: 'db_change', sql, executed_by_agent: false, note: 'Agent 1 never runs DB changes. After approval, run this manually in the Supabase SQL Editor.' } })
+    const ap = await ctx.store.createApproval({ task_id: taskId, title: 'DB change: ' + title, details: { kind: 'db_change', sql, executed_by_agent: false, note: 'After approval, press Run SQL in the Agent 1 console (ai_control only, one transaction), or run it manually in the Supabase SQL Editor.' } })
     await ctx.store.log('warn', 'agent1_approval_requested', 'DB change: ' + title, { approval_id: ap.id }, taskId, ctx.actor.id)
-    return { status: 'awaiting_approval', result: { approval_id: ap.id, next: 'Approve, then run the SQL yourself in the Supabase SQL Editor.' } }
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, next: 'Approve in the Approvals tab, then press Run SQL in the Agent 1 console.' } }
+  })
+}
+
+async function applyDbChange(ctx: Ctx, p: any): Promise<Out> {
+  const ap = await ctx.store.getApproval(String(p.approval_id || ''))
+  const d = ap && ap.details
+  if (!ap || !d || d.kind !== 'db_change') throw new AgentError('Approval not found', 404)
+  if (ap.status !== 'approved') throw new AgentError('Not approved yet (status: ' + ap.status + ')', 409, 'not_approved')
+  if (d.executed_at) throw new AgentError('Already executed', 409, 'already_executed')
+  if (!ap.decided_at || Date.now() - new Date(ap.decided_at).getTime() > 24 * 3600 * 1000) throw new AgentError('Approval older than 24h; request again', 409, 'expired')
+  if (p.db_ack !== 'RUN-SQL') throw new AgentError('Explicit confirmation needed (db_ack)', 403, 'db_ack')
+  const c = classifyExecutableSql(String(d.sql || ''))
+  if (!c.ok) throw new AgentError('DB change blocked: ' + c.reason, 403, 'db_change_blocked')
+  return withTask(ctx, 'apply_db_change', 'Run SQL: ' + ap.title, { approval_id: ap.id }, async () => {
+    const claimed = await ctx.store.claimApproval(ap.id, { ...d, executed_at: now(), executed_by: ctx.actor.id, executed_by_agent: true })
+    if (!claimed) throw new AgentError('Already executed', 409, 'already_executed')
+    try {
+      const rows = await new SupaMgmt(ctx.cfg, ctx.calls).rwExec(String(d.sql))
+      if (ap.task_id) await ctx.store.updateTask(ap.task_id, { status: 'succeeded', finished_at: now(), result: { applied: true, rows: rows.length } })
+      await ctx.store.log('success', 'agent1_db_applied', ap.title, { approval_id: ap.id }, null, ctx.actor.id)
+      return { result: { applied: true, rows: rows.length, preview: rows.slice(0, 5) } }
+    } catch (e) {
+      await ctx.store.patchApproval(ap.id, { details: { ...d, executed_at: null, last_error: errMsg(e).slice(0, 300) } }).catch(() => {})
+      throw e
+    }
+  })
+}
+
+async function githubStatus(ctx: Ctx): Promise<Out> {
+  const g = await collectGithub(ctx)
+  if (!g.available && g.reason) throw new AgentError(g.reason, 503, 'not_configured')
+  return { result: { generated_at: now(), overall: overall(g.issues), counts: countIssues(g.issues), issues: sortIssues(g.issues), repos: g.data } }
+}
+
+async function deployLogs(ctx: Ctx, p: any): Promise<Out> {
+  const v = new Vercel(ctx.cfg, ctx.calls)
+  const name = String(p.project || '')
+  const projects = name ? [await resolveProject(ctx, name)] : await v.listProjects()
+  const wanted = p.deployment ? String(p.deployment) : ''
+  const issues: Issue[] = []
+  const deployments: any[] = []
+  for (const pr of projects) {
+    if (deployments.length >= 3) break
+    const deps = await v.listDeployments(pr.id)
+    const d = wanted ? deps.find(x => x.id === wanted) : deps.find(x => x.state === 'ERROR')
+    if (wanted && !d) throw new AgentError('Deployment not found in recent history of ' + pr.name, 404)
+    if (!d) { if (name) issues.push({ severity: 'info', area: 'vercel', message: 'No failed deployment in recent history', target: pr.name }); continue }
+    let log_tail: string[] = []
+    try { log_tail = await v.buildLogs(d.id) } catch (e) { issues.push({ severity: 'warn', area: 'vercel', message: 'Could not read build logs: ' + errMsg(e), target: pr.name }) }
+    if (d.state === 'ERROR') issues.push({ severity: 'error', area: 'vercel', message: 'Failed deployment ' + d.id + (d.error ? ': ' + d.error : ''), target: pr.name })
+    deployments.push({ project: pr.name, deployment_id: d.id, state: d.state, target: d.target, branch: d.branch, error: d.error || undefined, at: new Date(d.createdAt).toISOString(), log_tail })
+  }
+  if (!deployments.length && !issues.length) issues.push({ severity: 'info', area: 'vercel', message: 'No failed deployments in recent history' })
+  return { result: { generated_at: now(), overall: overall(issues), counts: countIssues(issues), issues: sortIssues(issues), deployments } }
+}
+
+async function requestRedeploy(ctx: Ctx, p: any): Promise<Out> {
+  const project = await resolveProject(ctx, String(p.project || ''))
+  const deps = await new Vercel(ctx.cfg, ctx.calls).listDeployments(project.id)
+  const src = p.deployment ? deps.find(d => d.id === String(p.deployment)) : deps[0]
+  if (!src) throw new AgentError('No matching deployment found in recent history', 404)
+  const production = src.target === 'production'
+  const title = `Redeploy ${project.name} (${src.id.slice(0, 14)}) [${src.target}]${production ? ' - PRODUCTION' : ''}`
+  return withTask(ctx, 'request_redeploy', title, { project: project.name, deployment_id: src.id, target: src.target }, async taskId => {
+    const ap = await ctx.store.createApproval({ task_id: taskId, title, details: { kind: 'redeploy', project: project.name, project_id: project.id, deployment_id: src.id, source_target: src.target, production, note: 'Re-runs the same source. Press Redeploy in the Agent 1 console after approval.' } })
+    await ctx.store.log('warn', 'agent1_approval_requested', title, { approval_id: ap.id }, taskId, ctx.actor.id)
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, production, next: 'Approve in the Approvals tab, then press Redeploy in the Agent 1 console.' } }
+  })
+}
+
+async function applyRedeploy(ctx: Ctx, p: any): Promise<Out> {
+  const ap = await ctx.store.getApproval(String(p.approval_id || ''))
+  const d = ap && ap.details
+  if (!ap || !d || d.kind !== 'redeploy') throw new AgentError('Approval not found', 404)
+  if (ap.status !== 'approved') throw new AgentError('Not approved yet (status: ' + ap.status + ')', 409, 'not_approved')
+  if (d.executed_at) throw new AgentError('Already executed', 409, 'already_executed')
+  if (!ap.decided_at || Date.now() - new Date(ap.decided_at).getTime() > 24 * 3600 * 1000) throw new AgentError('Approval older than 24h; request again', 409, 'expired')
+  if (d.production && p.production_ack !== 'APPROVE-PRODUCTION') throw new AgentError('Production redeploy needs explicit confirmation (production_ack)', 403, 'production_ack')
+  return withTask(ctx, 'apply_redeploy', 'Apply: ' + ap.title, { approval_id: ap.id, project: d.project }, async () => {
+    const claimed = await ctx.store.claimApproval(ap.id, { ...d, executed_at: now(), executed_by: ctx.actor.id })
+    if (!claimed) throw new AgentError('Already executed', 409, 'already_executed')
+    try {
+      const out = await new Vercel(ctx.cfg, ctx.calls).redeploy(d.project, d.deployment_id, Boolean(d.production))
+      if (ap.task_id) await ctx.store.updateTask(ap.task_id, { status: 'succeeded', finished_at: now(), result: { applied: true, new_deployment: out.id } })
+      await ctx.store.log('success', 'agent1_redeploy_started', `${d.project} <- ${d.deployment_id}`, { approval_id: ap.id, production: d.production }, null, ctx.actor.id)
+      return { result: { applied: true, project: d.project, new_deployment: out.id, url: out.url } }
+    } catch (e) {
+      await ctx.store.patchApproval(ap.id, { details: { ...d, executed_at: null, last_error: errMsg(e).slice(0, 300) } }).catch(() => {})
+      throw e
+    }
   })
 }
 
@@ -239,6 +329,11 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'request_env_change': return requestEnvChange(ctx, params)
     case 'apply_env_change': return applyEnvChange(ctx, params)
     case 'propose_db_change': return proposeDbChange(ctx, params)
+    case 'apply_db_change': return applyDbChange(ctx, params)
+    case 'github_status': return withTask(ctx, action, 'GitHub repository status (read-only)', {}, () => githubStatus(ctx))
+    case 'deploy_logs': return withTask(ctx, action, 'Vercel deployment error logs', { project: params.project || null }, () => deployLogs(ctx, params))
+    case 'request_redeploy': return requestRedeploy(ctx, params)
+    case 'apply_redeploy': return applyRedeploy(ctx, params)
   }
 }
 

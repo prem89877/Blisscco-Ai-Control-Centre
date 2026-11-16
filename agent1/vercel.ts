@@ -71,4 +71,18 @@ export class Vercel {
   async deleteEnv(projectId: string, envId: string) {
     await this.call('DELETE', '/v9/projects/' + encodeURIComponent(projectId) + '/env/' + encodeURIComponent(envId))
   }
+
+  // READ: last lines of the build log of one deployment (text only; redacted again by the agent).
+  async buildLogs(deploymentId: string, tail = 60): Promise<string[]> {
+    const b = await this.call('GET', '/v3/deployments/' + encodeURIComponent(deploymentId) + '/events', { limit: 300, direction: 'backward' })
+    const arr: any[] = Array.isArray(b) ? b : (b && b.events) || []
+    const lines = arr.map(e => String(e.text ?? (e.payload && e.payload.text) ?? '').replace(/\u001b\[[0-9;]*m/g, '').trim()).filter(Boolean).reverse()
+    return lines.slice(-tail).map(l => l.slice(0, 300))
+  }
+
+  // WRITE: only ever called from apply_redeploy after approval. Re-runs an existing deployment, same source.
+  async redeploy(name: string, deploymentId: string, production: boolean): Promise<{ id: string | null; url: string | null }> {
+    const b = await this.call('POST', '/v13/deployments', { forceNew: 1 }, { name, deploymentId, ...(production ? { target: 'production' } : {}) })
+    return { id: (b && (b.id || b.uid)) || null, url: (b && b.url) || null }
+  }
 }

@@ -12,7 +12,7 @@ function loadDotenv(path: string) {
   }
 }
 
-const MAP: Record<string, string> = { health: 'health_report', vercel: 'vercel_status', 'env-audit': 'env_audit', schema: 'supabase_schema', rls: 'rls_check', 'request-env': 'request_env_change', 'apply-env': 'apply_env_change', 'propose-db': 'propose_db_change', heartbeat: 'heartbeat' }
+const MAP: Record<string, string> = { health: 'health_report', vercel: 'vercel_status', 'env-audit': 'env_audit', schema: 'supabase_schema', rls: 'rls_check', 'request-env': 'request_env_change', 'apply-env': 'apply_env_change', 'propose-db': 'propose_db_change', 'apply-db': 'apply_db_change', github: 'github_status', 'deploy-logs': 'deploy_logs', 'request-redeploy': 'request_redeploy', 'apply-redeploy': 'apply_redeploy', heartbeat: 'heartbeat' }
 
 async function main() {
   loadDotenv('.env.agent1')
@@ -27,8 +27,9 @@ async function main() {
   if (a['value-env']) params.value = process.env[a['value-env']] || ''
   if (a.approval) params.approval_id = a.approval
   if (a['production-ack']) params.production_ack = a['production-ack']
+  if (a.ack) params.db_ack = a.ack
   if (a.file) params.sql = readFileSync(a.file, 'utf8')
-  delete params['value-env']; delete params.file
+  delete params['value-env']; delete params.file; delete params.ack
   const ctx = makeCtx(loadConfig(), { type: 'system', id: null })
   const res = await runAction(ctx, action, params)
   const r = res.result || res
@@ -40,6 +41,15 @@ async function main() {
     console.log(`\n${p.name}${p.error ? ' (error: ' + p.error + ')' : ''}`)
     for (const e of p.env || []) console.log(`  ${e.key} [${e.type}] ${(e.targets || []).join(',')}`)
     for (const d of p.deployments || []) console.log(`  deploy ${d.state} ${d.target || ''} ${d.branch || ''} ${d.at}`)
+  }
+  if (Array.isArray(r.deployments)) for (const d of r.deployments) {
+    console.log(`\n${d.project} ${d.deployment_id} ${d.state} ${d.target || ''} ${d.branch || ''}`)
+    for (const l of d.log_tail || []) console.log('  ' + l)
+  }
+  if (Array.isArray(r.repos)) for (const g of r.repos) {
+    console.log(`\n${g.repo}${g.found ? '' : ' (not found)'} default=${g.defaultBranch || '-'} pushed=${g.pushedAt || '-'}`)
+    for (const c of g.lastCommits || []) console.log(`  commit ${c.sha} ${c.message}`)
+    for (const x of g.runs || []) console.log(`  run ${x.name} ${x.status}/${x.conclusion || '-'} ${x.branch}`)
   }
   if (full || !r.overall) console.log(JSON.stringify(res, null, 2))
   else console.log('\ntask_id: ' + res.task_id + '  (add --json for full output)')

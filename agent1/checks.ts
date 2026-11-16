@@ -143,3 +143,25 @@ export function classifyDbChange(sql: string): { ok: boolean; reason?: string } 
   if (/\b(drop\s+schema|truncate)\b/i.test(sql)) return { ok: false, reason: 'DROP SCHEMA / TRUNCATE are not allowed' }
   return { ok: true }
 }
+
+// Stricter guard for SQL that Agent 1 itself EXECUTES (after approval). Runs on top of classifyDbChange.
+export function classifyExecutableSql(sql: string): { ok: boolean; reason?: string } {
+  const base = classifyDbChange(sql)
+  if (!base.ok) return base
+  if (/--|\/\*/.test(sql)) return { ok: false, reason: 'SQL comments are not allowed' }
+  const s = sql.replace(/'([^']|'')*'/g, "''")
+  const block = (re: RegExp, reason: string) => (re.test(s) ? { ok: false, reason } : null)
+  return (
+    block(/(^|;)\s*(begin|commit|rollback|end|abort|savepoint|release|start\s+transaction)\b/i, 'Transaction control is handled by Agent 1') ||
+    block(/\b(set|reset)\s+(local\s+|session\s+)?(role|session\s+authorization|search_path|statement_timeout)\b|\breset\s+all\b|\bset_config\b/i, 'Changing role/search_path/session settings is not allowed') ||
+    block(/["']?\b(public|private|auth|storage|extensions|vault|cron|realtime|net|pg_catalog|information_schema|supabase_functions|graphql\w*)\b["']?\s*\./i, 'References a protected schema') ||
+    block(/\bcreate\s+(extension|role|user|database|publication|subscription|event\s+trigger)\b|\balter\s+(role|user|database|system|extension|default\s+privileges)\b|\bdrop\s+(role|user|database|extension)\b/i, 'Role/extension/database-level changes are not allowed') ||
+    block(/\bdrop\s+(schema|table|policy|function|trigger)\b/i, 'DROP of schema/table/policy/function/trigger is not allowed (run it manually if really needed)') ||
+    block(/\b(disable|no\s+force)\s+row\s+level\s+security\b/i, 'Disabling RLS is not allowed') ||
+    block(/\b(grant|revoke)\b[^;]*\b(anon|public)\b/i, 'Grants/revokes involving anon/public are not allowed') ||
+    block(/\bcopy\b|\bdo\s+(\$|language\b|')|\bdblink\b|\bpg_(read|write|ls|sleep|terminate|cancel|reload|stat_file)\w*|\blo_\w+|\bsecurity\s+definer\b/i, 'Forbidden statement or function') ||
+    (/\bdelete\s+from\b/i.test(s) && !/\bwhere\b/i.test(s) ? { ok: false, reason: 'DELETE needs a WHERE clause' } : null) ||
+    (/\bupdate\s+(only\s+)?[\w."]+\s+(as\s+\w+\s+)?set\b/i.test(s) && !/\bwhere\b/i.test(s) && !/\bon\s+conflict\b/i.test(s) ? { ok: false, reason: 'UPDATE needs a WHERE clause' } : null) ||
+    { ok: true }
+  )
+}

@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { loadConfig } from './config.js'
 import { redact, fingerprint } from './util.js'
-import { analyzeProject, analyzeRls, assertReadOnlySql, classifyDbChange, sortIssues } from './checks.js'
+import { analyzeProject, analyzeRls, assertReadOnlySql, classifyDbChange, classifyExecutableSql, sortIssues } from './checks.js'
 import { isEnvFile } from './github.js'
 import { handleRequest } from './server.js'
 import { makeCtx, runAction } from './agent.js'
@@ -25,13 +25,14 @@ type Row = Record<string, any>
 let db: Record<string, Row[]>
 let ext: { method: string; url: string }[]
 let dbWrites: string[]
+let sqlExec: string[]
 let vercelWrites: { method: string; url: string; body: any }[]
 let envs: Row[]
 let seq = 0
 const uuid = () => '00000000-0000-4000-8000-' + String(++seq).padStart(12, '0')
 
 function reset() {
-  seq = 0; ext = []; dbWrites = []; vercelWrites = []
+  seq = 0; ext = []; dbWrites = []; sqlExec = []; vercelWrites = []
   db = { agents: [1, 2, 3].map(s => ({ id: uuid(), slot: s, name: 'Agent ' + s, description: 'Placeholder - not built yet', status: 'offline', last_heartbeat_at: null, updated_at: new Date().toISOString(), config: {} })), tasks: [], approvals: [], activity_logs: [], api_usage: [], system_health: [], owners: [{ user_id: 'user-owner', role: 'owner' }] }
   envs = [
     { id: 'e1', key: 'VITE_SUPABASE_URL', type: 'plain', target: ['production', 'preview'] },
@@ -59,6 +60,8 @@ async function fake(input: any, init: any = {}): Promise<Response> {
     if (method !== 'GET') vercelWrites.push({ method, url: url.pathname, body })
     if (url.pathname === '/v9/projects') return json({ projects: [{ id: 'prj_1', name: 'ai-control-center', framework: 'vite', link: { org: 'me', repo: 'blisscco-ai-control-center' } }] })
     if (url.pathname === '/v6/deployments') return json({ deployments: [{ uid: 'd1', readyState: 'ERROR', target: 'production', created: Date.now() - 1000 }, { uid: 'd2', readyState: 'READY', target: 'preview', created: Date.now() - 5000 }] })
+    if (url.pathname === '/v3/deployments/d1/events') return json([{ type: 'stderr', payload: { text: 'Error: vite not found ' + GEMKEY } }, { type: 'stdout', text: '\u001b[31mRunning build\u001b[39m' }])
+    if (url.pathname === '/v13/deployments' && method === 'POST') return json({ id: 'd9', url: 'x.vercel.app' })
     if (url.pathname === '/v13/deployments/d1') return json({ errorMessage: 'Build failed: vite not found' })
     if (url.pathname === '/v9/projects/prj_1/env' && method === 'GET') return json({ envs })
     if (url.pathname === '/v10/projects/prj_1/env' && method === 'POST') return json({ created: { key: body.key } })
@@ -66,6 +69,7 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   }
   if (url.host === 'api.supabase.com') {
     ext.push({ method, url: url.host + url.pathname })
+    if (method === 'POST' && url.pathname.endsWith('/database/query')) { sqlExec.push(body.query); return body.query.includes('force_error') ? json({ message: 'relation does not exist' }, 400) : json([{ ok: 1 }]) }
     if (!url.pathname.endsWith('/database/query/read-only')) return json({}, 404)
     const q: string = body.query
     if (q.includes('pg_policies')) return json([{ schema: 'ai_control', tbl: 'agents', policy: 'agents_select', cmd: 'SELECT', roles: '{authenticated}', using_expr: 'ai_control.is_owner()', check_expr: '' }])
@@ -251,3 +255,81 @@ test('failure path: bad Vercel token -> task failed, agent error status, logged'
 })
 test('fingerprint is keyed and stable', () => { assert.equal(fingerprint('k', 'v'), fingerprint('k', 'v')); assert.notEqual(fingerprint('k', 'v'), fingerprint('k2', 'v')) })
 test('loadConfig requires Supabase url + service key; makeCtx exported', () => { assert.throws(() => loadConfig({})); assert.equal(typeof makeCtx, 'function'); assert.equal(typeof runAction, 'function') })
+
+test('classifyExecutableSql: allows ai_control DDL/DML, blocks risky statements', () => {
+  const ok = (q: string) => assert.equal(classifyExecutableSql(q).ok, true, q)
+  const no = (q: string) => assert.equal(classifyExecutableSql(q).ok, false, q)
+  ok('alter table ai_control.tasks add column note text')
+  ok("insert into ai_control.settings(key, value) values ('a', '1') on conflict (key) do update set value = excluded.value")
+  ok("update ai_control.tasks set status = 'x' where id = '1'")
+  no('delete from ai_control.tasks'); no('update ai_control.tasks set status = 1')
+  no('alter table public.ads add column x int'); no('select * from ai_control.tasks; commit')
+  no('drop table ai_control.tasks'); no('alter table ai_control.tasks disable row level security')
+  no('grant select on ai_control.tasks to anon'); no('set role postgres; select 1 from ai_control.tasks')
+  no('create extension pg_net; select 1 from ai_control.tasks'); no('select 1 from ai_control.tasks -- x')
+})
+test('apply_db_change: approval + ack gate, ai_control transaction, single execution, never for blocked SQL', async () => {
+  reset()
+  const mk = async (sql: string, title = 'add col') => { const r: any = await post({ action: 'propose_db_change', params: { title, sql } }); return r.body.result.approval_id as string }
+  const id = await mk('alter table ai_control.tasks add column note text')
+  const run = (approval_id: string, db_ack: string | null = 'RUN-SQL') => post({ action: 'apply_db_change', params: { approval_id, db_ack } })
+  assert.equal((await run(id) as any).status, 409)
+  approve(id)
+  assert.equal((await run(id, null) as any).status, 403)
+  assert.equal(sqlExec.length, 0)
+  const ok: any = await run(id)
+  assert.equal(ok.status, 200, JSON.stringify(ok.body)); assert.equal(ok.body.result.applied, true)
+  assert.equal(sqlExec.length, 1)
+  assert.match(sqlExec[0], /^BEGIN; SET LOCAL search_path = ai_control, pg_catalog;/); assert.match(sqlExec[0], /COMMIT;$/); assert.match(sqlExec[0], /alter table ai_control\.tasks add column note text/)
+  assert.equal((await run(id) as any).status, 409); assert.equal(sqlExec.length, 1)
+  const old = await mk('alter table ai_control.tasks add column n2 text', 'old'); approve(old, new Date(Date.now() - 25 * 3600 * 1000).toISOString())
+  assert.equal((await run(old) as any).status, 409)
+  const evil = await mk('alter table ai_control.tasks add column n3 text', 'tampered'); approve(evil)
+  db.approvals.find(a => a.id === evil)!.details.sql = 'alter table public.ads add column x int'
+  assert.equal((await run(evil) as any).status, 403); assert.equal(sqlExec.length, 1)
+  assert.ok(db.activity_logs.some(l => l.action === 'agent1_db_applied'))
+})
+test('apply_db_change: SQL error releases the approval and marks task failed', async () => {
+  reset()
+  const r: any = await post({ action: 'propose_db_change', params: { title: 'bad', sql: 'alter table ai_control.force_error add column x int' } })
+  const id = r.body.result.approval_id; approve(id)
+  const x: any = await post({ action: 'apply_db_change', params: { approval_id: id, db_ack: 'RUN-SQL' } })
+  assert.equal(x.status, 502); assert.equal(x.body.code, 'sql_failed')
+  const ap = db.approvals.find(a => a.id === id)!
+  assert.equal(ap.details.executed_at, null); assert.ok(ap.details.last_error)
+  assert.ok(db.tasks.some(t => t.status === 'failed' && t.description === 'Agent 1 - apply_db_change'))
+})
+
+test('github_status is read-only (GET only) and reports repos', async () => {
+  reset()
+  const r: any = await post({ action: 'github_status' })
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.result.repos[0].found, true)
+  assert.ok(ext.filter(c => c.url.startsWith('api.github.com')).every(c => c.method === 'GET'))
+  assert.equal(JSON.stringify(r.body).includes(GHTOKEN), false)
+})
+test('deploy_logs: returns redacted tail of the failed deployment, read-only', async () => {
+  reset()
+  const r: any = await post({ action: 'deploy_logs', params: { project: 'ai-control-center' } })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  const d = r.body.result.deployments[0]
+  assert.equal(d.deployment_id, 'd1'); assert.equal(d.log_tail.length, 2)
+  assert.equal(d.log_tail[1].includes('\u001b'), false)
+  assert.equal(JSON.stringify(r.body).includes(GEMKEY), false)
+  assert.equal(vercelWrites.length, 0)
+  assert.equal((await post({ action: 'deploy_logs', params: { project: 'ai-control-center', deployment: 'nope' } }) as any).status, 404)
+})
+test('redeploy: approval gate, production ack, single execution, no write before approval', async () => {
+  reset()
+  const q: any = await post({ action: 'request_redeploy', params: { project: 'ai-control-center' } })
+  assert.equal(q.status, 200, JSON.stringify(q.body)); assert.equal(q.body.status, 'awaiting_approval'); assert.equal(q.body.result.production, true)
+  const id = q.body.result.approval_id
+  const run = (production_ack?: string | null) => post({ action: 'apply_redeploy', params: { approval_id: id, production_ack } })
+  assert.equal((await run('APPROVE-PRODUCTION') as any).status, 409); assert.equal(vercelWrites.length, 0)
+  approve(id)
+  assert.equal((await run(null) as any).status, 403); assert.equal(vercelWrites.length, 0)
+  const ok: any = await run('APPROVE-PRODUCTION')
+  assert.equal(ok.status, 200, JSON.stringify(ok.body)); assert.equal(ok.body.result.new_deployment, 'd9')
+  assert.equal(vercelWrites.length, 1); assert.equal(vercelWrites[0].body.deploymentId, 'd1'); assert.equal(vercelWrites[0].body.target, 'production')
+  assert.equal((await run('APPROVE-PRODUCTION') as any).status, 409); assert.equal(vercelWrites.length, 1)
+  assert.equal((await post({ action: 'request_redeploy', params: { project: 'ai-control-center', deployment: 'zzz' } }) as any).status, 404)
+})

@@ -33,6 +33,22 @@ export class SupaMgmt {
     return Array.isArray(r.body) ? r.body : []
   }
 
+  // Write path. Used ONLY by apply_db_change, after approval + classifyExecutableSql. Wrapped in one transaction pinned to ai_control.
+  async rwExec(sql: string): Promise<any[]> {
+    if (!this.cfg.supaToken || !this.cfg.supabaseRef) throw new AgentError('AGENT1_SUPABASE_ACCESS_TOKEN (and project ref) not set', 503, 'not_configured')
+    const body = sql.trim().replace(/;\s*$/, '')
+    const wrapped = `BEGIN; SET LOCAL search_path = ai_control, pg_catalog; SET LOCAL statement_timeout = '15s'; ${body}; COMMIT;`
+    this.calls.supabase_mgmt = (this.calls.supabase_mgmt || 0) + 1
+    const r = await jfetch(`https://api.supabase.com/v1/projects/${this.cfg.supabaseRef}/database/query`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + this.cfg.supaToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: wrapped })
+    }, 30000)
+    if (r.status === 401 || r.status === 403) throw new AgentError('Supabase access token invalid or lacks Database write (' + r.status + ')', 502, 'supa_auth')
+    if (!r.ok) throw new AgentError('SQL failed (Supabase ' + r.status + '): ' + String(r.body && (r.body.message || r.body.error) || 'error').slice(0, 300), 502, 'sql_failed')
+    return Array.isArray(r.body) ? r.body : []
+  }
+
   tables() { return this.roQuery<TableRow>(Q.tables) }
   policies() { return this.roQuery<PolicyRow>(Q.policies) }
 }

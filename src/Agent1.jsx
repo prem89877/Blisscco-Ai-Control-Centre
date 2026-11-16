@@ -17,7 +17,8 @@ export async function callAgent1(action, params = {}) {
 
 const RUNS = [
   ['health_report', 'Health report'], ['vercel_status', 'Vercel status'], ['env_audit', 'Env audit'],
-  ['supabase_schema', 'DB schema'], ['rls_check', 'RLS check']
+  ['supabase_schema', 'DB schema'], ['rls_check', 'RLS check'],
+  ['deploy_logs', 'Vercel error logs'], ['github_status', 'GitHub status']
 ]
 const SEV = { critical: 'bad', error: 'bad', warn: 'warn', info: 'info' }
 const SETUP = [['vercel', 'Vercel'], ['supabase_mgmt', 'Supabase API'], ['github', 'GitHub'], ['gemini', 'Gemini']]
@@ -44,6 +45,15 @@ function Report({ res }) {
         <div key={n} style={{ marginTop: 6 }}><span className={'badge ' + (SEV[i.severity] || 'mute')}>{i.severity}</span> <span className="sub">{i.target ? i.target + ': ' : ''}{i.message}</span></div>
       ))}
       {r.issues && r.issues.length === 0 && <div className="sub">No issues found.</div>}
+      {(r.deployments || []).map((d, n) => (
+        <div key={n} style={{ marginTop: 8 }}><b>{d.project}</b> <span className="sub">{d.state} {d.target} {d.branch || ''}</span><pre>{(d.log_tail || []).join('\n')}</pre></div>
+      ))}
+      {(r.repos || []).map((g, n) => (
+        <div key={n} style={{ marginTop: 8 }}><b>{g.repo}</b> <span className="sub">{g.found ? 'branch ' + g.defaultBranch : 'not found'}</span>
+          {(g.lastCommits || []).map((c, i) => <div key={'c' + i} className="sub">commit {c.sha} {c.message}</div>)}
+          {(g.runs || []).map((x, i) => <div key={'r' + i} className="sub">run {x.name}: {x.status}/{x.conclusion || '-'} ({x.branch})</div>)}
+        </div>
+      ))}
       <details style={{ marginTop: 8 }}><summary className="sub">Raw data</summary><pre>{JSON.stringify(r, null, 2).slice(0, 8000)}</pre></details>
     </div>
   )
@@ -97,6 +107,68 @@ function Apply({ a, onDone, setErr }) {
   )
 }
 
+function ApplyDb({ a, onDone, setErr }) {
+  const [ack, setAck] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [out, setOut] = useState('')
+  async function go() {
+    setBusy(true); setErr(''); setOut('')
+    try { const r = await callAgent1('apply_db_change', { approval_id: a.id, db_ack: ack ? 'RUN-SQL' : undefined }); setOut('Done. Rows returned: ' + ((r.result && r.result.rows) || 0)); onDone() }
+    catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  return (
+    <div className="card">
+      <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
+      <pre>{a.details.sql}</pre>
+      <label className="sub" style={{ display: 'block', marginBottom: 8 }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> I confirm Agent 1 may run this SQL on the ai_control schema</label>
+      <button className="btn ok" disabled={busy || !ack} onClick={go}>{busy ? 'Running...' : 'Run SQL now'}</button>
+      {out && <div className="sub" style={{ marginTop: 6 }}>{out}</div>}
+    </div>
+  )
+}
+
+function RedeployRequest({ onResult, setErr }) {
+  const [project, setProject] = useState('')
+  const [deployment, setDeployment] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function go() {
+    setBusy(true); setErr('')
+    try { onResult(await callAgent1('request_redeploy', { project, deployment: deployment || undefined })); setDeployment('') }
+    catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  return (
+    <div className="card">
+      <b>Request redeploy</b> <span className="sub">(needs your approval; empty deployment = latest)</span>
+      <input placeholder="Vercel project name" value={project} onChange={e => setProject(e.target.value)} style={{ marginTop: 8 }} />
+      <input placeholder="Deployment id (optional)" value={deployment} onChange={e => setDeployment(e.target.value)} />
+      <button className="btn" disabled={busy || !project} onClick={go}>Request approval</button>
+    </div>
+  )
+}
+
+function ApplyRedeploy({ a, onDone, setErr }) {
+  const [ack, setAck] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [out, setOut] = useState('')
+  const d = a.details
+  async function go() {
+    setBusy(true); setErr(''); setOut('')
+    try { const r = await callAgent1('apply_redeploy', { approval_id: a.id, production_ack: ack ? 'APPROVE-PRODUCTION' : undefined }); setOut('Redeploy started: ' + ((r.result && r.result.new_deployment) || 'ok')); onDone() }
+    catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  return (
+    <div className="card">
+      <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
+      {d.production && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> I confirm this PRODUCTION redeploy</label>}
+      <button className="btn ok" disabled={busy || (d.production && !ack)} onClick={go}>{busy ? 'Starting...' : 'Redeploy now'}</button>
+      {out && <div className="sub" style={{ marginTop: 6 }}>{out}</div>}
+    </div>
+  )
+}
+
 function DbProposal({ onResult, setErr }) {
   const [title, setTitle] = useState('')
   const [sql, setSql] = useState('')
@@ -109,7 +181,7 @@ function DbProposal({ onResult, setErr }) {
   }
   return (
     <div className="card">
-      <b>Propose DB change</b> <span className="sub">(ai_control only; you run it manually after approval)</span>
+      <b>Propose DB change</b> <span className="sub">(ai_control only; after approval press Run SQL)</span>
       <input placeholder="Title" value={title} onChange={e => setTitle(e.target.value)} style={{ marginTop: 8 }} />
       <textarea rows={3} placeholder="SQL" value={sql} onChange={e => setSql(e.target.value)} />
       <button className="btn" disabled={busy} onClick={go}>Request approval</button>
@@ -127,7 +199,7 @@ export default function Agent1Panel() {
 
   const { data: ready, reload } = usePoll(() =>
     q(supabase.from('approvals').select('*').eq('status', 'approved').order('decided_at', { ascending: false }).limit(20)), [], 15000)
-  const applicable = (ready || []).filter(a => a.details && a.details.kind === 'env_change' && !a.details.executed_at)
+  const applicable = (ready || []).filter(a => a.details && (['env_change', 'db_change', 'redeploy'].includes(a.details.kind)) && !a.details.executed_at)
 
   async function run(action) {
     setBusy(action); setErr(''); setRes(null)
@@ -149,8 +221,9 @@ export default function Agent1Panel() {
         {RUNS.map(([a, l]) => <button key={a} className="btn" disabled={!!busy} onClick={() => run(a)}>{busy === a ? 'Running...' : l}</button>)}
       </div>
       {res && <Report res={res} />}
-      {applicable.length > 0 && <><h2>Approved - ready to apply</h2>{applicable.map(a => <Apply key={a.id} a={a} onDone={reload} setErr={setErr} />)}</>}
+      {applicable.length > 0 && <><h2>Approved - ready to apply</h2>{applicable.map(a => a.details.kind === 'db_change' ? <ApplyDb key={a.id} a={a} onDone={reload} setErr={setErr} /> : a.details.kind === 'redeploy' ? <ApplyRedeploy key={a.id} a={a} onDone={reload} setErr={setErr} /> : <Apply key={a.id} a={a} onDone={reload} setErr={setErr} />)}</>}
       <EnvRequest onResult={setRes} setErr={setErr} />
+      <RedeployRequest onResult={setRes} setErr={setErr} />
       <DbProposal onResult={setRes} setErr={setErr} />
     </>
   )
