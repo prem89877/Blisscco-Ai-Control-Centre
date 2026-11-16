@@ -235,7 +235,7 @@ export default function Agent2Panel() {
       <Propose repos={repos} onResult={setRes} setErr={setErr} />
       <Fix repos={repos} onResult={setRes} setErr={setErr} />
       <BranchRequest title="Promote to production" hint="(PR + merge; needs approval and a PRODUCTION tick)" action="request_promote" repos={repos} onResult={setRes} setErr={setErr} />
-      <BranchRequest title="Rollback a change" hint="(deletes the branch, or opens a revert PR if merged)" action="request_rollback" repos={repos} onResult={setRes} setErr={setErr} />
+      <BranchRequest title="Delete Agent 2 branch" hint="(only that agent2/* branch is deleted; nothing else changes. Needs approval)" action="request_rollback" repos={repos} onResult={setRes} setErr={setErr} />
       <div className="sub">Local lint, type check, tests and shell commands run only in Termux: <code>npm run agent2 -- checks</code></div>
     </>
   )
