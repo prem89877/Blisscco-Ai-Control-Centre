@@ -108,6 +108,25 @@ export class GitHub {
     return ((b || []) as any[]).map(d => ({ id: d.id, environment: String(d.environment), created_at: String(d.created_at) }))
   }
 
+  // ---- agent branches + workflows ----
+  async agentBranches(repo: string): Promise<string[]> {
+    const b = await this.call('GET', `/repos/${this.repo(repo)}/git/matching-refs/heads/agent2/`)
+    return ((b || []) as any[]).map(r => String(r.ref).replace(/^refs\/heads\//, '')).filter(n => n.startsWith('agent2/')).slice(0, 100)
+  }
+  async workflows(repo: string) {
+    const b = await this.call('GET', `/repos/${this.repo(repo)}/actions/workflows?per_page=50`)
+    return ((b.workflows || []) as any[]).map(w => ({ id: Number(w.id), name: String(w.name), path: String(w.path), state: String(w.state) }))
+  }
+  async dispatchWorkflow(repo: string, workflowId: number, ref: string) {
+    try { await this.call('POST', `/repos/${this.repo(repo)}/actions/workflows/${Number(workflowId)}/dispatches`, { ref }) }
+    catch (e) {
+      const m = e instanceof Error ? e.message : ''
+      if (m.includes('422')) throw new AgentError("This workflow cannot be started by hand: its file needs `on: workflow_dispatch:`. Add that line with Submit code (needs approval), then try again.", 409, 'no_dispatch')
+      if (e instanceof AgentError && e.code === 'github_denied') throw new AgentError('GitHub refused to start the workflow. The token needs Actions: Read and write permission for this repo.', 502, 'github_denied')
+      throw e
+    }
+  }
+
   // ---- promotion (pull request + merge) ----
   async findPr(repo: string, head: string, base: string) {
     const owner = repo.split('/')[0]

@@ -21,7 +21,7 @@ const MAP: Record<string, ['local' | 'remote', string]> = {
   heartbeat: ['remote', 'heartbeat'], 'repo-inspect': ['remote', 'repo_inspect'], monitor: ['remote', 'actions_status'],
   propose: ['remote', 'propose_change'], fix: ['remote', 'ai_fix'], 'apply-change': ['remote', 'apply_change'],
   'request-promote': ['remote', 'request_promote'], 'apply-promote': ['remote', 'apply_promote'],
-  'request-rollback': ['remote', 'request_rollback'], 'apply-rollback': ['remote', 'apply_rollback']
+  'request-rollback': ['remote', 'request_rollback'], ask: ['remote', 'ai_command'], 'apply-rollback': ['remote', 'apply_rollback']
 }
 
 async function main() {

@@ -42,6 +42,10 @@ let runs: any[]
 let ghWrites: { method: string; path: string; body?: any }[]
 let failNextBlob = false
 let fixReply: string
+let planReply: string
+let dispatches: { id: string; ref: string }[]
+let dispatchStatus = 204
+let workflowList: any[]
 let geminiCalls = 0
 const SEED: Record<string, string> = {
   'src/App.jsx': 'export const a = 1\nexport const b = 2\n',
@@ -59,7 +63,7 @@ function putTree(m: Map<string, { mode: string; sha: string }>) {
 function putCommit(tree: string, parents: string[], message: string) { const s = sha1(tree + parents.join() + message + seq++); commits.set(s, { tree, parents, message }); return s }
 
 function resetAll() {
-  seq = 0; ghWrites = []; failNextBlob = false; geminiCalls = 0; prs = []
+  seq = 0; dispatches = []; dispatchStatus = 204; planReply = '{}'; workflowList = [{ id: 11, name: 'CI', path: '.github/workflows/ci.yml', state: 'active' }, { id: 12, name: 'DB Integration', path: '.github/workflows/db-integration.yml', state: 'active' }]; ghWrites = []; failNextBlob = false; geminiCalls = 0; prs = []
   fixReply = JSON.stringify({ explanation: 'bump b', files: [{ path: 'src/App.jsx', content: 'export const a = 1\nexport const b = 3\n' }] })
   refs = new Map(); commits = new Map(); trees = new Map(); blobs = new Map()
   const m = new Map<string, { mode: string; sha: string }>()
@@ -100,6 +104,9 @@ async function gh(method: string, path: string, url: URL, body: any): Promise<Re
   if (p === '/git/refs' && method === 'POST') { refs.set(String(body.ref).replace('refs/heads/', ''), body.sha); return json({}, 201) }
   if ((r = /^\/git\/refs\/heads\/(.+)$/.exec(p)) && method === 'PATCH') { assert.equal(body.force, false); refs.set(decodeURIComponent(r[1]), body.sha); return json({}) }
   if ((r = /^\/git\/refs\/heads\/(.+)$/.exec(p)) && method === 'DELETE') { refs.delete(decodeURIComponent(r[1])); return new Response(null, { status: 204 }) }
+  if (p.startsWith('/git/matching-refs/heads/agent2/')) return json([...refs.keys()].filter(k => k.startsWith('agent2/')).map(k => ({ ref: 'refs/heads/' + k, object: { sha: refs.get(k) } })))
+  if (p === '/actions/workflows') return json({ workflows: workflowList })
+  if ((r = /^\/actions\/workflows\/(\d+)\/dispatches$/.exec(p)) && method === 'POST') { if (dispatchStatus !== 204) return json({ message: "Workflow does not have 'workflow_dispatch' trigger" }, dispatchStatus); dispatches.push({ id: r[1], ref: body.ref }); return new Response(null, { status: 204 }) }
   if (p.startsWith('/commits')) return json([{ sha: refs.get('main'), commit: { message: 'init', author: { date: '2026-11-01' } } }])
   if (p.startsWith('/actions/runs') && !p.includes('/jobs')) { const b = url.searchParams.get('branch'); return json({ workflow_runs: runs.filter(x => !b || x.head_branch === b) }) }
   if (p.includes('/actions/runs/') && p.endsWith('/jobs')) return json({ jobs: [{ name: 'test-build', conclusion: 'failure', steps: [{ name: 'npm test', conclusion: 'failure' }] }] })
@@ -133,7 +140,7 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   if (url.host === 'generativelanguage.googleapis.com') {
     geminiCalls++
     const sys = String(body.systemInstruction.parts[0].text)
-    const text = sys.includes('bug fixer') ? fixReply : '- Adds a constant.\n- No risks found.'
+    const text = sys.includes('command planner') ? planReply : sys.includes('bug fixer') ? fixReply : '- Adds a constant.\n- No risks found.'
     return json({ candidates: [{ content: { parts: [{ text }] } }], usageMetadata: { promptTokenCount: 200, candidatesTokenCount: 40 } })
   }
   if (url.host === `${REF}.supabase.co`) {
@@ -510,3 +517,58 @@ test('local_rollback: restores everything, deletes only the agent branch, refuse
   await runLocal(ctx, 'local_rollback', { branch: b.result.branch }); assert.equal(g('rev-parse', 'HEAD'), base); assert.ok(!existsSync(join(w, 'src/New.js')))
 })
 function unlinkMine(w: string) { execFileSync('rm', ['-f', join(w, 'mine.txt')]) }
+
+// ================================================================ free-text command
+const ask = (text: string) => ok('ai_command', { repo: REPO, text })
+test('ai_command: read-only requests run at once (CI check, list branches)', async () => {
+  runs = [{ id: 1, name: 'CI', status: 'completed', conclusion: 'success', head_branch: 'main', head_sha: 'abcdef1234', html_url: 'x' }]
+  planReply = JSON.stringify({ intent: 'check_ci', explanation: 'CI status' })
+  const a = await ask('ci workflow check karo'); assert.equal(a.result.overall, 'passing'); assert.equal(a.understood.intent, 'check_ci')
+  refs.set('agent2/test-1', refs.get('main')!)
+  planReply = JSON.stringify({ intent: 'list_branches', explanation: 'branches' })
+  const b = await ask('agent 2 ki branches dikhao'); assert.deepEqual(b.result.branches, ['agent2/test-1'])
+  assert.equal(ghWrites.length, 0)
+})
+test('ai_command: delete_branch creates an approval only; unknown or protected names are refused', async () => {
+  refs.set('agent2/test-1', refs.get('main')!)
+  planReply = JSON.stringify({ intent: 'delete_branch', branch: 'agent2/test-1', explanation: 'delete' })
+  const r = await ask('agent2 test branch delete karo'); assert.equal(r.status, 'awaiting_approval'); assert.ok(refs.has('agent2/test-1')); assert.equal(ghWrites.length, 0)
+  for (const bad of ['main', 'agent2/not-there', 'production']) {
+    planReply = JSON.stringify({ intent: 'delete_branch', branch: bad, explanation: 'x' })
+    await must('ai_command', { repo: REPO, text: 'delete ' + bad }, 404, 'not_found')
+  }
+  assert.ok(refs.has('main'))
+})
+test('ai_command: run_workflow needs approval, is pinned to the branch head, and a dispatch error is explained', async () => {
+  planReply = JSON.stringify({ intent: 'run_workflow', workflow: 'db integration', explanation: 'run db workflow' })
+  const r = await ask('db integration workflow run karo'); assert.equal(r.status, 'awaiting_approval'); assert.equal(dispatches.length, 0)
+  const id = r.result.approval_id; const row = db.approvals.find(a => a.id === id)!
+  assert.equal(row.details.workflow_path, '.github/workflows/db-integration.yml'); assert.equal(row.details.production, true)
+  await must('apply_workflow', { approval_id: id }, 409, 'not_approved')
+  approve(id)
+  await must('apply_workflow', { approval_id: id }, 403, 'production_ack')
+  dispatchStatus = 422
+  await must('apply_workflow', { approval_id: id, production_ack: 'APPROVE-PRODUCTION' }, 409, 'no_dispatch')
+  assert.ok(!row.details.executed_at, 'released after failure')
+  dispatchStatus = 204
+  const done = await ok('apply_workflow', { approval_id: id, production_ack: 'APPROVE-PRODUCTION' }); assert.equal(done.result.started, true)
+  assert.deepEqual(dispatches, [{ id: '12', ref: 'main' }])
+  await must('apply_workflow', { approval_id: id, production_ack: 'APPROVE-PRODUCTION' }, 409, 'already_executed')
+})
+test('ai_command: workflow on an agent branch needs no production tick; moved branch and unknown workflow are refused', async () => {
+  refs.set('agent2/t', refs.get('main')!)
+  planReply = JSON.stringify({ intent: 'run_workflow', workflow: 'ci.yml', ref: 'agent2/t', explanation: 'x' })
+  const r = await ask('ci chalao agent2/t par'); const id = r.result.approval_id; approve(id)
+  refs.set('agent2/t', 'e'.repeat(40)); await must('apply_workflow', { approval_id: id }, 409, 'head_moved')
+  refs.set('agent2/t', db.approvals.find(a => a.id === id)!.details.expected_head)
+  assert.equal((await ok('apply_workflow', { approval_id: id })).result.started, true)
+  await must('request_workflow', { repo: REPO, workflow: 'nope.yml' }, 404, 'not_found')
+})
+test('ai_command: anything else (codespace, shell, production merge) is declined and changes nothing; bad AI output is safe', async () => {
+  planReply = JSON.stringify({ intent: 'codespace_run', explanation: 'cannot run code in a codespace' })
+  const r = await ask('codespace mai yeh code run karo'); assert.equal(r.result.unsupported, true)
+  planReply = JSON.stringify({ intent: 'unsupported', explanation: 'no' }); assert.equal((await ask('rm -rf')).result.unsupported, true)
+  planReply = 'not json'; await must('ai_command', { repo: REPO, text: 'x' }, 502, 'ai_bad_output')
+  await must('ai_command', { repo: REPO, text: '  ' }, 400)
+  assert.equal(ghWrites.length, 0); assert.equal(db.approvals.length, 0)
+})

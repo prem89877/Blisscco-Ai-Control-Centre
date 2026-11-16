@@ -41,11 +41,16 @@ function Report({ res }) {
   if (r.pr_url) lines.push('PR: ' + r.pr_url)
   if (r.compare_url) lines.push('compare: ' + r.compare_url)
   if (r.rollback) lines.push('rollback: ' + r.rollback)
+  if (r.workflow) lines.push('workflow: ' + r.workflow)
+  if (r.started) lines.push('started: yes')
   const files = (r.changed_files || []).map(f => f.op + ' ' + f.path + (f.added != null ? '  +' + f.added + ' -' + f.removed : '') + (f.sensitive ? '  [SENSITIVE]' : '')).join('\n')
   const runs = (r.runs || r.ci_runs || []).map(x => x.name + ' ' + x.status + '/' + (x.conclusion || '-') + ' ' + x.branch + '@' + x.sha).join('\n')
   return (
     <div className="card">
       <div className="row"><b>Result</b><Badge s={waiting ? 'awaiting_approval' : 'ok'} /></div>
+      {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
+      {r.unsupported && <CodeBlock label="not done" tone="warn" text={r.message} />}
+      {r.branches && <CodeBlock label={'agent2 branches (' + r.branches.length + ')'} wrap={false} text={r.branches.join('\n') || 'none'} />}
       {r.ai_review && <CodeBlock label="ai review" tone="info" text={r.ai_review} />}
       {r.ai_note && <CodeBlock label="ai note" tone="warn" text={'AI review unavailable: ' + r.ai_note} />}
       {(r.warnings || []).length > 0 && <CodeBlock label="warnings" tone="warn" text={r.warnings.join('\n')} />}
@@ -70,6 +75,25 @@ function RepoPick({ repos, repo, setRepo }) {
       {!repos.length && <option value="">No repos in AGENT2_GITHUB_REPOS</option>}
       {repos.map(r => <option key={r} value={r}>{r}</option>)}
     </select>
+  )
+}
+
+function AskBox({ repos, onResult, setErr }) {
+  const [repo, setRepo] = useState('')
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function go() {
+    setBusy(true); setErr('')
+    try { onResult(await callAgent2('ai_command', { repo: repo || repos[0], text })); setText('') } catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  return (
+    <div className="card">
+      <b>Ask Agent 2</b> <span className="sub">(write anything; AI picks one safe action. Changes still need approval)</span>
+      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <textarea rows={3} placeholder="e.g. agent2 test branch delete karo / ci workflow check karo / db integration workflow run karo" value={text} onChange={e => setText(e.target.value)} />
+      <button className="btn" disabled={busy || !text.trim()} onClick={go}>{busy ? 'Thinking...' : 'Do it'}</button>
+    </div>
   )
 }
 
@@ -169,6 +193,7 @@ function BranchRequest({ title, hint, action, repos, onResult, setErr }) {
 const APPLY = {
   code_change: { action: 'apply_change', label: 'Create branch & commit', busy: 'Committing...', ack: 'sensitive_ack', ackValue: 'APPROVE-SENSITIVE', ackText: 'I confirm the SENSITIVE files in this change' },
   promote: { action: 'apply_promote', label: 'Merge now', busy: 'Merging...', ack: 'production_ack', ackValue: 'APPROVE-PRODUCTION', ackText: 'I confirm this PRODUCTION merge' },
+  workflow_run: { action: 'apply_workflow', label: 'Run workflow', busy: 'Starting...', ack: 'production_ack', ackValue: 'APPROVE-PRODUCTION', ackText: 'I confirm running this workflow on a PROTECTED branch' },
   rollback: { action: 'apply_rollback', label: 'Rollback now', busy: 'Rolling back...', ack: 'production_ack', ackValue: 'APPROVE-PRODUCTION', ackText: 'I confirm this PRODUCTION rollback' }
 }
 
@@ -231,6 +256,7 @@ export default function Agent2Panel() {
           ))}
         </>
       )}
+      <AskBox repos={repos} onResult={setRes} setErr={setErr} />
       <Inspect repos={repos} onResult={setRes} setErr={setErr} />
       <Propose repos={repos} onResult={setRes} setErr={setErr} />
       <Fix repos={repos} onResult={setRes} setErr={setErr} />

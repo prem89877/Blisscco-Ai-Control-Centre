@@ -2,13 +2,13 @@ import { loadConfig, readiness, secretValues, type Config } from './config.js'
 import { AgentError, clip, errMsg, redact } from './util.js'
 import { Store } from './store.js'
 import { GitHub, type CommitFile } from './github.js'
-import { proposeFix, review, type AiResult } from './gemini.js'
+import { planCommand, proposeFix, review, type AiResult } from './gemini.js'
 import { assertAgentBranch, branchFor, diffStats, gitBlobSha, isProtected, isSensitivePath, sha256, validatePath, validRepo, validateFiles, type FileIn } from './guard.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
 // Actions that need only GitHub + Supabase, so they can run on Vercel (/api/agent2) and in Termux.
-export const ACTIONS = ['heartbeat', 'repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'apply_change', 'request_promote', 'apply_promote', 'request_rollback', 'apply_rollback'] as const
+export const ACTIONS = ['heartbeat', 'repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'apply_change', 'request_promote', 'apply_promote', 'request_rollback', 'apply_rollback', 'ai_command', 'request_workflow', 'apply_workflow'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -332,6 +332,86 @@ async function applyRollback(ctx: Ctx, p: any): Promise<any> {
   })
 }
 
+// ---------------------------------------------------------------- workflow run (needs approval)
+async function requestWorkflow(ctx: Ctx, p: any): Promise<any> {
+  const gh = new GitHub(ctx.cfg, ctx.calls)
+  const repo = gh.repo(validRepo(p.repo))
+  const wanted = String(p.workflow || '').trim().toLowerCase().slice(0, 120)
+  if (!wanted) throw new AgentError('Which workflow? Write its file name, for example ci.yml', 400)
+  return withTask(ctx, 'request_workflow', 'Run workflow ' + wanted, { repo, workflow: wanted }, async taskId => {
+    const info = await gh.info(repo)
+    const ref = String(p.ref || info.default_branch)
+    if (!/^[\w./-]{1,100}$/.test(ref) || ref.includes('..')) throw new AgentError('Bad branch name', 400)
+    const head = await gh.branchSha(repo, ref)
+    if (!head) throw new AgentError('Branch not found: ' + ref, 404, 'not_found')
+    const all = await gh.workflows(repo)
+    const file = (w: { path: string }) => w.path.split('/').pop()!.toLowerCase()
+    let hits = all.filter(w => file(w) === wanted || w.name.toLowerCase() === wanted || String(w.id) === wanted)
+    if (!hits.length) hits = all.filter(w => file(w).includes(wanted) || w.name.toLowerCase().includes(wanted))
+    if (hits.length !== 1) throw new AgentError((hits.length ? 'More than one workflow matches: ' : 'Workflow not found. Available: ') + (hits.length ? hits : all).map(w => file(w)).join(', '), 404, 'not_found')
+    const wf = hits[0]
+    if (wf.state !== 'active') throw new AgentError('Workflow is not active: ' + file(wf), 409, 'workflow_inactive')
+    const production = isProtected(ref, ctx.cfg.protectedBranches)
+    const details = { kind: 'workflow_run', repo, workflow_id: wf.id, workflow_path: wf.path, workflow_name: wf.name, ref, expected_head: head, production, note: 'Starts this workflow by hand on ' + ref + '. It runs the code already in that branch. Nothing is changed in GitHub except the new run.' }
+    const title = `Run workflow ${file(wf)} on ${ref}`
+    const ap = await ctx.store.createApproval({ task_id: taskId, title, details })
+    await ctx.store.log('warn', 'agent2_approval_requested', title, { approval_id: ap.id }, taskId, ctx.actor.id)
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, workflow: wf.path, ref, production, next: 'Approve in the Approvals tab, then press Run workflow in the Agent 2 console.' } }
+  })
+}
+
+async function applyWorkflow(ctx: Ctx, p: any): Promise<any> {
+  const { ap, d } = await loadApproved(ctx, p.approval_id, 'workflow_run')
+  if (d.production && p.production_ack !== 'APPROVE-PRODUCTION') throw new AgentError('Running a workflow on a protected branch needs explicit confirmation (production_ack)', 403, 'production_ack')
+  return withTask(ctx, 'apply_workflow', 'Apply: ' + ap.title, { approval_id: ap.id }, async () => {
+    const gh = new GitHub(ctx.cfg, ctx.calls)
+    await claim(ctx, ap, d)
+    try {
+      const head = await gh.branchSha(d.repo, d.ref)
+      if (!head) throw new AgentError('Branch not found: ' + d.ref, 404, 'not_found')
+      if (head !== d.expected_head) throw new AgentError('Branch has new commits since the request; request again', 409, 'head_moved')
+      await gh.dispatchWorkflow(d.repo, d.workflow_id, d.ref)
+      await ctx.store.log('success', 'agent2_workflow_started', `${d.repo} ${d.workflow_path} on ${d.ref}`, { approval_id: ap.id }, null, ctx.actor.id)
+      return { result: { started: true, repo: d.repo, workflow: d.workflow_path, branch: d.ref, next: 'Press GitHub Actions (Inspect & monitor) in a minute to see the result.' } }
+    } catch (e) { await release(ctx, ap, d, e); throw e }
+  })
+}
+
+// ---------------------------------------------------------------- free-text command (AI picks ONE allowed action; code validates everything)
+async function aiCommand(ctx: Ctx, p: any): Promise<any> {
+  const gh = new GitHub(ctx.cfg, ctx.calls)
+  const repo = gh.repo(validRepo(p.repo))
+  const text = String(p.text || '').trim().slice(0, 1000)
+  if (!text) throw new AgentError('Write what you want Agent 2 to do', 400)
+  const branches = await gh.agentBranches(repo)
+  const r = await planCommand(ctx.cfg, { request: text, agent_branches: branches.slice(0, 50) })
+  await recordAi(ctx, 'ai_command', r)
+  if (!r.text) throw new AgentError('Gemini could not read the request: ' + (r.error || 'no answer'), 502, 'ai_unavailable')
+  let plan: any
+  try { plan = JSON.parse(r.text.replace(/^```(?:json)?\s*|\s*```$/g, '').trim()) } catch { throw new AgentError('Gemini answer was not valid JSON. Try again in simpler words.', 502, 'ai_bad_output') }
+  const INTENTS = ['check_ci', 'list_branches', 'inspect', 'delete_branch', 'run_workflow', 'fix_code']
+  const intent = INTENTS.includes(String(plan && plan.intent)) ? String(plan.intent) : 'unsupported'
+  const understood = { intent, explanation: String((plan && plan.explanation) || '').slice(0, 300) }
+  const safeRef = (v: unknown) => (typeof v === 'string' && /^[\w./-]{1,100}$/.test(v) && !v.includes('..') ? v : undefined)
+  let out: any
+  switch (intent) {
+    case 'check_ci': { const branch = safeRef(plan.branch); out = await withTask(ctx, 'actions_status', 'GitHub Actions status ' + repo, { repo, branch: branch || null }, () => actionsStatus(ctx, { repo, branch })); break }
+    case 'list_branches': out = await withTask(ctx, 'list_branches', 'List agent2 branches ' + repo, { repo }, async () => ({ result: { repo, branches, count: branches.length } })); break
+    case 'inspect': out = await withTask(ctx, 'repo_inspect', 'Inspect repo ' + repo, { repo }, () => repoInspect(ctx, { repo, path: typeof plan.path === 'string' ? plan.path : undefined, ref: safeRef(plan.ref) })); break
+    case 'delete_branch': {
+      const branch = String(plan.branch || '')
+      if (!branches.includes(branch)) throw new AgentError('That branch is not one of the agent2/* branches: ' + (branches.join(', ') || 'none exist'), 404, 'not_found')
+      out = await requestRollback(ctx, { repo, branch }); break
+    }
+    case 'run_workflow': out = await requestWorkflow(ctx, { repo, workflow: plan.workflow, ref: safeRef(plan.ref) }); break
+    case 'fix_code': out = await aiFix(ctx, { repo, paths: Array.isArray(plan.paths) ? plan.paths.map(String) : [], problem: String(plan.problem || text) }); break
+    default:
+      await ctx.store.log('warn', 'agent2_command_unsupported', understood.explanation || 'unsupported request', {}, null, ctx.actor.id)
+      return { status: 'succeeded', result: { unsupported: true, message: understood.explanation || 'This request is not something Agent 2 can do safely.' }, understood }
+  }
+  return { ...out, understood }
+}
+
 export async function runAction(ctx: Ctx, action: string, params: any = {}): Promise<any> {
   if (!(ACTIONS as readonly string[]).includes(action)) throw new AgentError('Unknown action', 400, 'unknown_action')
   switch (action as Action) {
@@ -348,6 +428,9 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'apply_promote': return applyPromote(ctx, params)
     case 'request_rollback': return requestRollback(ctx, params)
     case 'apply_rollback': return applyRollback(ctx, params)
+    case 'ai_command': return aiCommand(ctx, params)
+    case 'request_workflow': return requestWorkflow(ctx, params)
+    case 'apply_workflow': return applyWorkflow(ctx, params)
   }
 }
 
