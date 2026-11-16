@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { supabase } from './supabaseClient'
 import { usePoll, q, Badge, Err, Loading, timeAgo, effStatus, logAction } from './ui.jsx'
+import Agent1Panel from './Agent1.jsx'
 
 function AgentCard({ a, offlineSec, onSaved }) {
   const [edit, setEdit] = useState(false)
@@ -44,8 +45,9 @@ export default function Agents({ offlineSec }) {
   return (
     <>
       <Err msg={error} />
-      <p className="sub">Agents are placeholders until Phase 2. Offline = no heartbeat for {offlineSec}s.</p>
+      <p className="sub">Offline = no heartbeat for {offlineSec}s. Slots 2-3 are placeholders.</p>
       {(data || []).map(a => <AgentCard key={a.id + a.updated_at} a={a} offlineSec={offlineSec} onSaved={reload} />)}
+      <Agent1Panel />
     </>
   )
 }

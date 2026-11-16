@@ -9,6 +9,7 @@ import Approvals from './Approvals.jsx'
 import ApiUsage from './ApiUsage.jsx'
 import Health from './Health.jsx'
 import Settings from './Settings.jsx'
+import { useAgent1Heartbeat } from './Agent1.jsx'
 
 const TABS = [
   ['overview', '🏠', 'Overview'],
@@ -47,6 +48,8 @@ export default function App() {
       else setOwner(false)
     })
   }, [session, loadSettings])
+
+  useAgent1Heartbeat(Boolean(owner))
 
   if (session === undefined) return <div className="empty">Loading...</div>
   if (!session) return <Login />

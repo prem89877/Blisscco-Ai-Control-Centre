@@ -16,8 +16,8 @@ npm run build
 git add . && git commit -m "update" && git push
 ```
 
-## Test data (Supabase SQL editor)
-```
-insert into ai_control.approvals (title, details)
-values ('Test approval', '{"note":"demo"}');
-```
+## Agent 1 (Infrastructure & Deployment)
+Code: `agent1/*.ts` -> built to `agent1/dist` by `npm run build`. API: `/api/agent1`. UI: Agents tab.
+Env vars: see `.env.example` (AGENT1_*). No SQL migration needed.
+Termux: `npm install && npm test` then `npm run agent1 -- health` (secrets in `.env.agent1`, git-ignored).
+Details and test evidence: `09-AGENT1-REPORT.md`.
