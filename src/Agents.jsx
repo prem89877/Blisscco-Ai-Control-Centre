@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { supabase } from './supabaseClient'
 import { usePoll, q, Badge, Err, Loading, Icon, timeAgo, effStatus, logAction } from './ui.jsx'
 import Agent1Panel from './Agent1.jsx'
+import Agent2Panel from './Agent2.jsx'
 
 function AgentCard({ a, offlineSec, onSaved }) {
-  const hasConsole = a.slot === 1
+  const hasConsole = a.slot === 1 || a.slot === 2
   const [open, setOpen] = useState(false)
   const [edit, setEdit] = useState(false)
   const [name, setName] = useState(a.name)
@@ -33,7 +34,7 @@ function AgentCard({ a, offlineSec, onSaved }) {
         {open && (
           <div className="drop-body">
             <Err msg={err} />
-            {hasConsole && <><div className="sec-title">Console</div><Agent1Panel /></>}
+            {hasConsole && <><div className="sec-title">Console</div>{a.slot === 1 ? <Agent1Panel /> : <Agent2Panel />}</>}
             {!hasConsole && <div className="sub">No console for this slot yet.</div>}
             <div className="sec-title">Details</div>
             {edit ? (

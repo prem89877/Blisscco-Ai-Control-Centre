@@ -3,6 +3,10 @@
     "api/agent1.js": {
       "maxDuration": 60,
       "includeFiles": "agent1/dist/**"
+    },
+    "api/agent2.js": {
+      "maxDuration": 60,
+      "includeFiles": "agent2/dist/**"
     }
   },
   "rewrites": [

@@ -10,6 +10,7 @@ import ApiUsage from './ApiUsage.jsx'
 import Health from './Health.jsx'
 import Settings from './Settings.jsx'
 import { useAgent1Heartbeat } from './Agent1.jsx'
+import { useAgent2Heartbeat } from './Agent2.jsx'
 import { Icon } from './ui.jsx'
 
 const TABS = [
@@ -51,6 +52,7 @@ export default function App() {
   }, [session, loadSettings])
 
   useAgent1Heartbeat(Boolean(owner))
+  useAgent2Heartbeat(Boolean(owner))
 
   if (session === undefined) return <div className="empty">Loading...</div>
   if (!session) return <Login />
