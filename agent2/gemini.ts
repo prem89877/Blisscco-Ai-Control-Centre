@@ -57,4 +57,4 @@ async function ask(cfg: Config, system: string, input: unknown, maxOut: number, 
 export const review = (cfg: Config, digest: unknown) => ask(cfg, REVIEW, digest, 1200, false, 14000)
 export const proposeFix = (cfg: Config, input: unknown) => ask(cfg, FIX, input, 16000, true, 60000)
 
-export const planCommand = (cfg: Config, input: unknown) => ask(cfg, PLAN, input, 600, true, 8000)
+export const planCommand = (cfg: Config, input: unknown) => ask(cfg, PLAN, input, 4000, true, 8000)

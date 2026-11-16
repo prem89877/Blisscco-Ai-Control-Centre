@@ -568,6 +568,7 @@ test('ai_command: anything else (codespace, shell, production merge) is declined
   planReply = JSON.stringify({ intent: 'codespace_run', explanation: 'cannot run code in a codespace' })
   const r = await ask('codespace mai yeh code run karo'); assert.equal(r.result.unsupported, true)
   planReply = JSON.stringify({ intent: 'unsupported', explanation: 'no' }); assert.equal((await ask('rm -rf')).result.unsupported, true)
+  planReply = 'Here you go:\n```json\n{"intent":"unsupported","explanation":"wrapped"}\n```'; assert.equal((await ask('x')).understood.explanation, 'wrapped')
   planReply = 'not json'; await must('ai_command', { repo: REPO, text: 'x' }, 502, 'ai_bad_output')
   await must('ai_command', { repo: REPO, text: '  ' }, 400)
   assert.equal(ghWrites.length, 0); assert.equal(db.approvals.length, 0)

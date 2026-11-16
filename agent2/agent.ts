@@ -388,7 +388,7 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   await recordAi(ctx, 'ai_command', r)
   if (!r.text) throw new AgentError('Gemini could not read the request: ' + (r.error || 'no answer'), 502, 'ai_unavailable')
   let plan: any
-  try { plan = JSON.parse(r.text.replace(/^```(?:json)?\s*|\s*```$/g, '').trim()) } catch { throw new AgentError('Gemini answer was not valid JSON. Try again in simpler words.', 502, 'ai_bad_output') }
+  try { const a = r.text.indexOf('{'), b = r.text.lastIndexOf('}'); plan = JSON.parse(r.text.slice(a, b + 1)) } catch { throw new AgentError('Gemini answer was not valid JSON. Try again in simpler words.', 502, 'ai_bad_output') }
   const INTENTS = ['check_ci', 'list_branches', 'inspect', 'delete_branch', 'run_workflow', 'fix_code']
   const intent = INTENTS.includes(String(plan && plan.intent)) ? String(plan.intent) : 'unsupported'
   const understood = { intent, explanation: String((plan && plan.explanation) || '').slice(0, 300) }
