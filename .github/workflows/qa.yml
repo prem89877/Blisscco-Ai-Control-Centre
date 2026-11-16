@@ -29,6 +29,9 @@ jobs:
       QA_ADMIN_EMAIL: ${{ secrets.QA_ADMIN_EMAIL }}
       QA_ADMIN_PASSWORD: ${{ secrets.QA_ADMIN_PASSWORD }}
       QA_ADMIN_LANDING: ${{ secrets.QA_ADMIN_LANDING }}
+      QA_CRAWL_MAX: ${{ secrets.QA_CRAWL_MAX }}
+      QA_ADVERTISER_FORBIDDEN: ${{ secrets.QA_ADVERTISER_FORBIDDEN }}
+      QA_PUBLISHER_FORBIDDEN: ${{ secrets.QA_PUBLISHER_FORBIDDEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
