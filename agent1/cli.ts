@@ -16,7 +16,8 @@ const MAP: Record<string, string> = { health: 'health_report', vercel: 'vercel_s
 
 async function main() {
   loadDotenv('.env.agent1')
-  const [cmd, ...rest] = process.argv.slice(2)
+  const [cmd, ...rest0] = process.argv.slice(2)
+  const rest = rest0.filter(x => x !== '--json')
   const action = MAP[cmd || '']
   if (!action) { console.log('Usage: npm run agent1 -- <' + Object.keys(MAP).join('|') + '> [--key=value]\nSecret values: --value-env=ENV_NAME (never put values on the command line)'); process.exit(cmd ? 1 : 0) }
   const a: Record<string, string> = {}
@@ -31,8 +32,16 @@ async function main() {
   const ctx = makeCtx(loadConfig(), { type: 'system', id: null })
   const res = await runAction(ctx, action, params)
   const r = res.result || res
+  const full = process.argv.includes('--json')
   if (r.ai_summary) console.log('\n' + r.ai_summary + '\n')
-  if (r.issues) for (const i of r.issues) console.log(`[${i.severity.toUpperCase()}] ${i.target ? i.target + ': ' : ''}${i.message}`)
-  console.log(JSON.stringify(res, null, 2).slice(0, 6000))
+  if (r.overall) console.log('Overall: ' + r.overall + '  ' + JSON.stringify(r.counts))
+  if (r.issues) for (const i of r.issues) console.log(`[${String(i.severity).toUpperCase()}] ${i.target ? i.target + ': ' : ''}${i.message}`)
+  if (Array.isArray(r.projects)) for (const p of r.projects) {
+    console.log(`\n${p.name}${p.error ? ' (error: ' + p.error + ')' : ''}`)
+    for (const e of p.env || []) console.log(`  ${e.key} [${e.type}] ${(e.targets || []).join(',')}`)
+    for (const d of p.deployments || []) console.log(`  deploy ${d.state} ${d.target || ''} ${d.branch || ''} ${d.at}`)
+  }
+  if (full || !r.overall) console.log(JSON.stringify(res, null, 2))
+  else console.log('\ntask_id: ' + res.task_id + '  (add --json for full output)')
 }
 main().catch(e => { console.error('Agent1 error:', errMsg(e)); process.exit(1) })
