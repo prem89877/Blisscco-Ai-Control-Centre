@@ -327,10 +327,10 @@ export async function securityChecks(ctx: Ctx, origin: string, repo?: string) {
   // input validation: hostile strings in query params on GET, non-billing paths only, anonymous
   let inputIssues = 0, inputRuns = 0
   const getPaths = [...ctx.cfg.endpoints.filter(e => e.method !== 'POST').map(e => e.path), ...ctx.cfg.webPaths].filter(p => !isBillingRisk(p)).slice(0, 6)
-  for (const path of getPaths) for (const pl of C.PAYLOADS) {
-    const r = await hit(ctx, origin, path + (path.includes('?') ? '&' : '?') + 'q=' + encodeURIComponent(pl.value))
-    inputRuns++
-    const fs = C.analyzeInputProbe(path, pl.name, pl.value, r); inputIssues += fs.length; f.push(...fs)
+  const jobs = getPaths.flatMap(path => C.PAYLOADS.map(pl => ({ path, pl })))
+  for (let i = 0; i < jobs.length; i += 8) {
+    const rs = await Promise.all(jobs.slice(i, i + 8).map(async ({ path, pl }) => ({ path, pl, r: await hit(ctx, origin, path + (path.includes('?') ? '&' : '?') + 'q=' + encodeURIComponent(pl.value)) })))
+    for (const { path, pl, r } of rs) { inputRuns++; const fs = C.analyzeInputProbe(path, pl.name, pl.value, r); inputIssues += fs.length; f.push(...fs) }
   }
   ev.push({ check: 'Input validation (SQLi / XSS / traversal / long input, anonymous GET, non-billing paths)', ok: inputIssues === 0, detail: `${inputRuns} probe(s), ${inputIssues} issue(s). Billing-risk paths excluded.` })
   // repo: secrets + dependency vulnerabilities
@@ -343,10 +343,13 @@ export async function securityChecks(ctx: Ctx, origin: string, repo?: string) {
     const envFiles = tree.filter(t => t.type === 'blob' && /(^|\/)\.env(\..+)?$/.test(t.path) && !/\.(example|sample|template)$/.test(t.path))
     for (const e of envFiles) f.push({ id: 'sec.env_committed', area: 'security', severity: 'critical', title: '.env file committed to the repository', evidence: e.path, fix: 'Remove it from git history, rotate every key inside, add to .gitignore.', target: e.path })
     let repoHits = 0
-    for (const t of code) {
-      const txt = await gh.file(rp, t.path); if (!txt) continue
-      const hits = C.analyzeBundleText(t.path, txt)
-      repoHits += hits.length; f.push(...hits.map(h => ({ ...h, evidence: h.evidence.replace('public file', 'repo') })))
+    for (let i = 0; i < code.length; i += 10) {
+      const batch = await Promise.all(code.slice(i, i + 10).map(async t => ({ t, txt: await gh.file(rp, t.path) })))
+      for (const { t, txt } of batch) {
+        if (!txt) continue
+        const hits = C.analyzeBundleText(t.path, txt)
+        repoHits += hits.length; f.push(...hits.map(h => ({ ...h, evidence: h.evidence.replace('public file', 'repo') })))
+      }
     }
     ev.push({ check: 'Secrets in repository (code, config, SQL)', ok: repoHits === 0 && !envFiles.length, detail: `${code.length} file(s) scanned, ${repoHits} hit(s), ${envFiles.length} committed .env` })
     const dep = await depAudit(ctx, gh, rp)
@@ -393,11 +396,15 @@ async function fullReport(ctx: Ctx, p: any): Promise<Out> {
     const guarded = async (name: string, fn: () => Promise<{ f: Finding[]; ev: Ev[] }>) => {
       try { parts.push({ name, ...(await fn()) }) } catch (e) { parts.push({ name, f: [], ev: [{ check: name, ok: false, detail: 'FAILED TO RUN: ' + errMsg(e).slice(0, 160) }] }) }
     }
-    await guarded('website', async () => { const r = await websiteChecks(ctx, origin); return { f: r.f, ev: r.ev } })
-    await guarded('auth', () => authChecks(ctx, origin))
-    await guarded('api', () => apiChecks(ctx, origin))
-    await guarded('database', () => dbChecks(ctx))
-    await guarded('security', () => securityChecks(ctx, origin, repo))
+    await Promise.all([
+      guarded('website', async () => { const r = await websiteChecks(ctx, origin); return { f: r.f, ev: r.ev } }),
+      guarded('auth', () => authChecks(ctx, origin)),
+      guarded('api', () => apiChecks(ctx, origin)),
+      guarded('database', () => dbChecks(ctx)),
+      guarded('security', () => securityChecks(ctx, origin, repo))
+    ])
+    const ORDER = ['website', 'auth', 'api', 'database', 'security']
+    parts.sort((a, b) => ORDER.indexOf(a.name) - ORDER.indexOf(b.name))
     const findings = parts.flatMap(x => x.f)
     const evidence = parts.flatMap(x => x.ev.map(e => ({ ...e, check: x.name + ': ' + e.check })))
     const rep: any = report('Full QA, Testing & Security report', findings, evidence, { target: origin, sections: parts.map(x => ({ name: x.name, findings: x.f.length, tests: x.ev.length, passed: x.ev.filter(e => e.ok).length })), not_run: evidence.filter(e => /SKIPPED|FAILED TO RUN/.test(e.detail)).map(e => e.check), billing_safety: 'No billing event, charge, earning or payout was created. Billing-risk endpoints received only no-key/invalid-key requests. Database access was read-only.', rate_limit: 'Not run automatically: needs your approval (Rate-limit test).' })
