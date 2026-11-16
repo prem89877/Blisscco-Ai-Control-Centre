@@ -5,3 +5,7 @@ dist
 !.env.example
 .vercel
 .agent2
+.agent3
+e2e/node_modules
+e2e/test-results
+e2e/playwright-report

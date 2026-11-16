@@ -25,10 +25,10 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Agent 1 tests (typecheck + node:test)
+      - name: Agent 1, 2, 3 tests (typecheck + node:test)
         run: npm test
 
-      - name: Build (agent1 + dashboard)
+      - name: Build (agents + dashboard)
         run: npm run build
         env:
           VITE_SUPABASE_URL: https://example.supabase.co
