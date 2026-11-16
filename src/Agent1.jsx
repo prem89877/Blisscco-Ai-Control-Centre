@@ -129,21 +129,51 @@ function ApplyDb({ a, onDone, setErr }) {
 }
 
 function RedeployRequest({ onResult, setErr }) {
+  const [opts, setOpts] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [target, setTarget] = useState('preview')
   const [project, setProject] = useState('')
   const [deployment, setDeployment] = useState('')
   const [busy, setBusy] = useState(false)
+
+  async function load() {
+    setLoading(true); setErr('')
+    try {
+      const r = await callAgent1('vercel_options')
+      const list = (r.result && r.result.projects) || []
+      setOpts(list); setProject(p => (list.some(x => x.name === p) ? p : (list[0] ? list[0].name : ''))); setDeployment('')
+    } catch (e) { setErr(e.message) }
+    setLoading(false)
+  }
+  useEffect(() => { load() }, [])
+
+  const proj = (opts || []).find(x => x.name === project)
+  const deps = ((proj && proj.deployments) || []).filter(d => d.target === target)
+
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent1('request_redeploy', { project, deployment: deployment || undefined })); setDeployment('') }
+    try { onResult(await callAgent1('request_redeploy', { project, target, deployment })); setDeployment('') }
     catch (e) { setErr(e.message) }
     setBusy(false)
   }
   return (
     <div className="card">
-      <b>Request redeploy</b> <span className="sub">(needs your approval; empty deployment = latest)</span>
-      <input placeholder="Vercel project name" value={project} onChange={e => setProject(e.target.value)} style={{ marginTop: 8 }} />
-      <input placeholder="Deployment id (optional)" value={deployment} onChange={e => setDeployment(e.target.value)} />
-      <button className="btn" disabled={busy || !project} onClick={go}>Request approval</button>
+      <div className="row"><b>Request redeploy</b><button className="btn ghost" disabled={loading} onClick={load}>{loading ? 'Loading...' : 'Refresh'}</button></div>
+      <span className="sub">Needs your approval. Production also needs a confirmation tick.</span>
+      <select value={target} onChange={e => { setTarget(e.target.value); setDeployment('') }} style={{ marginTop: 8 }}>
+        <option value="preview">Preview</option>
+        <option value="production">Production</option>
+      </select>
+      <select value={project} onChange={e => { setProject(e.target.value); setDeployment('') }} disabled={!opts || !opts.length}>
+        {!opts && <option value="">Loading projects...</option>}
+        {opts && !opts.length && <option value="">No projects found</option>}
+        {(opts || []).map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
+      </select>
+      <select value={deployment} onChange={e => setDeployment(e.target.value)} disabled={!deps.length}>
+        <option value="">{deps.length ? 'Latest ' + target + ' deployment' : 'No ' + target + ' deployments'}</option>
+        {deps.map(d => <option key={d.id} value={d.id}>{d.id.slice(0, 14)} | {d.state} | {d.branch || '-'} | {timeAgo(d.at)}</option>)}
+      </select>
+      <button className="btn" disabled={busy || !project || !deps.length} onClick={go}>Request approval</button>
     </div>
   )
 }

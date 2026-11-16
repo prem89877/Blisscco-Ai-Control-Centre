@@ -333,3 +333,18 @@ test('redeploy: approval gate, production ack, single execution, no write before
   assert.equal((await run('APPROVE-PRODUCTION') as any).status, 409); assert.equal(vercelWrites.length, 1)
   assert.equal((await post({ action: 'request_redeploy', params: { project: 'ai-control-center', deployment: 'zzz' } }) as any).status, 404)
 })
+
+test('vercel_options lists projects+deployments read-only; redeploy honours target', async () => {
+  reset()
+  const o: any = await post({ action: 'vercel_options' })
+  assert.equal(o.status, 200, JSON.stringify(o.body))
+  const pr = o.body.result.projects.find((x: any) => x.name === 'ai-control-center')
+  assert.ok(pr && pr.deployments.some((d: any) => d.id === 'd2' && d.target === 'preview'))
+  assert.equal(vercelWrites.length, 0)
+  const q: any = await post({ action: 'request_redeploy', params: { project: 'ai-control-center', target: 'preview' } })
+  assert.equal(q.status, 200, JSON.stringify(q.body)); assert.equal(q.body.result.production, false)
+  const bad: any = await post({ action: 'request_redeploy', params: { project: 'ai-control-center', target: 'preview', deployment: 'd1' } })
+  assert.equal(bad.status, 400)
+  assert.equal((await post({ action: 'request_redeploy', params: { project: 'ai-control-center', target: 'staging' } }) as any).status, 400)
+  assert.equal(vercelWrites.length, 0)
+})

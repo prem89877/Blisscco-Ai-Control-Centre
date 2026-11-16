@@ -9,7 +9,7 @@ import { analyzeProject, analyzeRls, classifyDbChange, classifyExecutableSql, co
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
-export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'deploy_logs', 'request_redeploy', 'apply_redeploy'] as const
+export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'deploy_logs', 'request_redeploy', 'apply_redeploy', 'vercel_options'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -277,11 +277,27 @@ async function deployLogs(ctx: Ctx, p: any): Promise<Out> {
   return { result: { generated_at: now(), overall: overall(issues), counts: countIssues(issues), issues: sortIssues(issues), deployments } }
 }
 
+// READ-ONLY lookup for the dashboard dropdowns (projects -> recent deployments). Not logged as a task: it runs on every page open.
+async function vercelOptions(ctx: Ctx): Promise<Out> {
+  const v = new Vercel(ctx.cfg, ctx.calls)
+  const projects: any[] = []
+  for (const pr of await v.listProjects()) {
+    let deployments: any[] = []
+    try { deployments = (await v.listDeployments(pr.id, 15)).map(d => ({ id: d.id, state: d.state, target: d.target, branch: d.branch, at: new Date(d.createdAt).toISOString() })) } catch { /* project shown without deployments */ }
+    projects.push({ name: pr.name, deployments })
+  }
+  return { result: { projects } }
+}
+
 async function requestRedeploy(ctx: Ctx, p: any): Promise<Out> {
   const project = await resolveProject(ctx, String(p.project || ''))
   const deps = await new Vercel(ctx.cfg, ctx.calls).listDeployments(project.id)
-  const src = p.deployment ? deps.find(d => d.id === String(p.deployment)) : deps[0]
+  const want = p.target ? String(p.target) : ''
+  if (want && !['preview', 'production'].includes(want)) throw new AgentError('target must be preview or production', 400, 'bad_target')
+  const pool = want ? deps.filter(d => d.target === want) : deps
+  const src = p.deployment ? deps.find(d => d.id === String(p.deployment)) : pool[0]
   if (!src) throw new AgentError('No matching deployment found in recent history', 404)
+  if (want && src.target !== want) throw new AgentError('Deployment is ' + src.target + ', not ' + want, 400, 'target_mismatch')
   const production = src.target === 'production'
   const title = `Redeploy ${project.name} (${src.id.slice(0, 14)}) [${src.target}]${production ? ' - PRODUCTION' : ''}`
   return withTask(ctx, 'request_redeploy', title, { project: project.name, deployment_id: src.id, target: src.target }, async taskId => {
@@ -332,6 +348,7 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'apply_db_change': return applyDbChange(ctx, params)
     case 'github_status': return withTask(ctx, action, 'GitHub repository status (read-only)', {}, () => githubStatus(ctx))
     case 'deploy_logs': return withTask(ctx, action, 'Vercel deployment error logs', { project: params.project || null }, () => deployLogs(ctx, params))
+    case 'vercel_options': return vercelOptions(ctx)
     case 'request_redeploy': return requestRedeploy(ctx, params)
     case 'apply_redeploy': return applyRedeploy(ctx, params)
   }
