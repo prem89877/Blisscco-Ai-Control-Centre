@@ -234,7 +234,12 @@ async function fake(input: any, init: any = {}): Promise<Response> {
       t.push(...out); return json(out, 201)
     }
     if (method === 'PATCH') { const hit = t.filter(filt); hit.forEach(r => Object.assign(r, body, { updated_at: new Date().toISOString() })); return json(hit) }
-    if (method === 'DELETE') { const hit = t.filter(filt); hit.forEach(r => t.splice(t.indexOf(r), 1)); return json(hit) }
+    if (method === 'DELETE') {
+      const hit = t.filter(filt)
+      // Same as the real database: activity_logs is append-only, so a task row that logs point to can never be deleted.
+      if (table === 'tasks' && hit.some(r => db.activity_logs.some((l: Row) => l.task_id === r.id))) return json({ message: 'ai_control.activity_logs is append-only' }, 400)
+      hit.forEach(r => t.splice(t.indexOf(r), 1)); return json(hit)
+    }
   }
   return json({ error: 'unrouted ' + url }, 500)
 }
@@ -1230,9 +1235,12 @@ test('delete: a finished ZIP task is removed, its ZIP + commit locks are release
   const dup = await post({ action: 'upload_zip', params: { ...p, request_id: randomUUID() } })
   assert.equal(dup.status, 409); assert.equal((dup.body as any).code, 'duplicate_zip'); assert.match(String((dup.body as any).error), /red Delete button/)
   assert.equal(locks('zip').length, 1); assert.equal(locks('commit').length, 1)
+  assert.ok(db.activity_logs.some((l: Row) => l.task_id === id), 'the task has log rows, so a real row delete would hit the append-only rule')
   const other = await post({ action: 'delete_workflow', params: { workflow_id: id } }, 'tok-other'); assert.equal(other.status, 403); assert.equal(orchRows().length, 1)
   const d = await ok('delete_workflow', { workflow_id: id })
-  assert.equal(d.deleted, true); assert.equal(d.released_locks, 2); assert.equal(orchRows().length, 0); assert.equal(locks().length, 0)
+  assert.equal(d.deleted, true); assert.equal(d.released_locks, 2); assert.equal(locks().length, 0)
+  assert.equal((await ok('list')).workflows.length, 0, 'hidden from the list'); await must('get', { workflow_id: id }, 404, 'not_found'); await must('delete_workflow', { workflow_id: id }, 404)
+  assert.ok(db.tasks.find(x => x.id === id)!.payload.deleted, 'the row is kept (activity_logs is append-only), only marked deleted')
   assert.ok(db.approvals.length > 0, 'approvals are kept'); assert.ok(refs.has(b), 'the agent2 branch on GitHub is not touched')
   const again = await ok('upload_zip', zipParams(CODE_ZIP, { title: 'ZIP: again' })); approve(again.workflow.steps.approval.id)
   const ap2 = await ok('apply', { workflow_id: again.workflow.id }); assert.notEqual(ap2.workflow.steps.agent2_apply.branch, b); assert.equal(agentBranches().length, 2)
@@ -1245,10 +1253,10 @@ test('delete: SQL that already ran stays blocked (never runs twice); an uncertai
   approve(sqlApprovals()[0].id); sqlWritesAllowed = true; await ok('apply_sql', { workflow_id: u.id, db_ack: 'RUN-SQL' })
   assert.equal(stageOf(u.id), 'completed'); assert.equal(sqlExec.length, 1)
   const d = await ok('delete_workflow', { workflow_id: u.id }); assert.match(d.note, /never run twice/)
-  assert.equal(orchRows().length, 0); assert.equal(locks('sql').length, 1); assert.equal(locks('sql')[0].payload.status, 'applied'); assert.equal(locks('zip').length, 0)
+  assert.equal((await ok('list')).workflows.length, 0); assert.equal(locks('sql').length, 1); assert.equal(locks('sql')[0].payload.status, 'applied'); assert.equal(locks('zip').length, 0)
   const again = await ok('upload_zip', zipParams(entries, { title: 'ZIP: again' }))
   assert.equal(again.workflow.zip.sql[0].status, 'blocked'); assert.match(again.workflow.zip.sql[0].reason, /already applied/); assert.equal(sqlExec.length, 1)
   const w = await ok('upload_zip', zipParams([{ name: 'src/Z.js', data: 'z' }])); const row = db.tasks.find(t => t.id === w.workflow.id)!
   row.payload.stage = 'failed'; row.payload.steps.sql = { items: [{ path: 'x.sql', status: 'uncertain' }] }
-  await must('delete_workflow', { workflow_id: w.workflow.id }, 409, 'sql_uncertain_open'); assert.ok(orchRows().some(r => r.id === w.workflow.id))
+  await must('delete_workflow', { workflow_id: w.workflow.id }, 409, 'sql_uncertain_open'); assert.ok((await ok('list')).workflows.some((x: Row) => x.id === w.workflow.id))
 })

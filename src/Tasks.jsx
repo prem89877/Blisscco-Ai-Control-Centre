@@ -47,7 +47,7 @@ export default function Tasks() {
   if (loading && !data) return <Loading />
   const agents = data ? data.agents : []
   const name = id => (agents.find(a => a.id === id) || {}).name || 'Unassigned'
-  const tasks = (data ? data.tasks : []).filter(t => filter === 'all' || t.status === filter)
+  const tasks = (data ? data.tasks : []).filter(t => !(t.payload && t.payload.deleted)).filter(t => filter === 'all' || t.status === filter)
 
   return (
     <>

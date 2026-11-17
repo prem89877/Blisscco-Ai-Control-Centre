@@ -50,16 +50,16 @@ export class OStore {
 
   async getWorkflow(id: string): Promise<Row | null> {
     if (!isUuid(id)) throw new AgentError('Bad workflow id', 400, 'bad_id')
-    return (await this.rest('GET', `tasks?select=*&id=eq.${id}&payload->>kind=eq.orchestration`))[0] || null
+    return (await this.rest('GET', `tasks?select=*&id=eq.${id}&payload->>kind=eq.orchestration&payload->>deleted=is.null`))[0] || null // a deleted workflow behaves as not found
   }
 
   listWorkflows(n = 30): Promise<Row[]> {
-    return this.rest('GET', `tasks?select=*&payload->>kind=eq.orchestration&order=created_at.desc&limit=${Math.min(100, Math.max(1, n))}`)
+    return this.rest('GET', `tasks?select=*&payload->>kind=eq.orchestration&payload->>deleted=is.null&order=created_at.desc&limit=${Math.min(100, Math.max(1, n))}`)
   }
 
   // Workflows that are not finished yet, whatever their age (so a long-running or forgotten one is never missed by a "latest N" list).
   listActiveWorkflows(): Promise<Row[]> {
-    return this.rest('GET', 'tasks?select=*&payload->>kind=eq.orchestration&status=in.(running,awaiting_approval)&order=created_at.desc&limit=100')
+    return this.rest('GET', 'tasks?select=*&payload->>kind=eq.orchestration&payload->>deleted=is.null&status=in.(running,awaiting_approval)&order=created_at.desc&limit=100')
   }
   // Persisted approval state (the ONLY source of the pending indicator): every approval whose status is still 'pending'.
   async listPendingApprovals(): Promise<Row[]> {
@@ -105,11 +105,8 @@ export class OStore {
     if (!isUuid(id) || !isUuid(holder)) return false
     return (await this.rest('DELETE', `tasks?id=eq.${id}&payload->>kind=eq.orchestration_lock&payload->>holder=eq.${holder}`)).length > 0
   }
-  // Removes one workflow row (approvals and activity_logs stay: their task_id is set to null by the existing foreign keys).
-  async deleteWorkflow(id: string): Promise<boolean> {
-    if (!isUuid(id)) throw new AgentError('Bad workflow id', 400, 'bad_id')
-    return (await this.rest('DELETE', `tasks?id=eq.${id}&payload->>kind=eq.orchestration`)).length > 0
-  }
+  // NOTE: a workflow row is never hard-deleted: activity_logs is append-only (its task_id foreign key cannot be nulled), so "delete" marks
+  // payload.deleted and every list / get above hides it. Only the lock rows (no log references) are really removed.
 
   // Optimistic lock: applies only while payload.rev is unchanged. Returns null if somebody else moved the workflow.
   async casUpdate(id: string, rev: number, patch: Row): Promise<Row | null> {

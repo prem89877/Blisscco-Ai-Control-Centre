@@ -912,8 +912,8 @@ export async function resolveSql(o: OCtx, p: any) {
 }
 
 // ---------------------------------------------------------------- dispatcher
-// Delete a FINISHED task (completed / failed / cancelled) from the list. Its zip + commit locks are released so the same ZIP / change set
-// can be uploaded again; locks of SQL that really ran stay (a migration must never run twice). Approvals and logs are kept (audit).
+// Delete (hide) a FINISHED task (completed / failed / cancelled) from the list. Its zip + commit locks are released so the same ZIP / change set
+// can be uploaded again; locks of SQL that really ran stay (a migration must never run twice). The row, approvals and logs are kept for audit.
 export async function deleteWorkflow(o: OCtx, p: any) {
   const wf = await load(o, p.workflow_id)
   const st = wf.payload
@@ -927,7 +927,7 @@ export async function deleteWorkflow(o: OCtx, p: any) {
     if (kind === 'sql' && status !== 'failed') { kept++; continue } // SQL that ran (or may have run) stays locked forever
     if (await o.store.deleteLock(String(l.id), wf.id)) released++
   }
-  await o.store.deleteWorkflow(wf.id)
+  await advance(o, wf, q => { q.deleted = { at: now(), by: o.userId } }) // hidden everywhere; the row itself stays (activity_logs is append-only)
   await o.store.log('info', 'orchestrator_workflow_deleted', 'Task deleted by owner: ' + String(wf.title || '').replace(/^Orchestrated: /, '').slice(0, 120), { stage: st.stage, released_locks: released, kept_locks: kept }, null, o.userId)
   return { deleted: true, workflow_id: wf.id, released_locks: released, kept_locks: kept, note: sqlRan ? 'The ZIP can be uploaded again, but the SQL that already ran stays blocked and will never run twice.' : 'The same ZIP / change set can be uploaded again.' }
 }
