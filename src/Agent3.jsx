@@ -63,6 +63,7 @@ function Report({ res, onRetest }) {
         </>
       )}
       {(r.evidence || []).length > 0 && <CodeBlock label={'evidence (' + r.evidence.length + ' checks)'} wrap={false} text={r.evidence.map(e => (e.ok ? 'PASS ' : 'FAIL ') + e.check + ' - ' + e.detail).join('\n')} />}
+      {(r.commands || []).map((c, i) => <CodeBlock key={i} label={'$ ' + c.cmd + '  (exit ' + c.code + ')'} tone={c.code === 0 ? 'good' : 'warn'} wrap={false} text={c.output || '(no output)'} />)}
       {(r.not_run || []).length > 0 && <CodeBlock label="not run (setup missing)" tone="warn" text={r.not_run.join('\n')} />}
       {r.billing_safety && <CodeBlock label="billing safety" tone="good" text={r.billing_safety} />}
       {r.next && <CodeBlock label="next step" tone="info" text={r.next} />}
@@ -103,6 +104,58 @@ function Apply({ a, onDone, onResult, setErr }) {
   )
 }
 
+const LOCAL_PRESETS = [
+  ['tests', 'Project tests (npm test)'],
+  ['build', 'Build (npm run build)'],
+  ['audit', 'Dependency audit'],
+  ['secrets', 'Secret scan of local files'],
+  ['git', 'Git status + .env safety'],
+  ['env', 'Env variables (names only)'],
+  ['system', 'Phone: Node, npm, disk'],
+  ['project', 'Project files sanity']
+]
+
+function LocalCard({ busy, setBusy, setErr, setRes, setQueuedId, rows, reload }) {
+  const [sel, setSel] = useState(['tests', 'git', 'secrets'])
+  const [cmd, setCmd] = useState('')
+  const toggle = id => setSel(s => (s.includes(id) ? s.filter(x => x !== id) : [...s, id]))
+  async function go(label, fn) {
+    setBusy(label); setErr('')
+    try { const r = await fn(); setRes(r); if (r.status === 'queued') setQueuedId(r.task_id); return r } catch (e) { setErr(e.message) } finally { setBusy('') }
+  }
+  return (
+    <>
+      <div className="card">
+        <b>Termux Checks</b> <span className="sub">(runs on your phone, not on Vercel)</span>
+        <div style={{ margin: '8px 0' }}>
+          {LOCAL_PRESETS.map(([id, label]) => (
+            <label key={id} className="sub" style={{ display: 'block', margin: '4px 0' }}>
+              <input type="checkbox" checked={sel.includes(id)} onChange={() => toggle(id)} style={{ width: 'auto' }} /> {label}
+            </label>
+          ))}
+        </div>
+        <div className="actions" style={{ flexWrap: 'wrap' }}>
+          <button className="btn ghost" onClick={() => setSel(sel.length === LOCAL_PRESETS.length ? [] : LOCAL_PRESETS.map(p => p[0]))}>{sel.length === LOCAL_PRESETS.length ? 'Clear all' : 'Select all'}</button>
+          <button className="btn" disabled={!!busy || !sel.length} onClick={() => go('local', () => callAgent3('queue_local', { presets: sel }))}>{busy === 'local' ? 'Queueing...' : 'Run on Termux'}</button>
+        </div>
+        <div className="sub" style={{ marginTop: 6 }}>Termux me: <code>npm run agent3 -- worker --once</code></div>
+      </div>
+      <div className="card">
+        <b>Custom command</b> <span className="sub">(needs your approval)</span>
+        <input placeholder="e.g. git status -sb  /  grep -rn TODO src" value={cmd} onChange={e => setCmd(e.target.value)} autoCapitalize="none" autoCorrect="off" />
+        <button className="btn ghost" disabled={!!busy || !cmd.trim()} onClick={async () => { const r = await go('cmd', () => callAgent3('request_local_command', { command: cmd })); if (r) { setCmd(''); reload() } }}>{busy === 'cmd' ? 'Checking...' : 'Request approval'}</button>
+        <div className="sub" style={{ marginTop: 6 }}>Sirf padhne wale commands: ls, cat, head, tail, wc, grep, find, du, df, git status/log/diff --stat, npm test/audit/ls. Delete, install, push, .env files aur shell symbols (; | &gt; $) blocked hain.</div>
+      </div>
+      {rows.length > 0 && <><div className="sec-title">Approved commands</div>{rows.map(a => (
+        <div className="card" key={a.id}>
+          <div className="row"><b style={{ wordBreak: 'break-all' }}>{a.details.command}</b><Badge s="approved" /></div>
+          <button className="btn ok" disabled={!!busy} onClick={async () => { await go('queuecmd', () => callAgent3('queue_local_command', { approval_id: a.id })); reload() }}>{busy === 'queuecmd' ? 'Queueing...' : 'Queue on Termux'}</button>
+        </div>
+      ))}</>}
+    </>
+  )
+}
+
 export default function Agent3Panel() {
   const [hb, setHb] = useState(null)
   const [res, setRes] = useState(null)
@@ -119,6 +172,7 @@ export default function Agent3Panel() {
   const { data: ready, reload } = usePoll(() =>
     q(supabase.from('approvals').select('*').eq('status', 'approved').order('decided_at', { ascending: false }).limit(30)), [], 15000)
   const rows = (ready || []).filter(a => a.details && a.details.kind === 'rate_test' && !a.details.executed_at)
+  const localRows = (ready || []).filter(a => a.details && a.details.kind === 'local_command' && !a.details.executed_at)
   const targets = (hb && hb.targets) || []
   const repos = (hb && hb.repos) || []
 
@@ -174,6 +228,7 @@ export default function Agent3Panel() {
           {TESTS.map(([a, l]) => <button key={a} className={'btn' + (a === 'full_report' ? '' : ' ghost')} disabled={!!busy || !targets.length} onClick={() => run(a)}>{busy === a ? 'Testing...' : l}</button>)}
         </div>
       </div>
+      <LocalCard busy={busy} setBusy={setBusy} setErr={setErr} setRes={setRes} setQueuedId={setQueuedId} rows={localRows} reload={reload} />
       <div className="card">
         <b>Ask Agent 3</b> <span className="sub">(AI picks ONE read-only test)</span>
         <textarea rows={2} placeholder="e.g. api test karo / security check chalao" value={text} onChange={e => setText(e.target.value)} />

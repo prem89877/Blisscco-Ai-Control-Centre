@@ -3,7 +3,7 @@ import { isBillingRisk, scanSecrets, jwtRole } from './guard.js'
 import type { Probe } from './util.js'
 
 export type Sev = 'critical' | 'high' | 'medium' | 'low' | 'info'
-export interface Finding { id: string; area: 'website' | 'auth' | 'api' | 'database' | 'security' | 'mobile'; severity: Sev; title: string; evidence: string; fix: string; target?: string }
+export interface Finding { id: string; area: 'website' | 'auth' | 'api' | 'database' | 'security' | 'mobile' | 'local'; severity: Sev; title: string; evidence: string; fix: string; target?: string }
 const RANK: Record<Sev, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
 export const sortFindings = (f: Finding[]) => [...f].sort((a, b) => RANK[a.severity] - RANK[b.severity])
 export function countFindings(f: Finding[]) { const c: Record<Sev, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 }; for (const x of f) c[x.severity]++; return c }

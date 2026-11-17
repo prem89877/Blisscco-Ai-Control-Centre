@@ -7,6 +7,11 @@ import { redact } from './util.js'
 import { handleRequest } from './server.js'
 import { makeCtx, runAction } from './agent.js'
 import { workOnce } from './worker.js'
+import { parseCommand, runLocal, runOne, realExec, scanLocalSecrets, analyzeTests, analyzeAudit, analyzeGit, analyzeEnv, analyzeBuild, ALLOWED_HELP, type ExecFn } from './local.js'
+import { maskSecrets } from './guard.js'
+import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const REF = 'abcdref'
 const SITE = 'https://qa.example.com'
@@ -366,6 +371,118 @@ test('termux queue: only the six read-only tests; foreign targets and foreign qu
   assert.equal(db.tasks[0].status, 'queued'); assert.equal(db.tasks[2].status, 'queued')
   assert.equal(db.tasks[1].status, 'failed'); assert.match(db.tasks[1].error_message, /AGENT3_TARGETS/)
   assert.deepEqual(otherHostCalls, [])
+})
+
+// ================================================================ Termux local checks
+let execCalls: string[]
+const fakeExec: ExecFn = async (bin, args) => {
+  const line = [bin, ...args].join(' '); execCalls.push(line)
+  const ok = (out: string, code = 0) => ({ code, out, ms: 5, timedOut: false })
+  if (line === 'npm test') return ok('# tests 85\n# pass 85\n# fail 0\n')
+  if (line === 'npm run build') return ok('built')
+  if (line.startsWith('npm audit')) return ok(JSON.stringify({ metadata: { vulnerabilities: { low: 0, moderate: 1, high: 1, critical: 0 } } }), 1)
+  if (line.includes('status -sb')) return ok('## main...origin/main [ahead 1]\n M src/a.js\n?? .env.local\n')
+  if (line.includes('log --oneline')) return ok('abc123 msg')
+  if (line.startsWith('git check-ignore')) return ok('', 1)
+  if (line === 'node -v') return ok('v22.1.0'); if (line === 'npm -v') return ok('10.0.0')
+  if (line === 'df -h') return ok('/dev/x 100G 40G 60G 40% /'); if (line === 'uname -a') return ok('Linux localhost')
+  if (line.startsWith('cat package.json')) return ok('{"a":1}\ntoken = ghp_abcdefghijklmnopqrstuvwxyz0123\n')
+  return ok('')
+}
+const ALLOW = ['ls -la src', 'ls', 'cat package.json', 'head -n 20 README.md', 'tail -n 5 agent3/agent.ts', 'wc -l package.json', 'grep -rn TODO src', 'grep -rni "service role" agent3', 'find src -name "*.jsx" -type f', 'find . -maxdepth 2 -type d', 'du -sh src', 'df -h', 'pwd', 'date', 'uname -a', 'node -v', 'npm -v', 'npm test', 'npm run build', 'npm audit --json', 'npm ls --depth=0', 'npm outdated', 'git status -sb', 'git log --oneline -n 5', 'git diff --stat', 'git branch -a', 'git ls-files', 'git show --stat HEAD']
+const DENY = ['rm -rf src', 'cat .env.agent3', 'cat .env', 'cat ../x', 'cat /etc/passwd', 'ls /data/data', 'ls ~', 'node -e "1"', 'node x.js', 'git push', 'git commit -m x', 'git remote -v', 'git diff', 'git log -n 500', 'git checkout main', 'npm install', 'npm run agent3', 'npm publish', 'curl http://x.com', 'wget x', 'sh -c ls', 'bash', 'ls; rm x', 'ls | cat', 'ls > f', 'cat $(ls)', 'echo `ls`', 'find . -exec rm {} +', 'find . -delete', 'find . -ok ls', 'grep -r x ..', 'grep -rn password .env', 'cat package.json .env.local', 'ls .git', 'cat .git/config', 'cat id_rsa', 'cat key.pem', 'head -n 99999 x', 'chmod 777 x', 'mv a b', 'cp a b', 'tee x', 'sed -i x y', 'python -c 1', 'ls -la\nrm x', '', 'grep TODO', "ls 'a'", 'cat .agent3/x', 'cat secrets.txt', 'git status && ls']
+test('custom command guard: allow-list accepts safe reads only', () => {
+  for (const c of ALLOW) assert.doesNotThrow(() => parseCommand(c), c)
+  for (const c of DENY) assert.throws(() => parseCommand(c), /not allowed/, JSON.stringify(c))
+  assert.throws(() => parseCommand(undefined)); assert.ok(ALLOWED_HELP.includes('git'))
+  const g = parseCommand('grep -rn TODO src')
+  assert.ok(g.args.includes('--exclude=.env*') && g.args.includes('--exclude-dir=.git') && g.args.at(-2) === '--')
+  assert.ok(parseCommand('find . -name x').args.includes('-not'))
+  assert.deepEqual(parseCommand('git log').args, ['--no-pager', 'log', '-n', '20'])
+})
+test('maskSecrets hides tokens in command output', () => {
+  const m = maskSecrets(`a ghp_abcdefghijklmnopqrstuvwxyz0123 b ${SVC_JWT} c api_key = "abcdefghijklmnopqrstuvwx" ok`)
+  assert.ok(!m.includes('ghp_abc') && !m.includes('eyJ') && !m.includes('abcdefghijklmnopqrstuvwx')); assert.ok(m.includes('[REDACTED]') && m.endsWith('ok'))
+})
+test('local analyzers', () => {
+  assert.equal(analyzeTests(0, '# pass 5\n# fail 0').length, 0)
+  assert.match(analyzeTests(1, '# pass 4\n# fail 1\nnot ok 3 - bad thing')[0].evidence, /bad thing/)
+  assert.equal(analyzeBuild(0, '').length, 0); assert.equal(analyzeBuild(1, 'x\nError: boom')[0].severity, 'high')
+  assert.deepEqual(analyzeAudit(JSON.stringify({ metadata: { vulnerabilities: { low: 1, moderate: 0, high: 2, critical: 0 } } })).map(f => f.severity), ['high', 'low'])
+  assert.equal(analyzeAudit('garbage')[0].severity, 'info')
+  assert.equal(analyzeGit(0, '## main\n', 1)[0].id, 'local.env_not_ignored')
+  assert.ok(analyzeGit(0, '## main\n?? .env.local\n', 0).some(f => f.id === 'local.env_untracked' && f.severity === 'critical'))
+  assert.equal(analyzeGit(0, '## main\n?? .env.example\n', 0).filter(f => f.severity === 'critical').length, 0)
+  assert.equal(analyzeGit(128, 'fatal', 128)[0].id, 'local.not_git')
+  const e = analyzeEnv({ SUPABASE_URL: 'x', AGENT3_API_ENDPOINTS: '{bad' })
+  assert.ok(e.f.some(f => f.id === 'local.env_missing') && e.f.some(f => f.id === 'local.env_json'))
+  assert.ok(!JSON.stringify(analyzeEnv({ SUPABASE_URL: 'sekret-value-123' })).includes('sekret-value-123'))
+})
+test('local secret scan: finds service_role, skips env files and node_modules, never prints values', () => {
+  const d = mkdtempSync(join(tmpdir(), 'qa-')); mkdirSync(join(d, 'node_modules')); mkdirSync(join(d, 'src'))
+  writeFileSync(join(d, 'src', 'a.js'), `const k = "${SVC_JWT}"`)
+  writeFileSync(join(d, '.env.agent3'), `KEY=${SVC_JWT}`)
+  writeFileSync(join(d, 'node_modules', 'x.js'), `const k = "${SVC_JWT}"`)
+  writeFileSync(join(d, 'src', 'ok.js'), `const a = "${ANON}"`)
+  const r = scanLocalSecrets(d)
+  assert.equal(r.f.length, 1); assert.equal(r.f[0].severity, 'critical'); assert.match(r.f[0].target!, /a\.js$/); assert.ok(!JSON.stringify(r).includes(SVC_JWT)); assert.equal(r.files, 2)
+})
+test('runLocal presets with a fake phone', async () => {
+  execCalls = []
+  const r = await runLocal(['tests', 'build', 'audit', 'git', 'system', 'env'], fakeExec, process.cwd(), { SUPABASE_URL: 'u' })
+  const f = r.findings.map(x => x.id)
+  for (const id of ['local.audit_high', 'local.audit_moderate', 'local.env_not_ignored', 'local.env_untracked', 'local.dirty', 'local.git_sync', 'local.env_missing']) assert.ok(f.includes(id), id + ': ' + f)
+  assert.ok(!f.includes('local.tests_failed')); assert.ok(execCalls.includes('npm test') && execCalls.includes('node -v'))
+  assert.ok(r.commands.length >= 9); assert.ok(r.evidence.find(e => e.check === 'npm test')!.ok)
+})
+test('runOne really runs a harmless command (no shell)', async () => {
+  const r = await runOne(parseCommand('node -v'), realExec, process.cwd())
+  assert.equal(r.code, 0); assert.match(r.output, /^v\d+/)
+})
+test('termux checks: dashboard queues, Vercel refuses to run them, worker runs on the same task', async () => {
+  execCalls = []
+  const q = await runAction(ctx(), 'queue_local', { presets: ['tests', 'git', 'bogus'] })
+  assert.equal(q.status, 'queued'); assert.deepEqual(db.tasks[0].payload.presets, ['tests', 'git']); assert.equal(execCalls.length, 0)
+  await assert.rejects(() => runAction(ctx(), 'local_check', { presets: ['tests'] }), /inside Termux|only runs/)
+  await assert.rejects(() => runAction(ctx(), 'queue_local', { presets: ['rm -rf'] }), /at least one/)
+  assert.equal(await workOnce(loadConfig(ENV), { type: 'system', id: null }, () => {}, fakeExec), 1)
+  assert.equal(db.tasks.length, 1); assert.equal(db.tasks[0].status, 'succeeded')
+  assert.ok(db.tasks[0].result.commands.length > 0); assert.equal(db.tasks[0].result.title, 'Termux checks')
+  assert.ok(execCalls.includes('npm test'))
+})
+test('termux custom command: approval -> queue -> worker, single use, dangerous commands refused up front', async () => {
+  execCalls = []
+  await assert.rejects(() => runAction(ctx(), 'request_local_command', { command: 'cat .env.agent3' }), /not allowed/)
+  await assert.rejects(() => runAction(ctx(), 'request_local_command', { command: 'rm -rf /' }), /not allowed/)
+  assert.equal((db.approvals || []).length, 0)
+  const req = await runAction(ctx(), 'request_local_command', { command: 'cat package.json' })
+  assert.equal(req.status, 'awaiting_approval'); const id = req.result.approval_id
+  await assert.rejects(() => runAction(ctx(), 'queue_local_command', { approval_id: id }), /Not approved/)
+  Object.assign(db.approvals.find(a => a.id === id)!, { status: 'approved', decided_at: new Date().toISOString() })
+  const q = await runAction(ctx(), 'queue_local_command', { approval_id: id })
+  assert.equal(q.status, 'queued'); assert.equal(execCalls.length, 0)
+  await assert.rejects(() => runAction(ctx(), 'queue_local_command', { approval_id: id }), /Already queued/)
+  assert.equal(await workOnce(loadConfig(ENV), { type: 'system', id: null }, () => {}, fakeExec), 1)
+  const done = db.tasks.find(t => t.id === q.task_id)!
+  assert.equal(done.status, 'succeeded'); assert.deepEqual(execCalls, ['cat package.json'])
+  assert.ok(!JSON.stringify(done.result).includes('ghp_abc'), 'token in output must be masked')
+  assert.ok(db.approvals.find(a => a.id === id)!.details.ran_at)
+  assert.equal(await workOnce(loadConfig(ENV), { type: 'system', id: null }, () => {}, fakeExec), 0)
+})
+test('termux custom command: tampered queue rows never execute', async () => {
+  execCalls = []
+  await runAction(ctx(), 'heartbeat')
+  const aid = db.agents.find(a => a.slot === 3)!.id
+  const ap = { id: uuid(), status: 'pending', details: { kind: 'local_command', command: 'cat package.json' } }
+  const ap2 = { id: uuid(), status: 'approved', decided_at: new Date().toISOString(), details: { kind: 'local_command', command: 'rm -rf src', executed_at: new Date().toISOString() } }
+  db.approvals = [ap, ap2]
+  db.tasks = [
+    { id: uuid(), agent_id: aid, status: 'queued', payload: { action: 'local_command', approval_id: ap.id, runner: 'termux' } },
+    { id: uuid(), agent_id: aid, status: 'queued', payload: { action: 'local_command', approval_id: ap2.id, runner: 'termux' } },
+    { id: uuid(), agent_id: aid, status: 'queued', payload: { action: 'local_command', approval_id: uuid(), runner: 'termux' } }
+  ]
+  await workOnce(loadConfig(ENV), { type: 'system', id: null }, () => {}, fakeExec)
+  assert.deepEqual(execCalls, []); assert.ok(db.tasks.every(t => t.status === 'failed'), JSON.stringify(db.tasks.map(t => t.status)))
 })
 
 // ================================================================ server

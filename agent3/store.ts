@@ -114,5 +114,9 @@ export class Store {
     const rows = await this.rest('PATCH', `approvals?id=eq.${id}&details->>executed_at=is.null`, { details })
     return rows.length > 0
   }
+  async claimRun(id: string, details: Row): Promise<boolean> {
+    const rows = await this.rest('PATCH', `approvals?id=eq.${id}&details->>ran_at=is.null`, { details })
+    return rows.length > 0
+  }
   patchApproval(id: string, patch: Row) { return this.rest('PATCH', `approvals?id=eq.${id}`, patch) }
 }

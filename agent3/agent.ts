@@ -5,11 +5,12 @@ import { GitHub } from './github.js'
 import { summarize, planCommand, type AiResult } from './gemini.js'
 import { assertAuthorizedTarget, assertBillingSafe, assertReadOnlySql, isBillingRisk, validPath, validRepo, scanSecrets } from './guard.js'
 import * as C from './checks.js'
+import { parseCommand, runOne, runLocal, ensureProject, realExec, PRESET_IDS, ALLOWED_HELP, type ExecFn } from './local.js'
 import type { Finding } from './checks.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
-export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number>; adopt?: string }
-export const ACTIONS = ['heartbeat', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task'] as const
+export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number>; adopt?: string; worker?: boolean; exec?: ExecFn }
+export const ACTIONS = ['heartbeat', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task', 'queue_local', 'request_local_command', 'queue_local_command', 'local_check', 'local_command'] as const
 export type Action = typeof ACTIONS[number]
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
 export const now = () => new Date().toISOString()
@@ -467,6 +468,67 @@ async function queueTask(ctx: Ctx, p: any): Promise<any> {
   return { task_id: t.id, status: 'queued', result: { title: 'Queued for Termux', next: 'Termux me chalao: npm run agent3 -- worker --once   (live rakhna ho to --once hata do)' } }
 }
 
+// ---------------------------------------------------------------- Termux local checks (presets + approved custom command)
+// Vercel only validates and queues. The commands themselves run ONLY in the Termux worker, in the project folder, with a minimal environment.
+const cleanPresets = (p: any): string[] => [...new Set<string>((Array.isArray(p.presets) ? (p.presets as unknown[]) : []).map(x => String(x)))].filter(x => PRESET_IDS.includes(x))
+async function queueLocal(ctx: Ctx, p: any): Promise<any> {
+  const presets = cleanPresets(p)
+  if (!presets.length) throw new AgentError('Pick at least one check', 400, 'bad_request')
+  await ctx.store.ensureAgent()
+  const t = await ctx.store.createTask({ title: 'Termux checks: ' + presets.join(', '), description: 'Agent 3 - Termux checks queued', status: 'queued', payload: { action: 'local_check', presets, runner: 'termux' }, created_by: ctx.actor.id })
+  await ctx.store.log('info', 'agent3_local_queued', presets.join(','), {}, t.id, ctx.actor.id)
+  return { task_id: t.id, status: 'queued', result: { title: 'Queued for Termux', next: 'Termux me chalao: npm run agent3 -- worker --once' } }
+}
+async function requestLocalCommand(ctx: Ctx, p: any): Promise<Out> {
+  const parsed = parseCommand(p.command) // rejects anything outside the allow-list BEFORE an approval is created
+  return withTask(ctx, 'request_local_command', 'Termux command: ' + parsed.display.slice(0, 80), { command: parsed.display }, async taskId => {
+    const details = { kind: 'local_command', command: parsed.display, note: 'Runs on your phone, in the project folder, read-only allow-list, no secrets in its environment: ' + parsed.display }
+    const ap = await ctx.store.createApproval({ task_id: taskId, title: 'Termux command: ' + parsed.display.slice(0, 80), details })
+    await ctx.store.log('warn', 'agent3_approval_requested', ap.id, { approval_id: ap.id }, taskId, ctx.actor.id)
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, next: 'Approvals tab me approve karo, phir yahan "Queue on Termux" dabao.' } }
+  })
+}
+async function queueLocalCommand(ctx: Ctx, p: any): Promise<any> {
+  const ap = await ctx.store.getApproval(String(p.approval_id || ''))
+  const d = ap && ap.details
+  if (!ap || !d || d.kind !== 'local_command') throw new AgentError('Approval not found', 404, 'not_found')
+  if (ap.status !== 'approved') throw new AgentError('Not approved yet (status: ' + ap.status + ')', 409, 'not_approved')
+  if (d.executed_at) throw new AgentError('Already queued', 409, 'already_executed')
+  if (!ap.decided_at || Date.now() - new Date(ap.decided_at).getTime() > 24 * 3600 * 1000) throw new AgentError('Approval older than 24h; request again', 409, 'expired')
+  const parsed = parseCommand(d.command)
+  if (!(await ctx.store.claimApproval(ap.id, { ...d, executed_at: now(), executed_by: ctx.actor.id }))) throw new AgentError('Already queued', 409, 'already_executed')
+  const t = await ctx.store.createTask({ title: 'Termux command: ' + parsed.display.slice(0, 80), description: 'Agent 3 - approved Termux command', status: 'queued', payload: { action: 'local_command', approval_id: ap.id, command: parsed.display, runner: 'termux' }, created_by: ctx.actor.id })
+  await ctx.store.log('info', 'agent3_local_command_queued', parsed.display, { approval_id: ap.id }, t.id, ctx.actor.id)
+  return { task_id: t.id, status: 'queued', result: { title: 'Queued for Termux', next: 'Termux me chalao: npm run agent3 -- worker --once' } }
+}
+const termuxOnly = (ctx: Ctx) => { if (!ctx.worker) throw new AgentError('This only runs inside Termux (npm run agent3 -- worker)', 400, 'termux_only') }
+async function localCheck(ctx: Ctx, p: any): Promise<Out> {
+  termuxOnly(ctx)
+  const presets = cleanPresets(p)
+  if (!presets.length) throw new AgentError('No valid checks selected', 400, 'bad_request')
+  const root = process.cwd(); ensureProject(root)
+  return withTask(ctx, 'local_check', 'Termux checks: ' + presets.join(', '), { presets }, async () => {
+    const r = await runLocal(presets, ctx.exec || realExec, root)
+    return { result: report('Termux checks', r.findings, r.evidence, { commands: r.commands, presets, note: 'Ran on your phone. No secrets were passed to the commands. Nothing was written to production.' }) }
+  })
+}
+async function localCommand(ctx: Ctx, p: any): Promise<Out> {
+  termuxOnly(ctx)
+  const ap = await ctx.store.getApproval(String(p.approval_id || ''))
+  const d = ap && ap.details
+  if (!ap || !d || d.kind !== 'local_command') throw new AgentError('Approval not found', 404, 'not_found')
+  if (ap.status !== 'approved' || !d.executed_at) throw new AgentError('Not approved/queued', 409, 'not_approved')
+  if (d.ran_at) throw new AgentError('Already ran', 409, 'already_executed')
+  const parsed = parseCommand(d.command) // validated again on the phone
+  const root = process.cwd(); ensureProject(root)
+  if (!(await ctx.store.claimRun(ap.id, { ...d, ran_at: now() }))) throw new AgentError('Already ran', 409, 'already_executed')
+  return withTask(ctx, 'local_command', 'Termux command: ' + parsed.display.slice(0, 80), { approval_id: ap.id }, async () => {
+    const r = await runOne(parsed, ctx.exec || realExec, root, parsed.bin === 'npm' ? 300_000 : 60_000)
+    const f: Finding[] = r.code === 0 ? [] : [{ id: 'local.command_failed', area: 'local', severity: 'low', title: 'Command exited with an error', evidence: `exit ${r.code}${r.timedOut ? ' (time limit)' : ''}`, fix: 'Read the output below.', target: parsed.display }]
+    return { result: report('Termux command', f, [{ check: parsed.display, ok: r.code === 0, detail: `exit ${r.code} in ${r.ms}ms` }], { commands: [{ cmd: r.cmd, code: r.code, ms: r.ms, output: r.output }], note: 'Allowed: ' + ALLOWED_HELP }) }
+  })
+}
+
 // ---------------------------------------------------------------- dispatcher
 async function heartbeat(ctx: Ctx): Promise<any> {
   const a = await ctx.store.heartbeat()
@@ -487,6 +549,11 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'retest': return retest(ctx, params)
     case 'ai_command': return aiCommand(ctx, params)
     case 'queue_task': return queueTask(ctx, params)
+    case 'queue_local': return queueLocal(ctx, params)
+    case 'request_local_command': return requestLocalCommand(ctx, params)
+    case 'queue_local_command': return queueLocalCommand(ctx, params)
+    case 'local_check': return localCheck(ctx, params)
+    case 'local_command': return localCommand(ctx, params)
     default: throw new AgentError('Unknown action', 400, 'bad_action')
   }
 }

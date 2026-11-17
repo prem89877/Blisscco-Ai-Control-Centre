@@ -83,6 +83,13 @@ export function scanSecrets(text: string): SecretHit[] {
   return hits
 }
 
+// Replace anything that looks like a secret with [REDACTED] (used on command output from the phone).
+export function maskSecrets(text: string): string {
+  let t = text
+  for (const [, re] of RULES) t = t.replace(new RegExp(re.source, 'g'), '[REDACTED]')
+  return t.replace(/((?:api[_-]?key|secret|token|passwd|password)["']?\s*[:=]\s*["']?)[A-Za-z0-9_\-+/=.]{16,}/gi, '$1[REDACTED]')
+}
+
 // Decode a JWT payload (no verification) to learn its role, so we can tell a public anon key from a service_role key.
 export function jwtRole(token: string): string | null {
   const p = token.split('.')[1]

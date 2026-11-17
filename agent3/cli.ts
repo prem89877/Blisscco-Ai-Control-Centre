@@ -14,7 +14,7 @@ function loadDotenv(path: string) {
 }
 const MAP: Record<string, string> = {
   heartbeat: 'heartbeat', website: 'website_smoke', auth: 'auth_check', api: 'api_test', db: 'db_test', security: 'security_scan', report: 'full_report',
-  worker: 'worker', 'request-rate': 'request_rate_test', 'apply-rate': 'apply_rate_test', retest: 'retest', ask: 'ai_command'
+  worker: 'worker', local: 'local_check', 'request-rate': 'request_rate_test', 'apply-rate': 'apply_rate_test', retest: 'retest', ask: 'ai_command'
 }
 async function main() {
   loadDotenv('.env.agent3')
@@ -31,7 +31,7 @@ async function main() {
   }
   const action = MAP[cmd || '']
   if (!action) {
-    console.log('Usage: npm run agent3 -- <' + Object.keys(MAP).join('|') + '> [--key=value]\nExamples:\n  report\n  website --target=https://yoursite.com\n  request-rate --path=/api/serve\n  apply-rate --approval=<id> --production-ack=APPROVE-PRODUCTION\n  retest --task=<task_id>\n  worker [--once]   (dashboard ke queued tests chalata hai)\n  ask "api test karo"')
+    console.log('Usage: npm run agent3 -- <' + Object.keys(MAP).join('|') + '> [--key=value]\nExamples:\n  report\n  website --target=https://yoursite.com\n  request-rate --path=/api/serve\n  apply-rate --approval=<id> --production-ack=APPROVE-PRODUCTION\n  retest --task=<task_id>\n  worker [--once]   (dashboard ke queued tests chalata hai)\n  local --presets=tests,git,secrets   (phone ke checks: tests,build,audit,secrets,git,env,system,project)\n  ask "api test karo"')
     process.exit(cmd ? 1 : 0)
   }
   const a: Record<string, string> = {}, words: string[] = []
@@ -41,7 +41,9 @@ async function main() {
   if (a.task) params.task_id = a.task
   if (a['production-ack']) params.production_ack = a['production-ack']
   if (cmd === 'ask') params.text = words.join(' ')
+  if (a.presets) params.presets = a.presets.split(',').map(s => s.trim())
   const ctx = makeCtx(loadConfig(), { type: 'system', id: null })
+  ctx.worker = action === 'local_check'
   const res = await runAction(ctx, action, params)
   const r = res.result || res
   if (r.verdict) {
