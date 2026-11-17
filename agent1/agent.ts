@@ -1,4 +1,4 @@
-import { loadConfig, readiness, secretValues, type Config } from './config.js'
+import { loadConfig, readiness, secretValues, resolveProject as resolveSupaProject, type Config } from './config.js'
 import { AgentError, clip, errMsg, fingerprint, redact } from './util.js'
 import { Store } from './store.js'
 import { Vercel, type VProject } from './vercel.js'
@@ -217,8 +217,9 @@ async function proposeDbChange(ctx: Ctx, p: any): Promise<Out> {
   if (!title) throw new AgentError('title required')
   const c = classifyExecutableSql(sql)
   if (!c.ok) throw new AgentError('DB change blocked: ' + c.reason, 403, 'db_change_blocked')
+  const proj = resolveSupaProject(ctx.cfg, p.project_ref ? String(p.project_ref) : undefined) // allow-list only; empty = default project
   return withTask(ctx, 'propose_db_change', 'DB change proposal: ' + title, { title }, async taskId => {
-    const ap = await ctx.store.createApproval({ task_id: taskId, title: 'DB change: ' + title, details: { kind: 'db_change', sql, executed_by_agent: false, note: 'After approval, press Run SQL in the Agent 1 console (ai_control only, one transaction), or run it manually in the Supabase SQL Editor.' } })
+    const ap = await ctx.store.createApproval({ task_id: taskId, title: 'DB change: ' + title, details: { kind: 'db_change', sql, project_ref: proj.ref, project_label: proj.label, executed_by_agent: false, note: 'Runs on Supabase project "' + proj.label + '". After approval, press Run SQL in the Agent 1 console (ai_control only, one transaction), or run it manually in the Supabase SQL Editor.' } })
     await ctx.store.log('warn', 'agent1_approval_requested', 'DB change: ' + title, { approval_id: ap.id }, taskId, ctx.actor.id)
     return { status: 'awaiting_approval', result: { approval_id: ap.id, next: 'Approve in the Approvals tab, then press Run SQL in the Agent 1 console.' } }
   })
@@ -234,11 +235,12 @@ async function applyDbChange(ctx: Ctx, p: any): Promise<Out> {
   if (p.db_ack !== 'RUN-SQL') throw new AgentError('Explicit confirmation needed (db_ack)', 403, 'db_ack')
   const c = classifyExecutableSql(String(d.sql || ''))
   if (!c.ok) throw new AgentError('DB change blocked: ' + c.reason, 403, 'db_change_blocked')
+  const proj = resolveSupaProject(ctx.cfg, d.project_ref ? String(d.project_ref) : undefined) // re-checked at execution; older approvals use the default project
   return withTask(ctx, 'apply_db_change', 'Run SQL: ' + ap.title, { approval_id: ap.id }, async () => {
     const claimed = await ctx.store.claimApproval(ap.id, { ...d, executed_at: now(), executed_by: ctx.actor.id, executed_by_agent: true })
     if (!claimed) throw new AgentError('Already executed', 409, 'already_executed')
     try {
-      const rows = await new SupaMgmt(ctx.cfg, ctx.calls).rwExec(String(d.sql))
+      const rows = await new SupaMgmt(ctx.cfg, ctx.calls, proj.ref).rwExec(String(d.sql))
       if (ap.task_id) await ctx.store.updateTask(ap.task_id, { status: 'succeeded', finished_at: now(), result: { applied: true, rows: rows.length } })
       await ctx.store.log('success', 'agent1_db_applied', ap.title, { approval_id: ap.id }, null, ctx.actor.id)
       return { result: { applied: true, rows: rows.length, preview: rows.slice(0, 5) } }

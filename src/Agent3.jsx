@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import { Badge, Err, CodeBlock, usePoll, q } from './ui.jsx'
+import { PendingInline } from './InlineApproval.jsx'
 
 export async function callAgent3(action, params = {}) {
   const { data } = await supabase.auth.getSession()
@@ -214,6 +215,7 @@ export default function Agent3Panel() {
         </div>
       )}
       {res && <Report res={res} onRetest={id => run('retest', { task_id: id })} />}
+      <PendingInline kinds={['rate_test', 'local_command']} onDone={reload} />
       {rows.length > 0 && <><div className="sec-title">Approved - ready to run</div>{rows.map(a => <Apply key={a.id} a={a} onDone={reload} onResult={setRes} setErr={setErr} />)}</>}
       <div className="card">
         <b>Run a test</b> <span className="sub">(read-only; nothing is billed or written)</span>

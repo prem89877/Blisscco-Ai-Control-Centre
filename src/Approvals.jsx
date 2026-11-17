@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { supabase } from './supabaseClient'
-import { usePoll, q, Badge, Err, Loading, Empty, timeAgo, logAction } from './ui.jsx'
+import { usePoll, q, Badge, Err, Loading, Empty, timeAgo } from './ui.jsx'
 import { PendingDot } from './Monitor.jsx'
+import { decideApproval } from './InlineApproval.jsx'
 
 function Pending({ a, onDone, setErr }) {
   const [note, setNote] = useState('')
@@ -9,15 +10,8 @@ function Pending({ a, onDone, setErr }) {
 
   async function decide(status) {
     setBusy(true); setErr('')
-    const { data: s } = await supabase.auth.getSession()
-    const { error } = await supabase.from('approvals')
-      .update({ status, decided_by: s.session.user.id, decision_note: note || null })
-      .eq('id', a.id).eq('status', 'pending')
-    if (error) setErr(error.message)
-    else {
-      await logAction('approval_' + status, a.title, { task_id: a.task_id, agent_id: a.agent_id, level: status === 'approved' ? 'success' : 'warn' })
-      onDone()
-    }
+    try { await decideApproval(a.id, status, { title: a.title, note: note || null, task_id: a.task_id, agent_id: a.agent_id }); onDone() }
+    catch (e) { setErr(e.message) }
     setBusy(false)
   }
 

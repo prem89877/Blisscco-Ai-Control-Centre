@@ -16,14 +16,14 @@ export const Q = {
 export const SCHEMA_ALLOW = ['ai_control', 'public', 'private', 'storage']
 
 export class SupaMgmt {
-  constructor(private cfg: Config, private calls: Record<string, number>) {}
+  constructor(private cfg: Config, private calls: Record<string, number>, private ref: string = cfg.supabaseRef) {}
 
   // The ONLY database path Agent 1 has: Supabase's read-only query endpoint + static SQL guard.
   async roQuery<T = any>(sql: string): Promise<T[]> {
-    if (!this.cfg.supaToken || !this.cfg.supabaseRef) throw new AgentError('AGENT1_SUPABASE_ACCESS_TOKEN (and project ref) not set', 503, 'not_configured')
+    if (!this.cfg.supaToken || !this.ref) throw new AgentError('AGENT1_SUPABASE_ACCESS_TOKEN (and project ref) not set', 503, 'not_configured')
     try { assertReadOnlySql(sql) } catch (e) { throw new AgentError('Blocked SQL: ' + (e as Error).message, 400, 'sql_blocked') }
     this.calls.supabase_mgmt = (this.calls.supabase_mgmt || 0) + 1
-    const r = await jfetch(`https://api.supabase.com/v1/projects/${this.cfg.supabaseRef}/database/query/read-only`, {
+    const r = await jfetch(`https://api.supabase.com/v1/projects/${this.ref}/database/query/read-only`, {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + this.cfg.supaToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query: sql })
@@ -35,11 +35,11 @@ export class SupaMgmt {
 
   // Write path. Used ONLY by apply_db_change, after approval + classifyExecutableSql. Wrapped in one transaction pinned to ai_control.
   async rwExec(sql: string): Promise<any[]> {
-    if (!this.cfg.supaToken || !this.cfg.supabaseRef) throw new AgentError('AGENT1_SUPABASE_ACCESS_TOKEN (and project ref) not set', 503, 'not_configured')
+    if (!this.cfg.supaToken || !this.ref) throw new AgentError('AGENT1_SUPABASE_ACCESS_TOKEN (and project ref) not set', 503, 'not_configured')
     const body = sql.trim().replace(/;\s*$/, '')
     const wrapped = `BEGIN; SET LOCAL search_path = ai_control, pg_catalog; SET LOCAL statement_timeout = '15s'; ${body}; COMMIT;`
     this.calls.supabase_mgmt = (this.calls.supabase_mgmt || 0) + 1
-    const r = await jfetch(`https://api.supabase.com/v1/projects/${this.cfg.supabaseRef}/database/query`, {
+    const r = await jfetch(`https://api.supabase.com/v1/projects/${this.ref}/database/query`, {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + this.cfg.supaToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query: wrapped })

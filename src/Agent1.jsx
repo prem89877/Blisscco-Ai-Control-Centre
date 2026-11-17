@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import { Badge, Err, CodeBlock, usePoll, q, timeAgo } from './ui.jsx'
+import { PendingInline } from './InlineApproval.jsx'
 
 export async function callAgent1(action, params = {}) {
   const { data } = await supabase.auth.getSession()
@@ -256,6 +257,7 @@ export default function Agent1Panel() {
         {RUNS.map(([a, l]) => <button key={a} className="btn ghost" disabled={!!busy} onClick={() => run(a)}>{busy === a ? 'Running...' : l}</button>)}
       </div>
       {res && <Report res={res} />}
+      <PendingInline kinds={['env_change', 'db_change', 'redeploy']} onDone={reload} />
       {applicable.length > 0 && <><div className="sec-title">Approved - ready to apply</div>{applicable.map(a => a.details.kind === 'db_change' ? <ApplyDb key={a.id} a={a} onDone={reload} setErr={setErr} /> : a.details.kind === 'redeploy' ? <ApplyRedeploy key={a.id} a={a} onDone={reload} setErr={setErr} /> : <Apply key={a.id} a={a} onDone={reload} setErr={setErr} />)}</>}
       <EnvRequest onResult={setRes} setErr={setErr} />
       <RedeployRequest onResult={setRes} setErr={setErr} />

@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { supabase } from './supabaseClient'
 import { Err, CodeBlock, usePoll } from './ui.jsx'
+import { ApproveBar } from './InlineApproval.jsx'
 
 // ---------------------------------------------------------------- approval indicator
 // The green dot is derived ONLY from the persisted approvals table (status = 'pending'), re-read every few seconds, on focus,
@@ -19,8 +20,8 @@ export function usePendingApprovals(enabled = true) {
     load()
     const t = setInterval(load, 8000)
     const on = () => { if (document.visibilityState !== 'hidden') load() }
-    document.addEventListener('visibilitychange', on); window.addEventListener('focus', on); window.addEventListener('online', on)
-    return () => { clearInterval(t); document.removeEventListener('visibilitychange', on); window.removeEventListener('focus', on); window.removeEventListener('online', on) }
+    document.addEventListener('visibilitychange', on); window.addEventListener('focus', on); window.addEventListener('online', on); window.addEventListener('approvals-changed', load)
+    return () => { window.removeEventListener('approvals-changed', load); clearInterval(t); document.removeEventListener('visibilitychange', on); window.removeEventListener('focus', on); window.removeEventListener('online', on) }
   }, [enabled, load])
   return { count, reload: load }
 }
@@ -78,8 +79,13 @@ export function Monitor({ call, onOpenWorkflow, go }) {
       {note && <CodeBlock label="result" tone="info" text={note} />}
       <div className="card" onClick={() => go && go('approvals')} style={{ cursor: go ? 'pointer' : 'default' }}>
         <div className="row"><b>Approvals <PendingDot count={data.approvals.pending_count} /></b><span className={'badge ' + (pend.length ? 'warn' : 'good')}>{pend.length ? pend.length + ' pending' : 'None pending'}</span></div>
-        {pend.map(a => <div key={a.id} className="sub">• {a.title}{a.kind ? ' (' + String(a.kind).replace('_', ' ') + ')' : ''}</div>)}
-        {pend.length > 0 && <div className="sub">Tap to open the Approvals tab. Nothing is approved automatically.</div>}
+        {pend.map(a => (
+          <div key={a.id} style={{ margin: '6px 0' }} onClick={e => e.stopPropagation()}>
+            <div className="sub">• {a.title}{a.kind ? ' (' + String(a.kind).replace('_', ' ') + ')' : ''}</div>
+            <ApproveBar id={a.id} title={a.title} kind={a.kind} task_id={a.task_id} onDone={reload} setErr={setErr} />
+          </div>
+        ))}
+        {pend.length > 0 && <div className="sub">Approve or reject right here, or tap the card to open the Approvals tab. Nothing is approved automatically.</div>}
       </div>
 
       {fresh.map(f => (

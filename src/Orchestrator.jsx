@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import { Badge, Err, CodeBlock, Empty, Loading, usePoll, q, timeAgo } from './ui.jsx'
 import { Monitor } from './Monitor.jsx'
+import { ApproveBar } from './InlineApproval.jsx'
 
 export async function callOrch(action, params = {}) {
   const { data } = await supabase.auth.getSession()
@@ -194,8 +195,15 @@ function Detail({ id, onChanged, onDeleted, setErr }) {
       {!f && wait && wait.for === 'ci' && <CodeBlock label="waiting" tone="info" text={wait.detail} />}
 
       {pend.length > 0 && (
-        <CodeBlock label="needs your approval" tone="warn" wrap={false} text={pend.map(x => (x.sensitive ? 'SENSITIVE  ' : '') + (x.kind === 'code_change' ? 'Code change' : 'SQL ' + (x.path || '')) + ' - ' + x.why).join('\n') + '\n\nOpen the Approvals tab. Everything after your approval continues by itself.'} />
+        <CodeBlock label="needs your approval" tone="warn" wrap={false} text={pend.map(x => (x.sensitive ? 'SENSITIVE  ' : '') + (x.kind === 'code_change' ? 'Code change' : 'SQL ' + (x.path || '')) + ' - ' + x.why).join('\n') + '\n\nApprove or reject right below. Everything after your approval continues by itself.'} />
       )}
+      {pend.filter(x => x.approval_id).map(x => (
+        <div className="card" key={x.approval_id} style={{ margin: '6px 0' }}>
+          <div className="sub" style={{ wordBreak: 'break-word' }}>{x.sensitive ? 'SENSITIVE · ' : ''}{x.kind === 'code_change' ? 'Code change' : 'SQL ' + (x.path || '')}</div>
+          <ApproveBar id={x.approval_id} title={w.title + ' - ' + (x.kind === 'code_change' ? 'code change' : 'SQL ' + (x.path || ''))} kind={x.kind} risky={x.sensitive}
+            onDone={() => { reload(); onChanged() }} setErr={setErr} />
+        </div>
+      ))}
       {(w.stage === 'awaiting_approval' && sensitiveCode && ap && ap.status === 'approved') || (wait && wait.for === 'sensitive_confirmation') ? (
         <>
           <label className="sub" style={{ display: 'block', margin: '6px 0' }}><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={ack} onChange={e => setAck(e.target.checked)} />I confirm: this change touches sensitive files ({((sensitiveCode && sensitiveCode.sensitive_paths) || []).join(', ')})</label>
@@ -212,6 +220,7 @@ function Detail({ id, onChanged, onDeleted, setErr }) {
       {w.zip && <CodeBlock label="ZIP validation" tone="info" wrap={false} text={[
         'Repository: ' + w.repo + '  (base branch: ' + (w.zip.base_branch || '?') + ')',
         'Base commit: ' + w.zip.base_commit,
+        ...(w.zip.supabase_project ? ['Supabase project for SQL: ' + w.zip.supabase_project.label + ' (' + String(w.zip.supabase_project.ref).slice(0, 8) + '...)'] : []),
         'ZIP SHA-256: ' + w.zip.checksum,
         'Extracted: ' + w.zip.total_extracted_bytes + ' bytes in ' + (w.zip.changed_files || []).length + ' change(s)',
         ...((w.zip.ignored_entries || []).length ? ['Skipped OS junk: ' + w.zip.ignored_entries.length] : []),
@@ -258,8 +267,20 @@ function Detail({ id, onChanged, onDeleted, setErr }) {
 }
 
 
-function ZipUpload({ repos, onCreated, setErr }) {
+function ZipUpload({ repos, projects, onCreated, setErr }) {
   const [repo,setRepo]=useState('')
+  const [branches,setBranches]=useState(null) // null = not loaded / not supported by the server yet
+  const [brNote,setBrNote]=useState('')
+  const [base,setBase]=useState('')
+  const [project,setProject]=useState('')
+  const curRepo=repo||repos[0]||''
+  useEffect(()=>{
+    if(!curRepo){setBranches(null);return}
+    let live=true
+    setBranches(null); setBrNote(''); setBase('')
+    callOrch('list_branches',{repo:curRepo}).then(r=>{if(live)setBranches(r)}).catch(e=>{if(live)setBrNote(/unknown action/i.test(e.message)?'Branch list needs the latest server files (default branch is used).':'Branch list unavailable: '+e.message)})
+    return ()=>{live=false}
+  },[curRepo])
   const [title,setTitle]=useState('ZIP deployment')
   const [file,setFile]=useState(null)
   const [baseSha,setBaseSha]=useState('')
@@ -270,7 +291,9 @@ function ZipUpload({ repos, onCreated, setErr }) {
     try {
       if(file.size>2*1024*1024) throw new Error('ZIP max size is 2 MB')
       const base64=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result).split(',')[1]);r.onerror=()=>reject(new Error('Could not read ZIP'));r.readAsDataURL(file)})
-      const result=await callOrch('upload_zip',{repo:repo||repos[0],title,zip_base64:base64,request_id:crypto.randomUUID(),...(baseSha.trim()?{expected_base_sha:baseSha.trim()}:{})})
+      const proj=(projects||[]).find(x=>x.ref===(project||(projects[0]&&projects[0].ref)))
+      if(proj&&/prod/i.test(proj.label)&&!window.confirm('SQL in this ZIP will run on the PRODUCTION project "'+proj.label+'" (after your approvals). Continue?')){setBusy(false);return}
+      const result=await callOrch('upload_zip',{repo:curRepo,title,zip_base64:base64,request_id:crypto.randomUUID(),...(base?{base}:{}),...(proj?{supabase_project:proj.ref}:{}),...(baseSha.trim()?{expected_base_sha:baseSha.trim()}:{})})
       onCreated(result.workflow.id)
       setFile(null); setBaseSha('')
     } catch(e){setErr(e.message)}
@@ -279,7 +302,20 @@ function ZipUpload({ repos, onCreated, setErr }) {
   return <div className="card">
     <b>Deployment Control Center — ZIP upload</b>
     <p className="sub">Upload changed files only. Max 2 MB ZIP / 40 files / 600 KB extracted. The ZIP is checked on the server only; nothing is written to GitHub until you approve, and only a small diff summary (never the ZIP) is sent to Gemini.</p>
-    <select value={repo||repos[0]||''} onChange={e=>setRepo(e.target.value)} disabled={!repos.length}>{repos.map(r=><option key={r} value={r}>{r}</option>)}</select>
+    <select value={curRepo} onChange={e=>setRepo(e.target.value)} disabled={!repos.length}>{repos.map(r=><option key={r} value={r}>{r}</option>)}</select>
+    {branches ? <>
+      <label className="sub" style={{display:'block',marginTop:6}}>Branch to build on</label>
+      <select value={base} onChange={e=>setBase(e.target.value)}>
+        <option value="">Default ({branches.default_branch})</option>
+        {branches.branches.filter(b=>!b.default).map(b=><option key={b.name} value={b.name}>{b.name}{b.protected?' (protected)':''}</option>)}
+      </select>
+      <div className="sub">Your code is committed to a NEW agent2/* branch created from this branch. Protected branches are never written directly; merging stays a separate approval.{branches.truncated?' Showing the first 100 branches.':''}</div>
+    </> : brNote ? <div className="sub">{brNote}</div> : null}
+    {projects&&projects.length>0&&<>
+      <label className="sub" style={{display:'block',marginTop:6}}>Supabase project for SQL</label>
+      <select value={project||projects[0].ref} onChange={e=>setProject(e.target.value)}>{projects.map(x=><option key={x.ref} value={x.ref}>{x.label} ({String(x.ref).slice(0,8)}...)</option>)}</select>
+      <div className="sub">Used only if the ZIP has .sql files. Only projects on the server allow-list can be chosen, and each SQL still needs its own approval.</div>
+    </>}
     <input value={title} onChange={e=>setTitle(e.target.value)} placeholder="Change title"/>
     <input value={baseSha} onChange={e=>setBaseSha(e.target.value)} placeholder="Expected base commit SHA (optional, 40 chars)" autoCapitalize="none" spellCheck={false}/>
     <input type="file" accept=".zip,application/zip" onChange={e=>setFile(e.target.files&&e.target.files[0]||null)}/>
@@ -292,7 +328,8 @@ export default function Orchestrator({ go }) {
   const [err, setErr] = useState('')
   const [sel, setSel] = useState(() => (location.hash.startsWith('#wf=') ? location.hash.slice(4) : ''))
   const [repos, setRepos] = useState([])
-  useEffect(() => { callOrch('heartbeat').then(r => setRepos(r.repos || [])).catch(e => setErr(e.message)) }, [])
+  const [projects, setProjects] = useState([])
+  useEffect(() => { callOrch('heartbeat').then(r => { setRepos(r.repos || []); setProjects(r.supabase_projects || []) }).catch(e => setErr(e.message)) }, [])
   const { data, error, loading, reload } = usePoll(() => callOrch('list'), [], 10000)
   const pick = (id) => { setSel(id); history.replaceState(null, '', id ? '#wf=' + id : location.pathname); reload() } // survives refresh
   const list = (data && data.workflows) || []
@@ -301,9 +338,9 @@ export default function Orchestrator({ go }) {
     <>
       <Err msg={error} /><Err msg={err} />
       <Monitor call={callOrch} onOpenWorkflow={pick} go={go} />
-      <ZipUpload repos={repos} onCreated={pick} setErr={setErr} />
+      <ZipUpload repos={repos} projects={projects} onCreated={pick} setErr={setErr} />
       <Create repos={repos} onCreated={pick} setErr={setErr} />
-      {list.filter(w => w.needs_owner).length > 0 && <div className="card"><b>Pending owner approvals</b> <span className="sub">{list.filter(w => w.needs_owner).length} workflow(s) wait for you in the Approvals tab. Only sensitive or mandatory steps ask; everything else runs by itself.</span></div>}
+      {list.filter(w => w.needs_owner).length > 0 && <div className="card"><b>Pending owner approvals</b> <span className="sub">{list.filter(w => w.needs_owner).length} workflow(s) wait for you: approve inside the workflow card below (or in the Approvals tab). Only sensitive or mandatory steps ask; everything else runs by itself.</span></div>}
       {sel && <><h2>Current workflow</h2><Detail key={sel} id={sel} onChanged={reload} onDeleted={deleted} setErr={setErr} /></>}
       <h2>Task history</h2>
       {loading && !data ? <Loading /> : list.length === 0 ? <Empty text="No orchestrated tasks yet" /> : list.map(w => (

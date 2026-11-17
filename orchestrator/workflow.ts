@@ -9,6 +9,7 @@ import { makeCtx as makeCtx2, runAction as runA2 } from '../agent2/agent.js'
 import { makeCtx as makeCtx1, runAction as runA1 } from '../agent1/agent.js'
 import { inspectZip, ZIP_LIMITS } from './zip.js'
 import { classifyExecutableSql } from '../agent1/checks.js'
+import { resolveProject, projectList } from '../agent1/config.js'
 import { workflowTasks, retentionSeconds, recoveryPlan, healthReport } from './monitor.js'
 import { retryPolicy, backoffMs } from './policy.js'
 import { ROUTES, SENSITIVE_OPERATIONS, sensitivePathsOf, protectedZipPaths, sqlOutcomeIsDefinitive, isTransient, RETRYABLE_STAGES, NEVER_RETRY_CODES, recoveryFor, pipeline, stepOf } from './policy.js'
@@ -27,7 +28,7 @@ export const A1_ALLOWED = ['health_report'] as const
 // Reached only through callA1Sql, only from the sql stages below, never from a generic request.
 export const A1_SQL_ALLOWED = ['propose_db_change', 'apply_db_change'] as const
 
-export const ACTIONS = ['heartbeat', 'start', 'upload_zip', 'list', 'get', 'advance', 'retry', 'apply', 'check_ci', 'apply_sql', 'verify', 'cancel', 'monitor', 'health', 'resume', 'resolve_sql', 'delete_workflow'] as const
+export const ACTIONS = ['heartbeat', 'start', 'upload_zip', 'list', 'get', 'advance', 'retry', 'apply', 'check_ci', 'apply_sql', 'verify', 'cancel', 'monitor', 'health', 'resume', 'resolve_sql', 'delete_workflow', 'list_branches'] as const
 export type Action = typeof ACTIONS[number]
 
 export const STAGES = ['proposing', 'awaiting_approval', 'applying', 'ci_waiting', 'awaiting_sql', 'applying_sql', 'ci_passed', 'verifying', 'completed', 'failed', 'cancelled'] as const
@@ -374,7 +375,7 @@ async function startSqlStage(o: OCtx, wf: Row) {
   for (const f of files) {
     if (wf.payload.steps.sql.items.some((x: Row) => x.path === f.path && x.approval_id)) continue // retry never creates a second approval
     let out: any
-    try { out = await callA1Sql(o, 'propose_db_change', { title: ('SQL: ' + f.path + ' (' + p0(wf) + ')').slice(0, 120), sql: f.sql }) }
+    try { out = await callA1Sql(o, 'propose_db_change', { title: ('SQL: ' + f.path + ' (' + p0(wf) + ')').slice(0, 120), sql: f.sql, ...(wf.payload.zip && wf.payload.zip.supabase_project ? { project_ref: wf.payload.zip.supabase_project.ref } : {}) }) }
     catch (e) {
       const ae = asErr(e)
       const row = await fail(o, wf, { agent: 'agent1', code: ae.code, message: `Agent 1 refused the SQL migration ${f.path}: ${ae.message}. No SQL was executed.` })
@@ -518,7 +519,7 @@ export function buildReport(wfId: string, p: Row, a1: any) {
       ...(zipSql.length ? [{ name: 'Agent 1 SQL migrations', status: sqlItems.length ? (s.sql && s.sql.status) || '-' : 'blocked' }] : []),
       { name: 'Agent 1 verification', status: 'done' }
     ],
-    zip: p.zip ? { checksum: p.zip.checksum, base_commit: p.zip.base_commit, base_branch: p.zip.base_branch, files: p.zip.changed_files, gemini: p.zip.gemini || null } : null,
+    zip: p.zip ? { checksum: p.zip.checksum, base_commit: p.zip.base_commit, base_branch: p.zip.base_branch, supabase_project: p.zip.supabase_project || null, files: p.zip.changed_files, gemini: p.zip.gemini || null } : null,
     sql: sqlReport,
     approval: s.approval,
     agent2: { branch: s.agent2_apply.branch, commit_sha: s.agent2_apply.commit_sha, compare_url: s.agent2_apply.compare_url, changed_files: s.agent2_apply.changed_files, warnings: s.agent2_propose.warnings, checks: s.agent2_propose.checks, ci: { state: s.ci.state, runs: s.ci.runs }, production_touched: false },
@@ -681,6 +682,22 @@ export function reviewSql(e: { path: string; content: string; bytes: number; sha
   return { ...base, status: 'reviewed', reason: null, sql: e.content }
 }
 
+// Read-only: branches of an allowed repo (Agent 2's GitHub token) for the base-branch dropdown. Nothing is written.
+// The ZIP's code is always committed to a NEW agent2/* branch created from the branch you pick; protected branches are never written.
+async function listBranches(o: OCtx, p: any) {
+  const repo = validRepo(String(p.repo || ''))
+  if (!repoAllowed(o.cfg.c2, repo)) throw new AgentError('Repo is not in AGENT2_GITHUB_REPOS', 403, 'repo_not_allowed')
+  if (!o.cfg.c2.githubToken) throw new AgentError('AGENT2_GITHUB_TOKEN is not set', 503, 'not_configured')
+  const headers = { Authorization: 'Bearer ' + o.cfg.c2.githubToken, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }
+  const get = async (path: string) => { const r = await fetch('https://api.github.com/repos/' + repo + path, { headers, signal: AbortSignal.timeout(20000) }); if (!r.ok) throw new AgentError('GitHub read failed (' + r.status + ') while listing branches', 502, 'github_read'); return r.json() as Promise<any> }
+  const info = await get('')
+  const def = String(info.default_branch || '')
+  const rows = await get('/branches?per_page=100')
+  const names: Row[] = (Array.isArray(rows) ? rows : []).filter((b: any) => BRANCH_RE.test(String(b.name)) && !String(b.name).includes('..')).map((b: any) => ({ name: String(b.name), protected: !!b.protected, default: String(b.name) === def }))
+  names.sort((a, b) => Number(b.default) - Number(a.default) || String(a.name).localeCompare(String(b.name)))
+  return { repo, default_branch: def, branches: names, truncated: Array.isArray(rows) && rows.length >= 100 }
+}
+
 async function uploadZipWorkflow(o: OCtx, p: any) {
   const repo = validRepo(String(p.repo || ''))
   if (!repoAllowed(o.cfg.c2, repo)) throw new AgentError('Repo is not in AGENT2_GITHUB_REPOS', 403, 'repo_not_allowed')
@@ -695,6 +712,8 @@ async function uploadZipWorkflow(o: OCtx, p: any) {
 
   const parsed = inspectZip(p.zip_base64) // size / path / symlink / bomb / binary / secret checks; throws on any violation
   const sqlEntries = parsed.entries.filter(e => e.sql)
+  // Which Supabase project the SQL runs on. Only projects on the server allow-list are accepted; no SQL in the ZIP = nothing to choose.
+  const project = sqlEntries.length ? resolveProject(o.cfg.c1, p.supabase_project ? String(p.supabase_project) : undefined) : null
   const code = parsed.entries.filter(e => !e.sql && e.path !== '.blisscco-delete.txt')
   const delManifest = parsed.entries.find(e => e.path === '.blisscco-delete.txt')
   if (sqlEntries.length > MAX_SQL_FILES) throw new AgentError(`Too many SQL files (max ${MAX_SQL_FILES} per ZIP)`, 400, 'too_many_sql')
@@ -748,7 +767,7 @@ async function uploadZipWorkflow(o: OCtx, p: any) {
 
   const zipMeta = {
     checksum: parsed.checksum, archive_bytes: Math.floor(p.zip_base64.length * 3 / 4), total_extracted_bytes: parsed.totalBytes, limits: ZIP_LIMITS,
-    ignored_entries: parsed.ignored, base_branch: base, base_commit: baseSha, changed_files: fileMeta, sql,
+    ignored_entries: parsed.ignored, base_branch: base, base_commit: baseSha, changed_files: fileMeta, sql, supabase_project: project ? { ref: project.ref, label: project.label } : null,
     gemini: { input_max_chars: reviewLimits().maxInputChars, output_max_tokens: reviewLimits().maxOutputTokens, policy: 'Agent 2 sends a compact diff summary only (paths, operation, type, +/- counts, bounded hunks, findings). The ZIP, unchanged files and full file bodies are never sent.', review_partial: null as boolean | null },
     secret_scan: 'passed (any finding rejects the whole ZIP before anything is stored)'
   }
@@ -935,7 +954,7 @@ export async function deleteWorkflow(o: OCtx, p: any) {
 export async function runAction(o: OCtx, action: string, params: any = {}): Promise<any> {
   if (!(ACTIONS as readonly string[]).includes(action)) throw new AgentError('Unknown action', 400, 'unknown_action')
   switch (action as Action) {
-    case 'heartbeat': return { ready: orchReadiness(o.cfg), repos: o.cfg.c2.githubRepos, stages: STAGES, agent3: 'manual (not part of the Orchestrator)' }
+    case 'heartbeat': return { ready: orchReadiness(o.cfg), repos: o.cfg.c2.githubRepos, stages: STAGES, agent3: 'manual (not part of the Orchestrator)', features: ['branch_select', 'sql_project_select'], supabase_projects: projectList(o.cfg.c1).map(x => ({ ref: x.ref, label: x.label })), default_supabase_project: o.cfg.c1.supabaseRef }
     case 'start': return startWorkflow(o, params)
     case 'upload_zip': return uploadZipWorkflow(o, params)
     case 'list': {
@@ -957,6 +976,7 @@ export async function runAction(o: OCtx, action: string, params: any = {}): Prom
     case 'resume': return resumeWorkflow(o, params)
     case 'resolve_sql': return resolveSql(o, params)
     case 'delete_workflow': return deleteWorkflow(o, params)
+    case 'list_branches': return listBranches(o, params)
   }
 }
 

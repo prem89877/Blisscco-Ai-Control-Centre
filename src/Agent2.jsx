@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import { Badge, Err, CodeBlock, usePoll, q } from './ui.jsx'
+import { PendingInline } from './InlineApproval.jsx'
 
 export async function callAgent2(action, params = {}) {
   const { data } = await supabase.auth.getSession()
@@ -245,6 +246,7 @@ export default function Agent2Panel() {
         </div>
       )}
       {res && <Report res={res} />}
+      <PendingInline kinds={[...Object.keys(APPLY), 'git_push', 'command']} onDone={reload} />
       {remote.length > 0 && <><div className="sec-title">Approved - ready to apply</div>{remote.map(a => <Apply key={a.id} a={a} onDone={reload} onResult={setRes} setErr={setErr} />)}</>}
       {termux.length > 0 && (
         <>
