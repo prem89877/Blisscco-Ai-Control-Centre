@@ -122,6 +122,9 @@ async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: string }): P
     const base = String(p.base || info.default_branch)
     const baseSha = await gh.branchSha(repo, base)
     if (!baseSha) throw new AgentError('Base branch not found: ' + base, 404, 'not_found')
+    // Optional owner/Orchestrator pin (ZIP deployments): refuse to build a proposal against a base that has moved.
+    if (p.expected_base_sha !== undefined && (!/^[a-f0-9]{40}$/i.test(String(p.expected_base_sha)) || String(p.expected_base_sha).toLowerCase() !== baseSha.toLowerCase()))
+      throw new AgentError(`Base branch ${base} moved since the ZIP was checked (now ${baseSha.slice(0, 7)}). Nothing was proposed; upload again.`, 409, 'base_changed')
     const tree = await gh.tree(repo, await gh.commitTreeSha(repo, baseSha))
     const byPath = new Map(tree.map(e => [e.path, e]))
     const entries: any[] = []
@@ -143,16 +146,33 @@ async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: string }): P
     }
     const sensitive = entries.filter(e => e.sensitive).map(e => e.path)
     if (sensitive.length) warnings.push('Touches sensitive files: ' + sensitive.join(', '))
-    const ai = await review(ctx.cfg, { title, description, base, files: previews })
+    // Compact digest for Gemini: paths, operation, type, +/- counts, bounded hunk, short description, security findings.
+    // Never the ZIP, never whole files. Highest-priority files first, so truncation drops the least important hunks.
+    const prio = (f: any) => (f.sensitive ? 0 : f.op === 'delete' ? 1 : /(^|\/)(package\.json|vercel\.json|vite\.config\.\w+|\.github\/)/.test(f.path) ? 2 : 3)
+    const digestFiles = previews.map((f, i) => ({ ...f, sensitive: entries[i].sensitive })).sort((a, b) => prio(a) - prio(b) || (b.added + b.removed) - (a.added + a.removed))
+    const ai = await review(ctx.cfg, {
+      title, description, base,
+      total_files: previews.length,
+      total_added: previews.reduce((n, f) => n + f.added, 0),
+      total_removed: previews.reduce((n, f) => n + f.removed, 0),
+      total_change_bytes: files.reduce((n, f) => n + Buffer.byteLength(f.content || ''), 0),
+      files: digestFiles.map(({ sensitive: sens, ...f }) => ({
+        ...f,
+        file_type: f.path.includes('.') ? f.path.split('.').pop() : 'text',
+        short_description: `${f.op} ${f.path} (+${f.added} -${f.removed})`,
+        security_findings: sens ? ['sensitive path: requires additional owner confirmation'] : ['secret scan passed']
+      }))
+    })
+    if (ai.error && ai.text) warnings.push(ai.error)
     await recordAi(ctx, 'propose_change_review', ai)
     const branch = branchFor(title)
     assertAgentBranch(branch, ctx.cfg.protectedBranches)
     const ap = await ctx.store.createApproval({
       task_id: taskId, title: `Code change: ${title}`,
-      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
+      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial) }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
     })
     await ctx.store.log('warn', 'agent2_approval_requested', 'Code change: ' + title, { approval_id: ap.id }, taskId, ctx.actor.id)
-    return { status: 'awaiting_approval', result: { approval_id: ap.id, branch, base: `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, next: 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.' + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, branch, base: `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), estimated_cost_usd: Number(((ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1_000_000).toFixed(6)) }, base_sha: baseSha, next: 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.' + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
   })
 }
 

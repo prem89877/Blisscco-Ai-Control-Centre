@@ -9,6 +9,7 @@ import Approvals from './Approvals.jsx'
 import ApiUsage from './ApiUsage.jsx'
 import Health from './Health.jsx'
 import Settings from './Settings.jsx'
+import Orchestrator from './Orchestrator.jsx'
 import { useAgent1Heartbeat } from './Agent1.jsx'
 import { useAgent2Heartbeat } from './Agent2.jsx'
 import { useAgent3Heartbeat } from './Agent3.jsx'
@@ -17,6 +18,7 @@ import { Icon } from './ui.jsx'
 const TABS = [
   ['overview', 'home', 'Overview'],
   ['agents', 'bot', 'Agents'],
+  ['orchestrator', 'flow', 'Orchestrator'],
   ['tasks', 'tasks', 'Tasks'],
   ['logs', 'logs', 'Logs'],
   ['approvals', 'shield', 'Approvals'],
@@ -72,6 +74,7 @@ export default function App() {
   const page = {
     overview: <Overview offlineSec={offlineSec} go={setTab} />,
     agents: <Agents offlineSec={offlineSec} />,
+    orchestrator: <Orchestrator />,
     tasks: <Tasks />,
     logs: <Logs />,
     approvals: <Approvals />,

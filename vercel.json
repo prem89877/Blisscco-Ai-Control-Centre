@@ -11,6 +11,10 @@
     "api/agent3.js": {
       "maxDuration": 60,
       "includeFiles": "agent3/dist/**"
+    },
+    "api/orchestrator.js": {
+      "maxDuration": 60,
+      "includeFiles": "orchestrator/dist/**"
     }
   },
   "rewrites": [
