@@ -27,7 +27,7 @@ export const A1_ALLOWED = ['health_report'] as const
 // Reached only through callA1Sql, only from the sql stages below, never from a generic request.
 export const A1_SQL_ALLOWED = ['propose_db_change', 'apply_db_change'] as const
 
-export const ACTIONS = ['heartbeat', 'start', 'upload_zip', 'list', 'get', 'advance', 'retry', 'apply', 'check_ci', 'apply_sql', 'verify', 'cancel', 'monitor', 'health', 'resume', 'resolve_sql'] as const
+export const ACTIONS = ['heartbeat', 'start', 'upload_zip', 'list', 'get', 'advance', 'retry', 'apply', 'check_ci', 'apply_sql', 'verify', 'cancel', 'monitor', 'health', 'resume', 'resolve_sql', 'delete_workflow'] as const
 export type Action = typeof ACTIONS[number]
 
 export const STAGES = ['proposing', 'awaiting_approval', 'applying', 'ci_waiting', 'awaiting_sql', 'applying_sql', 'ci_passed', 'verifying', 'completed', 'failed', 'cancelled'] as const
@@ -270,7 +270,7 @@ export async function applyWorkflow(o: OCtx, p: any) {
   if (commitKey) {
     let got = await o.store.claimLock(commitKey, 'commit', { holder: wf.id, status: 'claimed', approval_id: ap.id, claimed_at: now() })
     if (!got) { const l = await o.store.getLock(commitKey); if (l && l.payload.status === 'failed') got = await o.store.casLock(commitKey, String(l.payload.holder), { holder: wf.id, status: 'claimed', approval_id: ap.id, claimed_at: now() }) }
-    if (!got) { await fail(o, wf, { agent: 'orchestrator', code: 'commit_duplicate', message: 'An identical change set (same repo and file checksums) was already committed or is being committed by another workflow; nothing was written.' }); throw withWf(new AgentError('Identical change set already committed or in progress', 409, 'commit_duplicate'), wf.id) }
+    if (!got) { await fail(o, wf, { agent: 'orchestrator', code: 'commit_duplicate', message: 'An identical change set (same repo and file checksums) was already committed or is being committed by another workflow; nothing was written. If that earlier task is finished, delete it in Task history (red Delete button) and start again.' }); throw withWf(new AgentError('Identical change set already committed or in progress', 409, 'commit_duplicate'), wf.id) }
   }
   const releaseCommit = async () => { if (commitKey) { try { await o.store.casLock(commitKey, wf.id, { status: 'failed' }) } catch { /* lock stays = safe side */ } } }
   wf = await advance(o, wf, q => { q.stage = 'applying'; q.steps.approval.status = 'approved'; q.steps.approval.decision = { approval_id: ap.id, decided_by: ap.decided_by, decided_at: ap.decided_at, operation: 'Agent 2 writes the approved change to its own agent2/* branch (one commit; no merge, no production)', sensitive_confirmed: sens.length ? true : false }; q.steps.agent2_apply = { status: 'running', agent: 'agent2', started_at: now() } }) // lock: a second click gets 409
@@ -764,7 +764,7 @@ async function uploadZipWorkflow(o: OCtx, p: any) {
       const hp = (hw && hw.payload) || {}
       const touched = !!(hp.steps && ((hp.steps.agent2_apply && hp.steps.agent2_apply.status !== 'failed' && hp.steps.agent2_apply.commit_sha) || (hp.steps.sql && (hp.steps.sql.items || []).some((it: Row) => ['applied', 'uncertain', 'running'].includes(it.status)))))
       const dead = !hw || (['failed', 'cancelled'].includes(String(hp.stage)) && !touched)
-      if (!lock || !dead || !(await o.store.casLock(zipKey, holder, { holder: requestId, claimed_at: now() }))) throw new AgentError('This exact ZIP was already uploaded' + (holder ? ' (workflow ' + holder + ')' : '') + '.', 409, 'duplicate_zip')
+      if (!lock || !dead || !(await o.store.casLock(zipKey, holder, { holder: requestId, claimed_at: now() }))) throw new AgentError('This exact ZIP was already uploaded' + (holder ? ' (workflow ' + holder.slice(0, 8) + ')' : '') + '.' + (hw ? (['completed', 'failed', 'cancelled'].includes(String(hp.stage)) ? ' That task is finished: press the red Delete button on it in Task history, then upload this ZIP again.' : ' That task is still in progress: let it finish or cancel it first.') : ''), 409, 'duplicate_zip')
     }
   }
   const result = await startWorkflow(o, { repo, title, description: `ZIP ${parsed.checksum.slice(0, 12)}; ${files.length} code change(s); ${sql.length} SQL file(s).`, mode: 'files', files, base, request_id: requestId, zip_meta: zipMeta })
@@ -912,6 +912,26 @@ export async function resolveSql(o: OCtx, p: any) {
 }
 
 // ---------------------------------------------------------------- dispatcher
+// Delete a FINISHED task (completed / failed / cancelled) from the list. Its zip + commit locks are released so the same ZIP / change set
+// can be uploaded again; locks of SQL that really ran stay (a migration must never run twice). Approvals and logs are kept (audit).
+export async function deleteWorkflow(o: OCtx, p: any) {
+  const wf = await load(o, p.workflow_id)
+  const st = wf.payload
+  if (!TERMINAL.includes(st.stage)) throw withWf(new AgentError('Only finished tasks can be deleted. Cancel it first if it is still running or waiting for you.', 409, 'not_finished'), wf.id)
+  const items: Row[] = (st.steps && st.steps.sql && st.steps.sql.items) || []
+  if (items.some(it => it.status === 'uncertain')) throw withWf(new AgentError('This task has an uncertain SQL result. Check it in Supabase and record what you saw first; then it can be deleted.', 409, 'sql_uncertain_open'), wf.id)
+  const sqlRan = items.some(it => it.status === 'applied')
+  let released = 0, kept = 0
+  for (const l of await o.store.listLocksByHolder(wf.id)) {
+    const kind = String(l.payload.lock), status = String(l.payload.status)
+    if (kind === 'sql' && status !== 'failed') { kept++; continue } // SQL that ran (or may have run) stays locked forever
+    if (await o.store.deleteLock(String(l.id), wf.id)) released++
+  }
+  await o.store.deleteWorkflow(wf.id)
+  await o.store.log('info', 'orchestrator_workflow_deleted', 'Task deleted by owner: ' + String(wf.title || '').replace(/^Orchestrated: /, '').slice(0, 120), { stage: st.stage, released_locks: released, kept_locks: kept }, null, o.userId)
+  return { deleted: true, workflow_id: wf.id, released_locks: released, kept_locks: kept, note: sqlRan ? 'The ZIP can be uploaded again, but the SQL that already ran stays blocked and will never run twice.' : 'The same ZIP / change set can be uploaded again.' }
+}
+
 export async function runAction(o: OCtx, action: string, params: any = {}): Promise<any> {
   if (!(ACTIONS as readonly string[]).includes(action)) throw new AgentError('Unknown action', 400, 'unknown_action')
   switch (action as Action) {
@@ -936,6 +956,7 @@ export async function runAction(o: OCtx, action: string, params: any = {}): Prom
     case 'health': return healthAction(o)
     case 'resume': return resumeWorkflow(o, params)
     case 'resolve_sql': return resolveSql(o, params)
+    case 'delete_workflow': return deleteWorkflow(o, params)
   }
 }
 

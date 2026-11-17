@@ -95,6 +95,22 @@ export class OStore {
     return rows.length > 0
   }
 
+  // Locks (zip / commit / sql) currently held by one workflow.
+  listLocksByHolder(holder: string): Promise<Row[]> {
+    if (!isUuid(holder)) return Promise.resolve([])
+    return this.rest('GET', `tasks?select=id,payload&payload->>kind=eq.orchestration_lock&payload->>holder=eq.${holder}&limit=200`)
+  }
+  // Removes a lock only while this holder still owns it (so another workflow's lock can never be deleted by mistake).
+  async deleteLock(id: string, holder: string): Promise<boolean> {
+    if (!isUuid(id) || !isUuid(holder)) return false
+    return (await this.rest('DELETE', `tasks?id=eq.${id}&payload->>kind=eq.orchestration_lock&payload->>holder=eq.${holder}`)).length > 0
+  }
+  // Removes one workflow row (approvals and activity_logs stay: their task_id is set to null by the existing foreign keys).
+  async deleteWorkflow(id: string): Promise<boolean> {
+    if (!isUuid(id)) throw new AgentError('Bad workflow id', 400, 'bad_id')
+    return (await this.rest('DELETE', `tasks?id=eq.${id}&payload->>kind=eq.orchestration`)).length > 0
+  }
+
   // Optimistic lock: applies only while payload.rev is unchanged. Returns null if somebody else moved the workflow.
   async casUpdate(id: string, rev: number, patch: Row): Promise<Row | null> {
     const rows = await this.rest('PATCH', `tasks?id=eq.${id}&payload->>kind=eq.orchestration&payload->>rev=eq.${rev}`, patch)

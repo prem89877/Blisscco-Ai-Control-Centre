@@ -38,6 +38,27 @@ function Tasks({ w }) {
   )
 }
 
+const FINISHED = ['completed', 'failed', 'cancelled']
+
+// Red two-step delete for a FINISHED task (first tap asks, second tap deletes). Releases the ZIP so it can be uploaded again.
+function DeleteBtn({ id, onDeleted, setErr }) {
+  const [ask, setAsk] = useState(false)
+  const [busy, setBusy] = useState(false)
+  async function del(e) {
+    e.stopPropagation()
+    if (!ask) { setAsk(true); return }
+    setBusy(true); setErr('')
+    try { await callOrch('delete_workflow', { workflow_id: id }); onDeleted(id) } catch (x) { setErr(x.message); setAsk(false) }
+    setBusy(false)
+  }
+  return (
+    <div className="actions" onClick={e => e.stopPropagation()}>
+      <button type="button" className="btn no" disabled={busy} onClick={del}>{busy ? 'Deleting...' : ask ? 'Tap again to delete' : 'Delete'}</button>
+      {ask && !busy && <button type="button" className="btn ghost" onClick={e => { e.stopPropagation(); setAsk(false) }}>Keep</button>}
+    </div>
+  )
+}
+
 function Create({ repos, onCreated, setErr }) {
   const [repo, setRepo] = useState('')
   const [title, setTitle] = useState('')
@@ -111,7 +132,7 @@ function Report({ r }) {
   )
 }
 
-function Detail({ id, onChanged, setErr }) {
+function Detail({ id, onChanged, onDeleted, setErr }) {
   const [busy, setBusy] = useState('')
   const [ack, setAck] = useState(false)
   const [destAck, setDestAck] = useState(false)
@@ -146,6 +167,7 @@ function Detail({ id, onChanged, setErr }) {
       <div className="row"><b>{w.title}</b><span className="badge good">Successful</span></div>
       <div className="sub">{timeAgo(w.finished_at || w.updated_at)}</div>
       {w.report && <details style={{ marginTop: 8 }}><summary className="sub" style={{ cursor: 'pointer' }}>Report</summary><Report r={w.report} /><CodeBlock label="rollback guidance" tone="warn" text={w.report.rollback_guidance || ''} /></details>}
+      <DeleteBtn id={id} onDeleted={onDeleted} setErr={setErr} />
     </div>
   )
 
@@ -223,6 +245,7 @@ function Detail({ id, onChanged, setErr }) {
       {w.report && <><Report r={w.report} /><CodeBlock label="rollback guidance" tone="warn" text={w.report.rollback_guidance || 'No automatic rollback. Owner must review and revert through a separately approved change.'} /></>}
 
       {['awaiting_approval', 'ci_waiting', 'awaiting_sql', 'ci_passed'].includes(w.stage) && <div className="actions"><button className="btn ghost" disabled={!!busy} onClick={() => act('cancel')}>Cancel</button></div>}
+      {FINISHED.includes(w.stage) && <DeleteBtn id={id} onDeleted={onDeleted} setErr={setErr} />}
 
       {w.events && w.events.length > 0 && (
         <details style={{ marginTop: 8 }}>
@@ -273,6 +296,7 @@ export default function Orchestrator({ go }) {
   const { data, error, loading, reload } = usePoll(() => callOrch('list'), [], 10000)
   const pick = (id) => { setSel(id); history.replaceState(null, '', id ? '#wf=' + id : location.pathname); reload() } // survives refresh
   const list = (data && data.workflows) || []
+  const deleted = (id) => { if (id === sel) pick(''); else reload() }
   return (
     <>
       <Err msg={error} /><Err msg={err} />
@@ -280,7 +304,7 @@ export default function Orchestrator({ go }) {
       <ZipUpload repos={repos} onCreated={pick} setErr={setErr} />
       <Create repos={repos} onCreated={pick} setErr={setErr} />
       {list.filter(w => w.needs_owner).length > 0 && <div className="card"><b>Pending owner approvals</b> <span className="sub">{list.filter(w => w.needs_owner).length} workflow(s) wait for you in the Approvals tab. Only sensitive or mandatory steps ask; everything else runs by itself.</span></div>}
-      {sel && <><h2>Current workflow</h2><Detail key={sel} id={sel} onChanged={reload} setErr={setErr} /></>}
+      {sel && <><h2>Current workflow</h2><Detail key={sel} id={sel} onChanged={reload} onDeleted={deleted} setErr={setErr} /></>}
       <h2>Task history</h2>
       {loading && !data ? <Loading /> : list.length === 0 ? <Empty text="No orchestrated tasks yet" /> : list.map(w => (
         <div className="card" key={w.id} onClick={() => pick(w.id)} style={{ cursor: 'pointer', outline: w.id === sel ? '1px solid var(--muted)' : 'none' }}>
@@ -289,6 +313,7 @@ export default function Orchestrator({ go }) {
           <div className="sub">ID {String(w.id).slice(0, 8)} · {(w.agents || []).map(a => a === 'agent1' ? 'Agent 1' : 'Agent 2').join(' + ') || '-'} · started {timeAgo(w.started_at)}{w.finished_at ? ' · finished ' + timeAgo(w.finished_at) : ''}{w.retries ? ' · retries ' + w.retries : ''}{w.approval ? ' · approval ' + w.approval : ''}</div>
           {w.needs_owner && <div className="sub">Needs your approval</div>}
           {w.failure && <div className="sub" style={{ color: 'var(--bad, #c0392b)' }}>{w.failed_agent} / {w.failed_stage}: {w.failure}{w.failure_detail && w.failure_detail.recovery ? ' - ' + w.failure_detail.recovery : ''}</div>}
+          {FINISHED.includes(w.stage) && <DeleteBtn id={w.id} onDeleted={deleted} setErr={setErr} />}
         </div>
       ))}
     </>

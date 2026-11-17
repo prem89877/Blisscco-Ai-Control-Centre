@@ -234,6 +234,7 @@ async function fake(input: any, init: any = {}): Promise<Response> {
       t.push(...out); return json(out, 201)
     }
     if (method === 'PATCH') { const hit = t.filter(filt); hit.forEach(r => Object.assign(r, body, { updated_at: new Date().toISOString() })); return json(hit) }
+    if (method === 'DELETE') { const hit = t.filter(filt); hit.forEach(r => t.splice(t.indexOf(r), 1)); return json(hit) }
   }
   return json({ error: 'unrouted ' + url }, 500)
 }
@@ -1217,4 +1218,37 @@ test('part3: monitoring is read-only, Agent 3 independent, no Agent 3 reference 
   assert.ok(!allUrls.some(x => /agent3/i.test(x)))
   const src = readFileSync(join(srcDir(), 'monitor.ts'), 'utf8'); assert.ok(!/from\s+['"][^'"]*agent3/.test(src) && !/AGENT3_/.test(src))
   assert.ok((ACTIONS as readonly string[]).includes('monitor') && !(A2_ALLOWED as readonly string[]).includes('apply_promote'))
+})
+
+test('delete: a finished ZIP task is removed, its ZIP + commit locks are released, the same ZIP can be uploaded again; unfinished tasks and non-owners are refused', async () => {
+  const p = zipParams(CODE_ZIP); const u = await ok('upload_zip', p); const id = u.workflow.id as string
+  await must('delete_workflow', { workflow_id: id }, 409, 'not_finished'); assert.equal(orchRows().length, 1)
+  approve(u.workflow.steps.approval.id)
+  const ap = await ok('apply', { workflow_id: id }); const b = ap.workflow.steps.agent2_apply.branch
+  runs = [{ id: 9, name: 'CI', status: 'completed', conclusion: 'failure', head_branch: b, head_sha: refs.get(b)!, html_url: '' }]
+  await must('check_ci', { workflow_id: id }, 409, 'ci_failed'); assert.equal(stageOf(id), 'failed')
+  const dup = await post({ action: 'upload_zip', params: { ...p, request_id: randomUUID() } })
+  assert.equal(dup.status, 409); assert.equal((dup.body as any).code, 'duplicate_zip'); assert.match(String((dup.body as any).error), /red Delete button/)
+  assert.equal(locks('zip').length, 1); assert.equal(locks('commit').length, 1)
+  const other = await post({ action: 'delete_workflow', params: { workflow_id: id } }, 'tok-other'); assert.equal(other.status, 403); assert.equal(orchRows().length, 1)
+  const d = await ok('delete_workflow', { workflow_id: id })
+  assert.equal(d.deleted, true); assert.equal(d.released_locks, 2); assert.equal(orchRows().length, 0); assert.equal(locks().length, 0)
+  assert.ok(db.approvals.length > 0, 'approvals are kept'); assert.ok(refs.has(b), 'the agent2 branch on GitHub is not touched')
+  const again = await ok('upload_zip', zipParams(CODE_ZIP, { title: 'ZIP: again' })); approve(again.workflow.steps.approval.id)
+  const ap2 = await ok('apply', { workflow_id: again.workflow.id }); assert.notEqual(ap2.workflow.steps.agent2_apply.branch, b); assert.equal(agentBranches().length, 2)
+  assert.equal(locks('zip').length, 1); assert.equal(locks('commit').length, 1)
+})
+
+test('delete: SQL that already ran stays blocked (never runs twice); an uncertain SQL result blocks deletion', async () => {
+  const entries = [...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }]
+  const u = await zipUp(entries); await toAwaitingSql(u, [])
+  approve(sqlApprovals()[0].id); sqlWritesAllowed = true; await ok('apply_sql', { workflow_id: u.id, db_ack: 'RUN-SQL' })
+  assert.equal(stageOf(u.id), 'completed'); assert.equal(sqlExec.length, 1)
+  const d = await ok('delete_workflow', { workflow_id: u.id }); assert.match(d.note, /never run twice/)
+  assert.equal(orchRows().length, 0); assert.equal(locks('sql').length, 1); assert.equal(locks('sql')[0].payload.status, 'applied'); assert.equal(locks('zip').length, 0)
+  const again = await ok('upload_zip', zipParams(entries, { title: 'ZIP: again' }))
+  assert.equal(again.workflow.zip.sql[0].status, 'blocked'); assert.match(again.workflow.zip.sql[0].reason, /already applied/); assert.equal(sqlExec.length, 1)
+  const w = await ok('upload_zip', zipParams([{ name: 'src/Z.js', data: 'z' }])); const row = db.tasks.find(t => t.id === w.workflow.id)!
+  row.payload.stage = 'failed'; row.payload.steps.sql = { items: [{ path: 'x.sql', status: 'uncertain' }] }
+  await must('delete_workflow', { workflow_id: w.workflow.id }, 409, 'sql_uncertain_open'); assert.ok(orchRows().some(r => r.id === w.workflow.id))
 })
