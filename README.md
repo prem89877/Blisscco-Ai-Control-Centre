@@ -40,3 +40,6 @@ Flow: Create task -> Agent 2 proposal -> you approve (Approvals tab) -> Apply (a
 ## Phase 3 Part 2 ZIP Deployment Control Center
 
 The existing Orchestrator dashboard accepts a ZIP of changed files (and optional `ai_control` SQL migrations). The ZIP is validated on the server only; Gemini sees only a compact bounded diff summary (max 14,000 chars). Code needs your approval before Agent 2 commits to its own `agent2/*` branch; SQL needs a separate Agent 1 approval after CI passes. Agent 3 and production promotion stay manual. See `16-PHASE3-PART2-REPORT.md`.
+
+## Orchestrator automation (Phase 3 Part 1 update)
+The Orchestrator now advances routine stages by itself (`advance` action, dashboard auto-polls) and asks the owner only for sensitive or mandatory steps. Successful runs show only "Successful"; failures show agent, stage, task, the real error and recovery guidance. See `17-PHASE3-PART1-AUTOMATION-REPORT.md`.

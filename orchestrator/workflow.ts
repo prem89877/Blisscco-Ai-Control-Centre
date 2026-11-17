@@ -4,11 +4,14 @@ import { OStore, isUuid } from './store.js'
 import { AgentError, clip, errMsg, redact } from '../agent2/util.js'
 import { repoAllowed } from '../agent2/config.js'
 import { validRepo, validatePath } from '../agent2/guard.js'
-import { REVIEW_MAX_INPUT_CHARS, REVIEW_MAX_OUTPUT_TOKENS } from '../agent2/gemini.js'
+import { reviewLimits } from '../agent2/gemini.js'
 import { makeCtx as makeCtx2, runAction as runA2 } from '../agent2/agent.js'
 import { makeCtx as makeCtx1, runAction as runA1 } from '../agent1/agent.js'
 import { inspectZip, ZIP_LIMITS } from './zip.js'
 import { classifyExecutableSql } from '../agent1/checks.js'
+import { workflowTasks, retentionSeconds, recoveryPlan, healthReport } from './monitor.js'
+import { retryPolicy, backoffMs } from './policy.js'
+import { ROUTES, SENSITIVE_OPERATIONS, sensitivePathsOf, protectedZipPaths, sqlOutcomeIsDefinitive, isTransient, RETRYABLE_STAGES, NEVER_RETRY_CODES, recoveryFor, pipeline, stepOf } from './policy.js'
 
 type Row = Record<string, any>
 
@@ -24,14 +27,15 @@ export const A1_ALLOWED = ['health_report'] as const
 // Reached only through callA1Sql, only from the sql stages below, never from a generic request.
 export const A1_SQL_ALLOWED = ['propose_db_change', 'apply_db_change'] as const
 
-export const ACTIONS = ['heartbeat', 'start', 'upload_zip', 'list', 'get', 'apply', 'check_ci', 'apply_sql', 'verify', 'cancel'] as const
+export const ACTIONS = ['heartbeat', 'start', 'upload_zip', 'list', 'get', 'advance', 'retry', 'apply', 'check_ci', 'apply_sql', 'verify', 'cancel', 'monitor', 'health', 'resume', 'resolve_sql'] as const
 export type Action = typeof ACTIONS[number]
 
 export const STAGES = ['proposing', 'awaiting_approval', 'applying', 'ci_waiting', 'awaiting_sql', 'applying_sql', 'ci_passed', 'verifying', 'completed', 'failed', 'cancelled'] as const
 export type Stage = typeof STAGES[number]
 const TERMINAL: Stage[] = ['completed', 'failed', 'cancelled']
 const TRANSIENT: Stage[] = ['proposing', 'applying', 'applying_sql', 'verifying']
-const STALE_MS = 5 * 60 * 1000
+// A stage that shows no progress for this long is treated as interrupted (default 5 min; ORCH_STALE_MS, min 60 s). This is NOT the display retention.
+const staleMs = (): number => { const n = Math.floor(Number(process.env.ORCH_STALE_MS)); return Number.isFinite(n) && n >= 60_000 ? n : 5 * 60 * 1000 }
 const APPROVAL_TTL_MS = 24 * 3600 * 1000
 
 const STATUS_OF: Record<Stage, string> = { proposing: 'running', awaiting_approval: 'awaiting_approval', applying: 'running', ci_waiting: 'running', awaiting_sql: 'awaiting_approval', applying_sql: 'running', ci_passed: 'running', verifying: 'running', completed: 'succeeded', failed: 'failed', cancelled: 'cancelled' }
@@ -69,32 +73,65 @@ async function advance(o: OCtx, wf: Row, mutate: (p: Row) => void, extra: Row = 
   return row
 }
 
+const TASK_NAME: Record<string, string> = { agent2_propose: 'Agent 2: prepare proposal', approval: 'Owner approval', agent2_apply: 'Agent 2: commit to agent2/* branch', ci: 'GitHub CI', sql: 'Agent 1: SQL migration', agent1_verify: 'Agent 1: verify' }
 async function fail(o: OCtx, wf: Row, f: { agent: 'orchestrator' | 'agent1' | 'agent2'; code: string; message: string }): Promise<Row> {
   const message = String(clean(o, f.message)).slice(0, 600)
   let row = wf
+  let recorded = false
   try {
-    row = await advance(o, wf, p => { const at = p.stage; p.stage = 'failed'; p.failure = { stage: at, agent: f.agent, code: f.code, message, at: now() }; if (p.steps && p.steps[stepOf(at)]) p.steps[stepOf(at)].status = 'failed' }, { error_message: message })
-  } catch { /* someone else already moved it; the original error is still reported */ }
-  await o.store.log('error', 'orchestrator_workflow_failed', message, { stage: wf.payload.stage, agent: f.agent, code: f.code }, wf.id, o.userId)
+    row = await advance(o, wf, p => {
+      const at = p.stage, key = stepOf(at), stp = (p.steps && p.steps[key]) || {}
+      p.stage = 'failed'
+      p.failure = {
+        stage: at, agent: f.agent, code: f.code, message, at: now(), task: TASK_NAME[key] || key,
+        task_id: stp.agent2_task_id || stp.agent1_task_id || null,
+        retryable: (RETRYABLE_STAGES as readonly string[]).includes(at) && !NEVER_RETRY_CODES.includes(f.code)
+      }
+      if (p.steps && p.steps[key]) p.steps[key].status = 'failed'
+    }, { error_message: message })
+    recorded = true
+  } catch (e) { void e /* someone else already moved it; the original error is still reported */ }
+  // One log row (= one failure notification) per failure event: a second concurrent report of the same failure is not logged again.
+  if (recorded) await o.store.log('error', 'orchestrator_workflow_failed', message, { stage: wf.payload.stage, agent: f.agent, code: f.code, event_id: wf.id + ':' + (row.payload && row.payload.failure ? row.payload.failure.at : '') }, wf.id, o.userId)
   return row
 }
 
-function stepOf(stage: string): string {
-  return ({ proposing: 'agent2_propose', awaiting_approval: 'approval', applying: 'agent2_apply', ci_waiting: 'ci', awaiting_sql: 'sql', applying_sql: 'sql', ci_passed: 'ci', verifying: 'agent1_verify' } as Record<string, string>)[stage] || 'none'
+const OUTCOME_OF = (p: Row, wf: Row): string => {
+  if (p.stage === 'completed') return wf.result && wf.result.verdict && wf.result.verdict !== 'healthy' ? 'Completed with warnings' : 'Successful'
+  if (p.stage === 'failed') return 'Failed'
+  if (p.stage === 'cancelled') return 'Cancelled'
+  if (p.stage === 'awaiting_approval' || p.stage === 'awaiting_sql') return 'Waiting for owner'
+  return 'Running'
 }
-
+const codePaths = (p: Row): string[] => (p.zip && Array.isArray(p.zip.changed_files) ? p.zip.changed_files.map((f: Row) => String(f.path)) : ((p.request && p.request.file_paths) || []).map(String))
+function pendingApprovals(p: Row): Row[] {
+  const out: Row[] = []
+  const s = p.steps || {}
+  if (p.stage === 'awaiting_approval' && s.approval && s.approval.id) { const sp = sensitivePathsOf(codePaths(p)); out.push({ kind: 'code_change', approval_id: s.approval.id, sensitive: sp.length > 0, sensitive_paths: sp, why: sp.length ? 'Touches sensitive files' : 'Mandatory approval before Agent 2 writes code to GitHub' }) }
+  if (p.stage === 'awaiting_sql' && s.sql && Array.isArray(s.sql.items)) for (const it of s.sql.items as Row[]) if (it.status === 'pending') out.push({ kind: 'db_change', approval_id: it.approval_id, path: it.path, sensitive: it.risk === 'destructive', why: it.risk === 'destructive' ? 'Destructive SQL' : 'SQL run needs your approval (Agent 1)' })
+  return out
+}
 function view(o: OCtx, wf: Row) {
   const p = wf.payload || {}
+  const outcome = OUTCOME_OF(p, wf)
+  const ok = outcome === 'Successful'
+  const failure = p.failure ? { ...p.failure, recovery: recoveryFor(p.failure) } : null
   return clean(o, {
-    id: wf.id, title: String(wf.title || '').replace(/^Orchestrated: /, ''), status: wf.status, stage: p.stage, repo: p.repo, mode: p.mode,
-    request: p.request, steps: p.steps, failure: p.failure || null, events: p.events || [], report: wf.result || null,
-    safety: p.safety, zip: p.zip || null, created_at: wf.created_at, updated_at: wf.updated_at, finished_at: wf.finished_at || null, rev: p.rev
+    id: wf.id, title: String(wf.title || '').replace(/^Orchestrated: /, ''), status: wf.status, stage: p.stage, outcome, repo: p.repo, mode: p.mode,
+    request: p.request, steps: p.steps, failure, tasks: pipeline(p), pending_approvals: pendingApprovals(p),
+    running: ['proposing', 'applying', 'ci_waiting', 'applying_sql', 'ci_passed', 'verifying'].includes(p.stage) ? { agent: (ROUTES as Row)[p.stage].agent, action: (ROUTES as Row)[p.stage].action } : null,
+    approval_policy: { owner_approval_required_for: SENSITIVE_OPERATIONS, code_change: 'always (mandatory, Agent 2 gate)', sensitive_paths: sensitivePathsOf(codePaths(p)), automatic: ['proposal', 'CI check', 'SQL run after owner approval (non-destructive)', 'Agent 1 verification'], never_automatic: ['production promotion', 'protected-branch merge', 'Agent 3'] },
+    events: ok ? [] : (p.events || []), report: wf.result || null, // successful runs carry no event log
+    safety: p.safety, zip: p.zip || null, created_at: wf.created_at, updated_at: wf.updated_at, finished_at: wf.finished_at || null, rev: p.rev, retries: p.retries || 0
   })
 }
 function summary(o: OCtx, wf: Row) {
   const p = wf.payload || {}
   const s = p.steps || {}
-  return clean(o, { id: wf.id, title: String(wf.title || '').replace(/^Orchestrated: /, ''), status: wf.status, stage: p.stage, repo: p.repo, branch: s.agent2_propose && s.agent2_propose.branch || null, commit_sha: s.agent2_apply && s.agent2_apply.commit_sha || null, ci: s.ci && s.ci.state || null, verdict: wf.result && wf.result.verdict || null, failure: p.failure ? p.failure.message : null, created_at: wf.created_at, updated_at: wf.updated_at })
+  return clean(o, { id: wf.id, title: String(wf.title || '').replace(/^Orchestrated: /, ''), status: wf.status, stage: p.stage, outcome: OUTCOME_OF(p, wf), needs_owner: pendingApprovals(p).length > 0, repo: p.repo, branch: s.agent2_propose && s.agent2_propose.branch || null, commit_sha: s.agent2_apply && s.agent2_apply.commit_sha || null, ci: s.ci && s.ci.state || null, verdict: wf.result && wf.result.verdict || null, failure: p.failure ? p.failure.message : null, failed_agent: p.failure ? p.failure.agent : null, failed_stage: p.failure ? p.failure.stage : null, created_at: wf.created_at, updated_at: wf.updated_at,
+    started_at: wf.started_at || wf.created_at, finished_at: wf.finished_at || null, retries: p.retries || 0, approval: s.approval ? s.approval.status : null,
+    agents: [...new Set([s.agent2_propose && 'agent2', s.sql && 'agent1', s.agent1_verify && 'agent1', s.agent2_apply && 'agent2'].filter(Boolean))],
+    failure_detail: p.failure ? { agent: p.failure.agent, stage: p.failure.stage, code: p.failure.code, message: p.failure.message, at: p.failure.at, recovery: recoveryFor(p.failure), plan: recoveryPlan(p.failure) } : null })
 }
 
 async function load(o: OCtx, id: unknown): Promise<Row> {
@@ -108,7 +145,7 @@ async function sync(o: OCtx, wf: Row): Promise<Row> {
   const p = wf.payload
   const stage: Stage = p.stage
   if (TERMINAL.includes(stage)) return wf
-  if (TRANSIENT.includes(stage) && Date.now() - new Date(wf.updated_at).getTime() > STALE_MS) {
+  if (TRANSIENT.includes(stage) && Date.now() - new Date(wf.updated_at).getTime() > staleMs()) {
     return fail(o, wf, { agent: 'orchestrator', code: 'interrupted', message: `The ${stage} step was interrupted (no result after 5 minutes). Check the agent's own task and branch before starting again.` })
   }
   if (stage === 'awaiting_approval' && p.steps.approval && p.steps.approval.id) {
@@ -168,7 +205,6 @@ export async function startWorkflow(o: OCtx, p: any) {
     safety: { production_promotion: 'never automatic; separate Agent 2 approval', agent3: 'not part of this workflow; start manually', file_contents_stored: mode === 'files' ? 'private Agent 2 ai_control task storage' : false }, zip: p.zip_meta || null
   }
   let wf = await o.store.createWorkflow(clean(o, { id: requestId, title: 'Orchestrated: ' + title, description: 'Orchestrator workflow (Agent 2 + Agent 1)', status: 'running', priority: 2, payload, created_by: o.userId, started_at: now() }))
-  await o.store.log('info', 'orchestrator_workflow_started', title, { repo, mode }, wf.id, o.userId)
 
   let out: any
   try {
@@ -203,8 +239,10 @@ function asErr(e: unknown): AgentError {
   return new AgentError(errMsg(e), 500, 'internal')
 }
 
+async function ownerDecided(o: OCtx, ap: Row): Promise<boolean> { return !!ap.decided_by && (await o.store.isOwner(String(ap.decided_by))) }
 function withWf(e: AgentError, id: string): AgentError { (e as any).workflowId = id; return e }
 
+const commitKeyOf = (repo: unknown, files: unknown): string => 'commit:' + String(repo).toLowerCase() + ':' + createHash('sha256').update(JSON.stringify(((files || []) as Row[]).map(f => [f.path, f.op, f.sha256 || null]).sort())).digest('hex')
 // ---------------------------------------------------------------- apply (steps 5-7). Approval gate is checked twice: here and inside Agent 2.
 export async function applyWorkflow(o: OCtx, p: any) {
   const loaded = await load(o, p.workflow_id)
@@ -222,29 +260,56 @@ export async function applyWorkflow(o: OCtx, p: any) {
   if (ap.status !== 'approved') { await fail(o, wf, { agent: 'orchestrator', code: 'approval_' + ap.status, message: `Approval ${ap.status}; nothing was applied.` }); throw withWf(new AgentError('Approval is ' + ap.status, 409, 'approval_' + ap.status), wf.id) }
   if (d.executed_at) { await fail(o, wf, { agent: 'orchestrator', code: 'already_executed', message: 'This approval was already used; it cannot be executed twice.' }); throw withWf(new AgentError('Already executed', 409, 'already_executed'), wf.id) }
   if (!ap.decided_at || Date.now() - new Date(ap.decided_at).getTime() > APPROVAL_TTL_MS) { await fail(o, wf, { agent: 'orchestrator', code: 'expired', message: 'Approval is older than 24h; start the workflow again.' }); throw withWf(new AgentError('Approval older than 24h', 409, 'expired'), wf.id) }
-  if ((d.sensitive_paths || []).length && p.sensitive_ack !== 'APPROVE-SENSITIVE') throw withWf(new AgentError('This change touches sensitive files (' + d.sensitive_paths.join(', ') + '). Tick the confirmation to continue.', 403, 'sensitive_ack'), wf.id)
+  if (!(await ownerDecided(o, ap))) { await fail(o, wf, { agent: 'orchestrator', code: 'approval_not_owner', message: 'The approval was not decided by an authorized owner; nothing was applied.' }); throw withWf(new AgentError('Approval was not decided by an authorized owner', 403, 'approval_not_owner'), wf.id) }
+  const sens = [...new Set([...(d.sensitive_paths || []), ...sensitivePathsOf(((d.files || []) as Row[]).map(f => String(f.path)))])]
+  if (sens.length && p.sensitive_ack !== 'APPROVE-SENSITIVE') throw withWf(new AgentError('This change touches sensitive files (' + sens.join(', ') + '). Tick the confirmation to continue.', 403, 'sensitive_ack'), wf.id)
 
-  wf = await advance(o, wf, q => { q.stage = 'applying'; q.steps.approval.status = 'approved'; q.steps.agent2_apply = { status: 'running', agent: 'agent2', started_at: now() } }) // lock: a second click gets 409
+  // Durable commit lock (permanent, primary-key backed): the same change set (repo + base + per-file SHA-256) can be committed once, ever.
+  const commitKey = st.zip ? commitKeyOf(st.repo, d.files) : ''
+  if (commitKey) {
+    let got = await o.store.claimLock(commitKey, 'commit', { holder: wf.id, status: 'claimed', approval_id: ap.id, claimed_at: now() })
+    if (!got) { const l = await o.store.getLock(commitKey); if (l && l.payload.status === 'failed') got = await o.store.casLock(commitKey, String(l.payload.holder), { holder: wf.id, status: 'claimed', approval_id: ap.id, claimed_at: now() }) }
+    if (!got) { await fail(o, wf, { agent: 'orchestrator', code: 'commit_duplicate', message: 'An identical change set (same repo and file checksums) was already committed or is being committed by another workflow; nothing was written.' }); throw withWf(new AgentError('Identical change set already committed or in progress', 409, 'commit_duplicate'), wf.id) }
+  }
+  const releaseCommit = async () => { if (commitKey) { try { await o.store.casLock(commitKey, wf.id, { status: 'failed' }) } catch { /* lock stays = safe side */ } } }
+  wf = await advance(o, wf, q => { q.stage = 'applying'; q.steps.approval.status = 'approved'; q.steps.approval.decision = { approval_id: ap.id, decided_by: ap.decided_by, decided_at: ap.decided_at, operation: 'Agent 2 writes the approved change to its own agent2/* branch (one commit; no merge, no production)', sensitive_confirmed: sens.length ? true : false }; q.steps.agent2_apply = { status: 'running', agent: 'agent2', started_at: now() } }) // lock: a second click gets 409
   let out: any
   try {
     out = await callA2(o, 'apply_change', { approval_id: ap.id, sensitive_ack: p.sensitive_ack })
   } catch (e) {
     const ae = asErr(e)
+    if (!isTransient(ae) && ae.status < 500 && ae.code !== 'already_executed') await releaseCommit() // refused before/rolled back by Agent 2: nothing committed. Uncertain (5xx/network) errors keep the lock.
     const row = await fail(o, wf, { agent: 'agent2', code: ae.code, message: 'Agent 2 could not apply the change: ' + ae.message })
     throw withWf(new AgentError('Agent 2 could not apply the change: ' + clean(o, ae.message), ae.status, ae.code), row.id)
   }
   const r = out.result || {}
   if (!r.applied || !r.commit_sha) {
-    const row = await fail(o, wf, { agent: 'agent2', code: 'no_commit', message: 'Agent 2 reported no commit; stopped.' })
+    const row = await fail(o, wf, { agent: 'agent2', code: 'no_commit', message: 'Agent 2 reported no commit; stopped. The commit lock is kept: check the agent2/* branch before trying again.' })
     throw withWf(new AgentError('Agent 2 reported no commit', 502, 'no_commit'), row.id)
   }
+  if (commitKey) await o.store.casLock(commitKey, wf.id, { status: 'committed', commit_sha: r.commit_sha, branch: r.branch, committed_at: now() }).catch(() => false)
   wf = await advance(o, wf, q => {
     q.stage = 'ci_waiting'
     q.steps.agent2_apply = { status: 'done', agent: 'agent2', agent2_task_id: out.task_id, branch: r.branch, commit_sha: r.commit_sha, compare_url: r.compare_url, changed_files: r.changed_files, production_touched: false, finished_at: now() }
     q.steps.ci = { state: 'unknown', checked_at: null, runs: ((r.ci_runs || []) as any[]).slice(0, 5) }
   })
-  await o.store.log('success', 'orchestrator_change_applied', `${r.branch} @ ${String(r.commit_sha).slice(0, 7)}`, { approval_id: ap.id }, wf.id, o.userId)
   return { workflow: view(o, wf), next: 'Check CI. When it passes, Agent 1 verification starts.' }
+}
+
+// Read-only calls only (CI status, health report): up to 2 extra attempts on a transient error. Never used for commits or SQL.
+export async function readOnlyWithRetry<T>(fn: () => Promise<T>, env: Record<string, string | undefined> = process.env): Promise<T> {
+  const pol = retryPolicy(env), t0 = Date.now()
+  let last: unknown
+  for (let i = 0; i < pol.maxAttempts; i++) {
+    try { return await fn() } catch (e) {
+      last = e
+      if (!isTransient(asErr(e))) throw e // permanent / unauthorized / security errors are never retried
+      const wait = backoffMs(i, pol.baseMs)
+      if (i === pol.maxAttempts - 1 || Date.now() - t0 + wait > pol.maxTotalMs) break // attempts or total duration exhausted: stop, no infinite loop
+      await new Promise(r => setTimeout(r, wait))
+    }
+  }
+  throw last
 }
 
 // ---------------------------------------------------------------- CI check, then hand over to Agent 1 (steps 7-8)
@@ -261,15 +326,19 @@ export async function checkCi(o: OCtx, p: any) {
   if (st.stage !== 'ci_waiting') throw withWf(new AgentError(`Cannot check CI: workflow is "${st.stage}"`, 409, 'wrong_stage'), wf.id)
   const commit = String(st.steps.agent2_apply.commit_sha)
   let res: any
-  try { res = await callA2(o, 'actions_status', { repo: st.repo, branch: st.steps.agent2_apply.branch }) }
+  try { res = await readOnlyWithRetry(() => callA2(o, 'actions_status', { repo: st.repo, branch: st.steps.agent2_apply.branch })) }
   catch (e) {
     const ae = asErr(e)
+    if (isTransient(ae)) { // temporary GitHub problem: stay in ci_waiting and let the next poll retry (read-only, bounded)
+      const n = (Number(st.steps.ci && st.steps.ci.read_retries) || 0) + 1
+      if (n < retryPolicy().maxAttempts) { wf = await advance(o, wf, q => { q.steps.ci = { ...(q.steps.ci || {}), read_retries: n, last_read_error: String(clean(o, ae.message)).slice(0, 200) } }); return { workflow: view(o, wf), ci_state: 'unknown', transient: true, next: 'GitHub could not be read just now (temporary). It will be retried automatically.' } }
+    }
     const row = await fail(o, wf, { agent: 'agent2', code: ae.code, message: 'Agent 2 could not read CI status: ' + ae.message })
     throw withWf(new AgentError('Agent 2 could not read CI status: ' + clean(o, ae.message), ae.status, ae.code), row.id)
   }
   const runs: any[] = (res.result && res.result.runs) || []
   const state = evalCi(runs, commit)
-  const ciStep = { state, checked_at: now(), runs: runs.filter(r => r.sha && commit.startsWith(r.sha)).slice(0, 5), deployments: ((res.result && res.result.deployments) || []).slice(0, 5), failed_jobs: state === 'failing' ? ((res.result && res.result.failed_jobs) || []).slice(0, 5) : undefined }
+  const ciStep = { state, checked_at: now(), read_retries: 0, runs: runs.filter(r => r.sha && commit.startsWith(r.sha)).slice(0, 5), deployments: ((res.result && res.result.deployments) || []).slice(0, 5), failed_jobs: state === 'failing' ? ((res.result && res.result.failed_jobs) || []).slice(0, 5) : undefined }
   if (state === 'failing') {
     const jobs = ciStep.failed_jobs && ciStep.failed_jobs.length ? ' Failed: ' + ciStep.failed_jobs.map((j: any) => j.job + ' (' + (j.failed_steps || []).join(', ') + ')').join('; ') : ''
     await advance(o, wf, q => { q.steps.ci = ciStep })
@@ -328,8 +397,10 @@ export async function applySqlWorkflow(o: OCtx, p: any) {
   if (loaded.payload.stage === 'awaiting_sql' && st.stage === 'failed' && st.failure) throw withWf(new AgentError('Workflow stopped: ' + st.failure.message, 409, st.failure.code), wf.id)
   if (st.stage !== 'awaiting_sql') throw withWf(new AgentError(`Cannot run SQL: workflow is "${st.stage}", not awaiting SQL approval`, 409, 'wrong_stage'), wf.id)
   if (p.db_ack !== 'RUN-SQL') throw withWf(new AgentError('Explicit confirmation needed (db_ack)', 403, 'db_ack'), wf.id)
-  const items: Row[] = st.steps.sql.items
+  const items: Row[] = (st.steps.sql.items as Row[]).filter(i => i.status !== 'applied') // already-applied (verified) migrations are never run again
+  if (!items.length) throw withWf(new AgentError('Every migration in this workflow is already applied', 409, 'wrong_stage'), wf.id)
   if (items.some(i => i.risk === 'destructive') && p.destructive_ack !== 'APPROVE-DESTRUCTIVE') throw withWf(new AgentError('This migration contains destructive statements (DELETE/UPDATE/ALTER ... DROP). Tick the destructive confirmation to continue.', 403, 'destructive_ack'), wf.id)
+  const decisions = new Map<string, Row>()
   // Check EVERY approval before executing ANY of them, so a half-approved set never runs partially.
   for (const it of items) {
     const ap = await o.store.getApproval(String(it.approval_id))
@@ -338,22 +409,56 @@ export async function applySqlWorkflow(o: OCtx, p: any) {
     if (ap.status === 'pending') throw withWf(new AgentError(`Not approved yet: ${it.path}. Approve it in the Approvals tab first.`, 409, 'not_approved'), wf.id)
     if (ap.status !== 'approved') { await fail(o, wf, { agent: 'orchestrator', code: 'sql_approval_' + ap.status, message: `SQL approval for ${it.path} is ${ap.status}; no SQL was executed.` }); throw withWf(new AgentError('SQL approval is ' + ap.status, 409, 'approval_' + ap.status), wf.id) }
     if (d.executed_at) { await fail(o, wf, { agent: 'orchestrator', code: 'already_executed', message: `The SQL approval for ${it.path} was already used; it cannot be executed twice.` }); throw withWf(new AgentError('Already executed', 409, 'already_executed'), wf.id) }
+    if (!ap.decided_at || Date.now() - new Date(ap.decided_at).getTime() > APPROVAL_TTL_MS) { await fail(o, wf, { agent: 'orchestrator', code: 'sql_approval_expired', message: `SQL approval for ${it.path} is older than 24h; no SQL was executed. Start again and approve promptly.` }); throw withWf(new AgentError('SQL approval older than 24h', 409, 'sql_approval_expired'), wf.id) }
+    if (!(await ownerDecided(o, ap))) { await fail(o, wf, { agent: 'orchestrator', code: 'approval_not_owner', message: `The SQL approval for ${it.path} was not decided by an authorized owner; no SQL was executed.` }); throw withWf(new AgentError('Approval was not decided by an authorized owner', 403, 'approval_not_owner'), wf.id) }
+    decisions.set(String(it.path), { approval_id: ap.id, decided_by: ap.decided_by, decided_at: ap.decided_at, operation: 'Agent 1 runs this approved SQL in ai_control (one transaction, 15 s timeout)', destructive_confirmed: it.risk === 'destructive' })
     if (createHash('sha256').update(String(d.sql || '')).digest('hex') !== it.sha256) { await fail(o, wf, { agent: 'orchestrator', code: 'sql_checksum', message: `The approved SQL for ${it.path} does not match the uploaded file (checksum); no SQL was executed.` }); throw withWf(new AgentError('SQL checksum mismatch', 409, 'sql_checksum'), wf.id) }
   }
-  wf = await advance(o, wf, q => { q.stage = 'applying_sql'; q.steps.sql.status = 'running' }) // lock: a second click gets 409
+  // Durable per-migration lock (primary-key backed, permanent): the same SQL checksum can never be claimed by two workflows,
+  // even across restarts, other tabs or workflows older than the list window. All claimed BEFORE anything runs.
+  const claimed: string[] = []
+  const releaseClaims = async (keys: string[]) => { for (const k of keys) { try { await o.store.casLock(k, wf.id, { status: 'failed' }) } catch { /* best effort; lock stays claimed = safe side */ } } }
+  for (const it of items) {
+    const key = 'sql:' + it.sha256
+    let got = await o.store.claimLock(key, 'sql', { holder: wf.id, status: 'claimed', approval_id: it.approval_id, path: it.path, claimed_at: now() })
+    if (!got) {
+      const lock = await o.store.getLock(key)
+      // Only a migration that definitively FAILED (single transaction, rolled back) may be claimed again.
+      if (lock && lock.payload.status === 'failed') got = await o.store.casLock(key, String(lock.payload.holder), { holder: wf.id, status: 'claimed', approval_id: it.approval_id, path: it.path, claimed_at: now() })
+    }
+    if (!got) {
+      await releaseClaims(claimed)
+      await fail(o, wf, { agent: 'orchestrator', code: 'sql_duplicate', message: `An identical migration (SHA-256) for ${it.path} was already claimed or applied by another workflow; no SQL was executed.` })
+      throw withWf(new AgentError('Identical migration already applied or in progress', 409, 'sql_duplicate'), wf.id)
+    }
+    claimed.push(key)
+  }
+  const appliedKeys = new Set<string>()
+  wf = await advance(o, wf, q => { q.stage = 'applying_sql'; q.steps.sql.status = 'running'; for (const x of q.steps.sql.items) if (decisions.has(String(x.path))) x.decision = decisions.get(String(x.path)) }) // lock: a second click gets 409
   for (const it of items) {
     let out: any
     try { out = await callA1Sql(o, 'apply_db_change', { approval_id: it.approval_id, db_ack: 'RUN-SQL' }) }
     catch (e) {
       const ae = asErr(e)
-      const row = await fail(o, wf, { agent: 'agent1', code: ae.code, message: `Agent 1 could not run ${it.path}: ${ae.message}. Later migrations were NOT run. Earlier ones are not rolled back automatically.` }).then(async w => {
-        try { return await advance(o, w, q => { for (const x of q.steps.sql.items) if (x.status !== 'applied') x.status = x.path === it.path ? 'failed' : 'not_run'; q.steps.sql.status = 'failed' }) } catch { return w }
+      const definitive = sqlOutcomeIsDefinitive(ae)
+      // Locks of migrations that did NOT run (later files) are always released. The failing file's lock is released only when the
+      // failure is provably definitive; an uncertain result keeps it claimed and is never repeated automatically.
+      const notRun = items.filter(x => x.path !== it.path && x.status !== 'applied' && claimed.includes('sql:' + x.sha256) && !appliedKeys.has('sql:' + x.sha256)).map(x => 'sql:' + x.sha256)
+      await releaseClaims(definitive ? [...notRun, 'sql:' + it.sha256] : notRun)
+      if (!definitive) await o.store.casLock('sql:' + it.sha256, wf.id, { status: 'uncertain', uncertain_at: now(), last_error: String(clean(o, ae.message)).slice(0, 200) }).catch(() => false)
+      const code = definitive ? ae.code : 'sql_uncertain'
+      const msg = definitive
+        ? `Agent 1 could not run ${it.path}: ${ae.message}. The SQL ran in one transaction and was rolled back. Later migrations were NOT run. Earlier ones are not rolled back automatically.`
+        : `The result of ${it.path} is UNCERTAIN (${ae.message}). It was NOT repeated. Check in Supabase whether it was applied before doing anything else. Later migrations were NOT run.`
+      const row = await fail(o, wf, { agent: 'agent1', code, message: msg }).then(async w => {
+        try { return await advance(o, w, q => { for (const x of q.steps.sql.items) if (x.status !== 'applied') x.status = x.path === it.path ? (definitive ? 'failed' : 'uncertain') : 'not_run'; q.steps.sql.status = 'failed' }) } catch { return w }
       })
-      throw withWf(new AgentError(`Agent 1 could not run ${it.path}: ` + clean(o, ae.message), ae.status, ae.code), row.id)
+      throw withWf(new AgentError(msg, definitive ? ae.status : 502, code), row.id)
     }
     const rows = out.result && typeof out.result.rows === 'number' ? out.result.rows : null
+    appliedKeys.add('sql:' + it.sha256)
+    await o.store.casLock('sql:' + it.sha256, wf.id, { status: 'applied', applied_at: now() }) // permanent: never released
     wf = await advance(o, wf, q => { const x = q.steps.sql.items.find((y: Row) => y.path === it.path); x.status = 'applied'; x.rows = rows; x.applied_at = now() })
-    await o.store.log('success', 'orchestrator_sql_applied', it.path, { approval_id: it.approval_id }, wf.id, o.userId)
   }
   wf = await advance(o, wf, q => { q.stage = 'ci_passed'; q.steps.sql.status = 'done'; q.steps.sql.finished_at = now() })
   return runVerify(o, wf) // SQL is in place: Agent 1 now verifies Supabase / Vercel / GitHub
@@ -436,7 +541,7 @@ async function runVerify(o: OCtx, wf: Row) {
   if (reviewedSql(st).length && !(st.steps.sql && st.steps.sql.status === 'done')) throw withWf(new AgentError('SQL migrations in this ZIP have not been run yet. Approve and run them first (the code must not be verified or promoted before its migration is applied).', 409, 'sql_pending'), wf.id)
   wf = await advance(o, wf, q => { q.stage = 'verifying'; q.steps.agent1_verify = { status: 'running', agent: 'agent1', started_at: now() } })
   let res: any
-  try { res = await callA1(o, 'health_report') }
+  try { res = await readOnlyWithRetry(() => callA1(o, 'health_report')) }
   catch (e) {
     const ae = asErr(e)
     const row = await fail(o, wf, { agent: 'agent1', code: ae.code, message: 'Agent 1 verification failed: ' + ae.message })
@@ -445,7 +550,7 @@ async function runVerify(o: OCtx, wf: Row) {
   const a1 = summarizeAgent1(res, wf.payload.repo, wf.payload.branch)
   const report = clean(o, buildReport(wf.id, wf.payload, a1))
   wf = await advance(o, wf, q => { q.stage = 'completed'; q.steps.agent1_verify = { status: 'done', agent: 'agent1', agent1_task_id: res.task_id, overall: a1.overall, finished_at: now() } }, { result: clip(report) })
-  await o.store.log(report.verdict === 'healthy' ? 'success' : 'warn', 'orchestrator_workflow_completed', `${p0(wf)} verdict: ${report.verdict}`, {}, wf.id, o.userId)
+  if (report.verdict !== 'healthy') await o.store.log('warn', 'orchestrator_workflow_completed', `${p0(wf)} verdict: ${report.verdict}`, {}, wf.id, o.userId) // a healthy run writes no log row
   return { workflow: view(o, wf), ci_state: 'passing', next: 'Workflow finished. Read the combined report.' }
 }
 const p0 = (wf: Row) => String(wf.title || '').replace(/^Orchestrated: /, '')
@@ -465,6 +570,92 @@ export async function cancelWorkflow(o: OCtx, p: any) {
   return { workflow: view(o, wf) }
 }
 
+
+// ---------------------------------------------------------------- automatic coordination
+// advance = "do whatever is next and permitted". It moves a workflow through every stage that needs no owner decision
+// (CI check -> Agent 1 verification, commit after the owner approved, SQL run after the owner approved) and STOPS at the first
+// stage that does. It never creates, edits or decides an approval, never treats an unreadable approval as approval,
+// and is safe to call repeatedly or in parallel (state is guarded by the rev lock; the second caller just sees the current state).
+type Gate = { ready: true } | { ready: false; why: string; detail: string }
+
+async function readApproval(o: OCtx, id: unknown): Promise<Row | null | 'unavailable'> {
+  try { return await o.store.getApproval(String(id || '')) } catch { return 'unavailable' }
+}
+const UNAVAILABLE: Gate = { ready: false, why: 'approval_unavailable', detail: 'The approval system could not be read. Nothing was applied; an unreadable approval is never treated as approved.' }
+
+async function codeGate(o: OCtx, wf: Row, p: any): Promise<Gate> {
+  const ap = await readApproval(o, wf.payload.steps.approval && wf.payload.steps.approval.id)
+  if (ap === 'unavailable' || !ap) return UNAVAILABLE
+  if (ap.status === 'pending') return { ready: false, why: 'owner_approval', detail: 'Waiting for the owner to approve the code change in the Approvals tab.' }
+  if (ap.status !== 'approved') return { ready: true } // rejected / expired: applyWorkflow records the stop
+  const d = ap.details || {}
+  const sens = [...new Set([...(d.sensitive_paths || []), ...sensitivePathsOf(((d.files || []) as Row[]).map(f => String(f.path)))])]
+  if (sens.length && p.sensitive_ack !== 'APPROVE-SENSITIVE') return { ready: false, why: 'sensitive_confirmation', detail: 'Sensitive files need your explicit confirmation: ' + sens.join(', ') }
+  return { ready: true }
+}
+
+async function sqlGate(o: OCtx, wf: Row, p: any): Promise<Gate> {
+  const items: Row[] = ((wf.payload.steps.sql && wf.payload.steps.sql.items) || []).filter((i: Row) => i.status !== 'applied')
+  if (!items.length) return { ready: false, why: 'no_sql', detail: 'No SQL approvals recorded.' }
+  for (const it of items) {
+    const ap = await readApproval(o, it.approval_id)
+    if (ap === 'unavailable' || !ap) return UNAVAILABLE
+    if (ap.status === 'pending') return { ready: false, why: 'owner_approval', detail: 'Waiting for the owner to approve ' + it.path + ' in the Approvals tab.' }
+  }
+  if (items.some(i => i.risk === 'destructive') && p.destructive_ack !== 'APPROVE-DESTRUCTIVE') return { ready: false, why: 'destructive_confirmation', detail: 'This SQL is destructive. It never runs automatically: confirm it explicitly.' }
+  return { ready: true }
+}
+
+export async function autoAdvance(o: OCtx, p: any) {
+  let wf = await sync(o, await load(o, p.workflow_id))
+  let moved = 0
+  const waiting = (w: Row, why: string, detail: string) => ({ workflow: view(o, w), advanced: moved, waiting: { for: why, detail } })
+  for (let i = 0; i < 8; i++) {
+    const stage: Stage = wf.payload.stage
+    if (TERMINAL.includes(stage)) break
+    try {
+      if (stage === 'awaiting_approval') {
+        const g = await codeGate(o, wf, p); if (!g.ready) return waiting(wf, g.why, g.detail)
+        await applyWorkflow(o, { workflow_id: wf.id, sensitive_ack: p.sensitive_ack })
+      } else if (stage === 'ci_waiting') {
+        const r: any = await checkCi(o, { workflow_id: wf.id }); moved++
+        wf = await load(o, wf.id)
+        if (wf.payload.stage === 'ci_waiting') return waiting(wf, 'ci', r.next || 'Waiting for GitHub CI.')
+        continue
+      } else if (stage === 'ci_passed') {
+        await nextAfterCi(o, wf)
+      } else if (stage === 'awaiting_sql') {
+        const g = await sqlGate(o, wf, p); if (!g.ready) return waiting(wf, g.why, g.detail)
+        await applySqlWorkflow(o, { workflow_id: wf.id, db_ack: 'RUN-SQL', destructive_ack: p.destructive_ack }) // owner approved this exact SQL (checksum re-verified inside)
+      } else break // proposing / applying / applying_sql / verifying: another request is working on it
+      moved++
+      wf = await load(o, wf.id)
+    } catch (e) {
+      const ae = asErr(e), id = (e as any).workflowId
+      if (ae.code === 'conflict') { wf = await load(o, wf.id); return waiting(wf, 'other_request', 'Another request is already moving this workflow.') }
+      if (id) return { workflow: view(o, await load(o, id)), advanced: moved, waiting: null } // the failure is recorded in the workflow itself
+      throw e
+    }
+  }
+  return { workflow: view(o, wf), advanced: moved, waiting: null }
+}
+
+// retry = resume a FAILED workflow at its failed READ-ONLY stage (CI status / verification). Completed steps are kept and never repeated.
+// Commit, SQL, rejected / expired approvals and real CI failures are never retried.
+export async function retryWorkflow(o: OCtx, p: any) {
+  const wf = await load(o, p.workflow_id)
+  const st = wf.payload, f = st.failure
+  if (st.stage !== 'failed' || !f) throw withWf(new AgentError('Only a failed workflow can be retried', 409, 'wrong_stage'), wf.id)
+  if (!f.retryable) throw withWf(new AgentError(`Not retryable (${f.stage}: ${f.code}). ` + recoveryFor(f), 409, 'not_retryable'), wf.id)
+  if ((Number(st.retries) || 0) >= 5) throw withWf(new AgentError('Retry limit reached for this workflow', 409, 'retry_limit'), wf.id)
+  const back: Stage = f.stage === 'verifying' ? 'ci_passed' : f.stage
+  await advance(o, wf, q => {
+    q.retries = (Number(q.retries) || 0) + 1; q.stage = back; delete q.failure
+    const key = stepOf(f.stage); if (q.steps[key] && q.steps[key].status === 'failed') delete q.steps[key].status
+    if (q.steps.ci) q.steps.ci.read_retries = 0
+  }, { error_message: null, finished_at: null })
+  return autoAdvance(o, { workflow_id: wf.id })
+}
 
 // ---------------------------------------------------------------- ZIP deployment (steps 1-5)
 // The archive is decoded and validated only on the server and is never forwarded anywhere. Agent 2 receives the validated
@@ -514,10 +705,16 @@ async function uploadZipWorkflow(o: OCtx, p: any) {
     if (wp.zip && wp.zip.checksum === parsed.checksum && wp.repo === repo && !['failed', 'cancelled'].includes(wp.stage)) throw new AgentError('This exact ZIP was already uploaded (workflow ' + w.id + ').', 409, 'duplicate_zip')
     for (const it of (wp.steps && wp.steps.sql && wp.steps.sql.items) || []) if (it.status === 'applied') applied.set(it.sha256, w.id)
   }
+  // Durable SQL lock lookup (covers workflows beyond the 100-row list window). A 'failed' lock is free again.
+  for (const e of sqlEntries) { const l = await o.store.getLock('sql:' + e.sha256); if (l && l.payload.status !== 'failed') applied.set(e.sha256, String(l.payload.holder)) }
   const sql = sqlEntries.map(e => reviewSql(e, applied))
 
   const delPaths = delManifest ? delManifest.content.split(/\r?\n/).map(x => x.trim()).filter(Boolean) : []
   if (delManifest && !delPaths.length) throw new AgentError('Delete manifest is empty', 400, 'bad_delete_manifest')
+
+  // The deployment workflow's own security rules cannot be changed through an upload (create, update OR delete).
+  const protectedHit = protectedZipPaths([...code.map(e => e.path), ...delPaths.map(x => { try { return validatePath(x) } catch { return x } })], String(process.env.ORCH_ZIP_PROTECTED_EXTRA || '').split(','))
+  if (protectedHit.length) throw new AgentError('This ZIP touches protected deployment/security files and was refused: ' + protectedHit.slice(0, 6).join(', ') + '. Change these only through a normal reviewed GitHub commit. Nothing was stored or applied.', 403, 'protected_path')
 
   // Target repository + base commit verification (read-only GitHub calls with Agent 2's token).
   const headers = { Authorization: 'Bearer ' + o.cfg.c2.githubToken, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }
@@ -550,11 +747,166 @@ async function uploadZipWorkflow(o: OCtx, p: any) {
   const zipMeta = {
     checksum: parsed.checksum, archive_bytes: Math.floor(p.zip_base64.length * 3 / 4), total_extracted_bytes: parsed.totalBytes, limits: ZIP_LIMITS,
     ignored_entries: parsed.ignored, base_branch: base, base_commit: baseSha, changed_files: fileMeta, sql,
-    gemini: { input_max_chars: REVIEW_MAX_INPUT_CHARS, output_max_tokens: REVIEW_MAX_OUTPUT_TOKENS, policy: 'Agent 2 sends a compact diff summary only (paths, operation, type, +/- counts, bounded hunks, findings). The ZIP, unchanged files and full file bodies are never sent.', review_partial: null as boolean | null },
+    gemini: { input_max_chars: reviewLimits().maxInputChars, output_max_tokens: reviewLimits().maxOutputTokens, policy: 'Agent 2 sends a compact diff summary only (paths, operation, type, +/- counts, bounded hunks, findings). The ZIP, unchanged files and full file bodies are never sent.', review_partial: null as boolean | null },
     secret_scan: 'passed (any finding rejects the whole ZIP before anything is stored)'
+  }
+  // Durable duplicate-ZIP claim (permanent, atomic). Same repo + same ZIP checksum -> exactly one workflow, ever,
+  // unless that workflow ended failed/cancelled (or never got created), in which case it is atomically taken over.
+  const zipKey = 'zip:' + repo.toLowerCase() + ':' + parsed.checksum
+  if (!(await o.store.claimLock(zipKey, 'zip', { holder: requestId, status: 'claimed', claimed_at: now() }))) {
+    const lock = await o.store.getLock(zipKey)
+    const holder = lock ? String(lock.payload.holder) : ''
+    if (holder !== requestId) { // same request_id = retry; startWorkflow then answers 409 'duplicate'
+      const hw = isUuid(holder) ? await o.store.getWorkflow(holder) : null
+      // Takeover only when the earlier attempt provably changed nothing: no commit on GitHub and no SQL claimed/applied.
+      const hp = (hw && hw.payload) || {}
+      const touched = !!(hp.steps && ((hp.steps.agent2_apply && hp.steps.agent2_apply.status !== 'failed' && hp.steps.agent2_apply.commit_sha) || (hp.steps.sql && (hp.steps.sql.items || []).some((it: Row) => ['applied', 'uncertain', 'running'].includes(it.status)))))
+      const dead = !hw || (['failed', 'cancelled'].includes(String(hp.stage)) && !touched)
+      if (!lock || !dead || !(await o.store.casLock(zipKey, holder, { holder: requestId, claimed_at: now() }))) throw new AgentError('This exact ZIP was already uploaded' + (holder ? ' (workflow ' + holder + ')' : '') + '.', 409, 'duplicate_zip')
+    }
   }
   const result = await startWorkflow(o, { repo, title, description: `ZIP ${parsed.checksum.slice(0, 12)}; ${files.length} code change(s); ${sql.length} SQL file(s).`, mode: 'files', files, base, request_id: requestId, zip_meta: zipMeta })
   return result
+}
+
+// ---------------------------------------------------------------- Part 3: persistent monitoring, crash recovery, health
+// monitor = ONE read-only call that restores the whole dashboard state after any refresh / restart / new device: it only reads
+// persisted rows (workflows, approvals) and the server clock. It writes nothing except the existing "interrupted" bookkeeping done by sync().
+async function monitorAction(o: OCtx) {
+  const nowMs = Date.now(), retention = retentionSeconds()
+  const byId = new Map<string, Row>()
+  for (const r of [...await o.store.listActiveWorkflows(), ...await o.store.listWorkflows(100)]) byId.set(r.id, r)
+  const wfs: Row[] = []
+  for (const r of byId.values()) wfs.push(await sync(o, r).catch(() => r)) // detects interrupted (stale) stages and rejected/expired approvals
+  const tasks = wfs.flatMap(r => workflowTasks(r, nowMs, retention))
+  const pending = await o.store.listPendingApprovals() // persisted approval state is the only source of the indicator
+  const failed = wfs.filter(r => r.payload && r.payload.stage === 'failed' && r.payload.failure)
+  const interrupted = failed.filter(r => { const f = r.payload.failure, pl = recoveryPlan(f); return !!pl && (f.code === 'interrupted' || pl.kind === 'verify_sql') && nowMs - new Date(f.at).getTime() < 7 * 86400000 }).map(r => {
+    const f = r.payload.failure, plan = recoveryPlan(f)!
+    return { workflow_id: r.id, title: String(r.title || '').replace(/^Orchestrated: /, ''), stage: f.stage, code: f.code, uncertain: plan.uncertain, uncertain_paths: ((r.payload.steps.sql && r.payload.steps.sql.items) || []).filter((x: Row) => x.status === 'uncertain').map((x: Row) => x.path), action: plan.kind, summary: plan.summary, detected_at: f.at, verified: f.verified || null }
+  })
+  const failures = failed.filter(r => nowMs - new Date(r.payload.failure.at).getTime() <= retention * 1000).map(r => { // one entry per failure EVENT; successes produce no notification at all
+    const f = r.payload.failure
+    return { event_id: r.id + ':' + f.at, workflow_id: r.id, title: String(r.title || '').replace(/^Orchestrated: /, ''), agent: f.agent, stage: f.stage, code: f.code, message: f.message, at: f.at, recovery: recoveryFor(f), retryable: !!f.retryable }
+  })
+  const rank = (t: Row) => t.status === 'running' ? 0 : t.status === 'waiting' ? 1 : 2
+  tasks.sort((a, b) => rank(a) - rank(b) || String(b.finished_at || b.started_at).localeCompare(String(a.finished_at || a.started_at)))
+  return {
+    server_now: new Date(nowMs).toISOString(), retention_seconds: retention,
+    approvals: { pending_count: pending.length, pending: pending.slice(0, 50).map(a => ({ id: a.id, title: a.title, kind: a.details && a.details.kind || null, requested_at: a.requested_at, task_id: a.task_id })) },
+    tasks: { running: tasks.filter(t => t.status === 'running' || t.status === 'waiting'), recent_succeeded: tasks.filter(t => t.status === 'succeeded'), recent_failed: tasks.filter(t => t.status === 'failed') },
+    interrupted, failures,
+    operational: { active_workflows: wfs.filter(r => !TERMINAL.includes(r.payload.stage)).length, failed_workflows: failed.length, pending_approvals: pending.length, interrupted: interrupted.length }
+  }
+}
+
+async function healthAction(o: OCtx) {
+  const active = await o.store.listActiveWorkflows()
+  const stages = active.map(r => String(r.payload && r.payload.stage))
+  const run = (agent: string) => stages.some(s => (ROUTES as Row)[s] && (ROUTES as Row)[s].agent === agent && ['proposing', 'applying', 'ci_waiting', 'applying_sql', 'ci_passed', 'verifying'].includes(s))
+  return healthReport(o.cfg, { agent1: run('agent1'), agent2: run('agent2') })
+}
+
+// A read-only GitHub lookup with Agent 2's own token (the same read-only access the ZIP upload already uses).
+async function ghGet(o: OCtx, repo: string, path: string): Promise<{ status: number; body: any }> {
+  const r = await fetch('https://api.github.com/repos/' + repo + '/' + path, { headers: { Authorization: 'Bearer ' + o.cfg.c2.githubToken, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }, signal: AbortSignal.timeout(15000) })
+  return { status: r.status, body: await r.json().catch(() => ({})) }
+}
+
+// What actually happened to one SQL migration? Decided only from recorded facts, never guessed:
+//  applied     - Agent 1 recorded a successful run
+//  not_applied - the approval was never claimed, or Supabase rejected the statement (4xx, single transaction = rolled back)
+//  uncertain   - claimed but no success/definitive failure was recorded (crash, timeout, 5xx): the owner must confirm
+async function sqlState(o: OCtx, it: Row): Promise<'applied' | 'not_applied' | 'uncertain'> {
+  const ap = it.approval_id ? await o.store.getApproval(String(it.approval_id)).catch(() => null) : null
+  const d = ap && ap.details
+  if (!ap || !d) return 'uncertain'
+  const task = ap.task_id ? await o.store.getTaskRow(String(ap.task_id)).catch(() => null) : null
+  if (task && task.status === 'succeeded' && task.result && task.result.applied) return 'applied'
+  if (!d.executed_at) { const le = String(d.last_error || ''); if (!le) return 'not_applied'; return sqlOutcomeIsDefinitive({ code: 'sql_failed', message: le }) ? 'not_applied' : 'uncertain' }
+  return 'uncertain'
+}
+
+async function finishSql(o: OCtx, wf: Row, how: string): Promise<any> {
+  const items: Row[] = wf.payload.steps.sql.items
+  if (items.every(i => i.status === 'applied')) {
+    wf = await advance(o, wf, q => { q.stage = 'ci_passed'; q.steps.sql.status = 'done'; q.steps.sql.finished_at = now(); q.steps.sql.recovered = how; delete q.failure }, { error_message: null, finished_at: null })
+    return runVerify(o, wf) // all migrations proven applied: continue with Agent 1 verification
+  }
+  return { workflow: view(o, wf) }
+}
+
+export async function resumeWorkflow(o: OCtx, p: any) {
+  const wf0 = await sync(o, await load(o, p.workflow_id))
+  const st = wf0.payload, f = st.failure
+  if (st.stage !== 'failed' || !f) throw withWf(new AgentError('Only a failed / interrupted workflow can be resumed', 409, 'wrong_stage'), wf0.id)
+  const plan = recoveryPlan(f)
+  if (!plan) { // an ordinary failure: the existing safe-retry rules decide (read-only stages only, never commit / SQL / security failures)
+    return retryWorkflow(o, p)
+  }
+  if (plan.kind === 'retry_read_only') return retryWorkflow(o, p)
+  if (plan.kind === 'restart') throw withWf(new AgentError(plan.summary, 409, 'not_resumable'), wf0.id)
+
+  if (plan.kind === 'verify_commit') {
+    const branch = String(st.branch || (st.steps.agent2_propose && st.steps.agent2_propose.branch) || ''), apId = String(st.steps.approval && st.steps.approval.id || '')
+    const ap = await o.store.getApproval(apId).catch(() => null)
+    const d = ap && ap.details
+    if (!branch || !d) throw withWf(new AgentError('Cannot verify: branch or approval is missing', 409, 'not_resumable'), wf0.id)
+    const ref = await ghGet(o, st.repo, 'git/ref/heads/' + encodeURIComponent(branch).replace(/%2F/g, '/'))
+    if (ref.status === 404) { // proven: nothing was committed
+      await o.store.casLock(commitKeyOf(st.repo, d.files), wf0.id, { status: 'failed' }).catch(() => false) // commit lock released: the same change may be started again
+      const wf = await advance(o, wf0, q => { q.failure = { ...q.failure, verified: { commit: 'not_found', at: now() }, message: String(q.failure.message).slice(0, 400) + ' Verified on GitHub: branch ' + branch + ' does not exist, nothing was committed.' } })
+      return { workflow: view(o, wf), resumed: false, verified: 'no_commit', next: 'Nothing was committed. Upload / start the change again (the duplicate protection allows it because nothing was committed).' }
+    }
+    if (ref.status !== 200 || !ref.body.object || !ref.body.object.sha) throw withWf(new AgentError('GitHub could not confirm the branch state right now; nothing was changed. Try Verify again shortly.', 502, 'github_read'), wf0.id)
+    const sha = String(ref.body.object.sha)
+    const c = await ghGet(o, st.repo, 'git/commits/' + sha)
+    if (c.status !== 200 || !String(c.body.message || '').includes('Agent 2 change ' + apId)) throw withWf(new AgentError('The branch exists but its commit is not the approved change; nothing was changed. Check ' + branch + ' manually.', 409, 'commit_unverified'), wf0.id)
+    const wf = await advance(o, wf0, q => {
+      q.stage = 'ci_waiting'; delete q.failure
+      q.steps.agent2_apply = { status: 'done', agent: 'agent2', agent2_task_id: ap && ap.task_id, branch, commit_sha: sha, compare_url: `https://github.com/${st.repo}/compare/${d.base_branch}...${branch}`, changed_files: ((d.files || []) as Row[]).map(e => ({ path: e.path, op: e.op, added: e.added, removed: e.removed })), production_touched: false, recovered: 'verified on GitHub after interruption', finished_at: now() }
+      q.steps.ci = { state: 'unknown', checked_at: null, runs: [], read_retries: 0 }
+    }, { error_message: null, finished_at: null })
+    return { workflow: view(o, wf), resumed: true, verified: 'commit_found', next: 'The commit was found on GitHub and is NOT repeated. CI is checked next.' }
+  }
+
+  // verify_sql
+  const items: Row[] = (st.steps.sql && st.steps.sql.items) || []
+  const states = new Map<string, string>()
+  for (const it of items) states.set(String(it.path), it.status === 'applied' ? 'applied' : await sqlState(o, it))
+  const verified = Object.fromEntries(states)
+  const anyUncertain = [...states.values()].includes('uncertain')
+  if (anyUncertain) {
+    const wf = await advance(o, wf0, q => { q.failure = { ...q.failure, verified: { sql: verified, at: now() } }; for (const x of q.steps.sql.items) if (states.get(String(x.path)) === 'uncertain') x.status = 'uncertain' })
+    return { workflow: view(o, wf), resumed: false, verified: 'uncertain', next: 'The execution state could not be proven. Check Supabase for the objects this migration creates, then use "I checked: applied / not applied". Nothing was re-run.' }
+  }
+  for (const it of items) {
+    const sh = 'sql:' + it.sha256
+    if (states.get(String(it.path)) === 'applied') await o.store.casLock(sh, wf0.id, { status: 'applied', applied_at: now(), verified_by: 'recorded execution result' }).catch(() => false)
+    else await o.store.casLock(sh, wf0.id, { status: 'failed' }).catch(() => false) // proven not executed: lock released for the approved retry
+  }
+  const notApplied = items.some(i => states.get(String(i.path)) === 'not_applied')
+  const wf = await advance(o, wf0, q => {
+    for (const x of q.steps.sql.items) { const s = states.get(String(x.path)); if (s === 'applied') { x.status = 'applied'; x.applied_at = x.applied_at || now() } else if (s === 'not_applied') x.status = 'pending' }
+    if (notApplied) { q.stage = 'awaiting_sql'; q.steps.sql.status = 'awaiting_approval'; delete q.failure }
+  }, notApplied ? { error_message: null, finished_at: null } : {})
+  if (notApplied) return { workflow: view(o, wf), resumed: true, verified: 'not_applied', next: 'Proven not executed. It is back at the SQL approval stage: the existing approvals, 24 h limit and (for destructive SQL) your explicit confirmation still apply. Nothing runs automatically.' }
+  return finishSql(o, wf, 'verified from recorded execution results')
+}
+
+// Owner attests what he saw in Supabase for ONE uncertain migration. Never automatic; the request is authenticated as an owner like every action.
+export async function resolveSql(o: OCtx, p: any) {
+  const wf0 = await load(o, p.workflow_id)
+  const st = wf0.payload, it = ((st.steps.sql && st.steps.sql.items) || []).find((x: Row) => x.path === String(p.path || ''))
+  if (st.stage !== 'failed' || !it || it.status !== 'uncertain') throw withWf(new AgentError('No uncertain migration with that path in this workflow', 409, 'wrong_stage'), wf0.id)
+  if (p.ack !== 'VERIFIED-IN-SUPABASE') throw withWf(new AgentError('Explicit confirmation needed: you must have checked Supabase yourself (ack)', 403, 'ack'), wf0.id)
+  if (p.outcome !== 'applied' && p.outcome !== 'not_applied') throw withWf(new AgentError('outcome must be "applied" or "not_applied"', 400, 'bad_request'), wf0.id)
+  const applied = p.outcome === 'applied'
+  await o.store.casLock('sql:' + it.sha256, wf0.id, applied ? { status: 'applied', applied_at: now(), verified_by: 'owner ' + o.userId } : { status: 'failed' }).catch(() => false)
+  const wf = await advance(o, wf0, q => { const x = q.steps.sql.items.find((y: Row) => y.path === it.path); x.status = applied ? 'applied' : 'failed'; x.resolved = { by: o.userId, at: now(), outcome: p.outcome, how: 'owner confirmed after checking Supabase' }; if (applied) x.applied_at = now() })
+  await o.store.log('warn', 'orchestrator_sql_resolved', `${it.path}: ${p.outcome}`, { outcome: p.outcome }, wf.id, o.userId)
+  if (!applied) return { workflow: view(o, wf), next: 'Marked as NOT applied. Its approval was already used, so it cannot run again: upload a corrected migration as a new ZIP.' }
+  return finishSql(o, wf, 'owner confirmed after checking Supabase')
 }
 
 // ---------------------------------------------------------------- dispatcher
@@ -571,11 +923,17 @@ export async function runAction(o: OCtx, action: string, params: any = {}): Prom
       return { workflows: out.map(r => summary(o, r)) }
     }
     case 'get': return { workflow: view(o, await sync(o, await load(o, params.workflow_id))) }
+    case 'advance': return autoAdvance(o, params)
+    case 'retry': return retryWorkflow(o, params)
     case 'apply': return applyWorkflow(o, params)
     case 'check_ci': return checkCi(o, params)
     case 'apply_sql': return applySqlWorkflow(o, params)
     case 'verify': return verifyWorkflow(o, params)
     case 'cancel': return cancelWorkflow(o, params)
+    case 'monitor': return monitorAction(o)
+    case 'health': return healthAction(o)
+    case 'resume': return resumeWorkflow(o, params)
+    case 'resolve_sql': return resolveSql(o, params)
   }
 }
 

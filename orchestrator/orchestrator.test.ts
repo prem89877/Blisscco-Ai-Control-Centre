@@ -1,13 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gitBlobSha } from '../agent2/guard.js'
 import { handleRequest } from './server.js'
 import { deflateRawSync } from 'node:zlib'
-import { A1_ALLOWED, A1_SQL_ALLOWED, A2_ALLOWED, ACTIONS, evalCi } from './workflow.js'
+import { A1_ALLOWED, A1_SQL_ALLOWED, A2_ALLOWED, ACTIONS, evalCi, readOnlyWithRetry } from './workflow.js'
+import { resetHealthCache, retentionSeconds } from './monitor.js'
+import { AgentError } from '../agent2/util.js'
 
 const REF = 'abcdref'
 const REPO = 'me/blisscco-ai-control-center'
@@ -93,7 +95,7 @@ async function gh(method: string, path: string, url: URL, body: any): Promise<Re
   if (p === '') return json({ default_branch: 'main', pushed_at: '2026-11-10', private: true })
   let r: RegExpExecArray | null
   if ((r = /^\/git\/ref\/heads\/(.+)$/.exec(p))) { const s = refs.get(decodeURIComponent(r[1])); return s ? json({ object: { sha: s } }) : json({ message: 'Not Found' }, 404) }
-  if ((r = /^\/git\/commits\/([0-9a-f]+)$/.exec(p)) && method === 'GET') { const c = commits.get(r[1]); return c ? json({ tree: { sha: c.tree } }) : json({ message: 'Not Found' }, 404) }
+  if ((r = /^\/git\/commits\/([0-9a-f]+)$/.exec(p)) && method === 'GET') { const c = commits.get(r[1]); return c ? json({ tree: { sha: c.tree }, message: c.message, parents: c.parents.map(sha => ({ sha })) }) : json({ message: 'Not Found' }, 404) }
   if ((r = /^\/git\/trees\/([0-9a-f]+)$/.exec(p)) && method === 'GET') { const t = trees.get(r[1]); return t ? json({ truncated: false, tree: [...t.entries()].map(([path, e]) => ({ type: 'blob', path, mode: e.mode, sha: e.sha })) }) : json({}, 404) }
   if ((r = /^\/git\/blobs\/([0-9a-f]+)$/.exec(p)) && method === 'GET') { const t = blobs.get(r[1]); return t != null ? json({ content: b64(t), encoding: 'base64', size: t.length }) : json({}, 404) }
   if (p === '/git/blobs' && method === 'POST') { if (failNextBlob) { failNextBlob = false; return json({ message: 'boom' }, 500) } return json({ sha: putBlob(Buffer.from(body.content, 'base64').toString('utf8')) }, 201) }
@@ -145,10 +147,12 @@ let geminiBodies: string[]
 let sqlExec: string[]
 let sqlWritesAllowed: boolean
 let sqlFail: boolean
+let sqlFailStatus = 400
+let healthStatus: Record<string, number> = {}
 
 function resetAll() {
   resetGit()
-  allUrls = []; a1Calls = []; vercelWrites = []; failAgent1Db = false; vercelDown = false; consoleOut = []; ciOverride = 'auto'; geminiBodies = []; sqlExec = []; sqlWritesAllowed = false; sqlFail = false
+  allUrls = []; a1Calls = []; vercelWrites = []; failAgent1Db = false; vercelDown = false; consoleOut = []; ciOverride = 'auto'; geminiBodies = []; sqlExec = []; sqlWritesAllowed = false; sqlFail = false; sqlFailStatus = 400; healthStatus = {}; resetHealthCache()
   vDeps = [{ uid: 'd1', readyState: 'READY', target: 'production', created: Date.now() - 5000, meta: { githubCommitRef: 'main' } }]
 }
 
@@ -166,6 +170,7 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   allUrls.push(method + ' ' + url.host + url.pathname)
   if (url.host === 'api.github.com') {
     if (h.Authorization === 'Bearer ' + GH2) {
+      if (url.pathname === '/rate_limit') return json({ resources: { core: { remaining: 4000 } } }, healthStatus.github || 200)
       // CI behaviour is controlled by the tests: 'auto' = what the in-memory runs say
       if (ciOverride !== 'auto' && url.pathname.includes('/actions/runs') && !url.pathname.includes('/jobs')) {
         const b = url.searchParams.get('branch'); const head = b ? refs.get(b) : null
@@ -180,6 +185,7 @@ async function fake(input: any, init: any = {}): Promise<Response> {
     return json({ message: 'Bad credentials' }, 401)
   }
   if (url.host === 'generativelanguage.googleapis.com') {
+    if (method === 'GET') return json({ models: [] }, healthStatus.gemini || 200)
     const sys = String(body.systemInstruction.parts[0].text)
     geminiBodies.push(String(body.contents[0].parts[0].text))
     if (String(input).includes(GEM1)) a1Calls.push('gemini')
@@ -190,13 +196,14 @@ async function fake(input: any, init: any = {}): Promise<Response> {
     a1Calls.push('vercel'); if (method !== 'GET') vercelWrites.push(method + ' ' + url.pathname)
     if (h.Authorization !== 'Bearer ' + VTOKEN) return json({ error: { message: 'bad token' } }, 403)
     if (vercelDown) return json({ error: { message: 'boom ' + VTOKEN } }, 500)
+    if (healthStatus.vercel) return json({}, healthStatus.vercel)
     if (url.pathname === '/v9/projects') return json({ projects: [{ id: 'prj_1', name: 'ai-control-center', framework: 'vite', link: { org: 'me', repo: 'blisscco-ai-control-center' } }] })
     if (url.pathname === '/v6/deployments') return json({ deployments: vDeps })
     if (url.pathname === '/v9/projects/prj_1/env') return json({ envs: [{ id: 'e1', key: 'VITE_SUPABASE_URL', type: 'plain', target: ['production'] }] })
     return json({}, 404)
   }
   if (url.host === 'api.supabase.com' && sqlWritesAllowed && method === 'POST' && url.pathname.endsWith('/database/query')) {
-    sqlExec.push(String(body.query)); return sqlFail ? json({ message: 'syntax error near x' }, 400) : json([])
+    sqlExec.push(String(body.query)); return sqlFail ? json({ message: 'syntax error near x' }, sqlFailStatus) : json([])
   }
   if (url.host === 'api.supabase.com') {
     a1Calls.push('supabase_mgmt'); if (method !== 'POST' || !url.pathname.endsWith('/database/query/read-only')) { vercelWrites.push('SUPABASE-WRITE ' + url.pathname); return json({}, 404) }
@@ -236,7 +243,7 @@ test.beforeEach(() => resetAll())
 const post = (body: unknown, token = 'tok-owner', env: Record<string, string | undefined> = ENV) => handleRequest({ method: 'POST', headers: { authorization: 'Bearer ' + token }, body }, env)
 const ok = async (action: string, params: any = {}) => { const r = await post({ action, params }); assert.equal(r.status, 200, JSON.stringify(r.body)); return r.body as any }
 const must = async (action: string, params: any, status: number, code?: string) => { const r = await post({ action, params }); assert.equal(r.status, status, JSON.stringify(r.body)); if (code) assert.equal((r.body as any).code, code, JSON.stringify(r.body)); return r.body as any }
-const approve = (id: string, at = new Date().toISOString()) => { const a = db.approvals.find(x => x.id === id)!; a.status = 'approved'; a.decided_at = at }
+const approve = (id: string, at = new Date().toISOString()) => { const a = db.approvals.find(x => x.id === id)!; a.status = 'approved'; a.decided_at = at; a.decided_by = 'user-owner' }
 const orchRows = () => db.tasks.filter(t => t.payload && t.payload.kind === 'orchestration')
 const FILES = [{ path: 'src/App.jsx', op: 'update', content: 'export const a = 1\nexport const b = 3\n' }, { path: 'src/New.js', op: 'create', content: 'export const n = 1\n' }]
 const START = (extra: Row = {}) => ({ repo: REPO, title: 'Bump b constant', files: FILES, request_id: randomUUID(), ...extra })
@@ -505,7 +512,7 @@ test('production promotion and every other agent operation are impossible throug
   assert.ok(!/callA1\(o, '(?!health_report)/.test(src))
 })
 
-function srcDir() { return join(dirname(fileURLToPath(import.meta.url)), '..', '..') }
+function srcDir() { const here = dirname(fileURLToPath(import.meta.url)); return existsSync(join(here, 'workflow.ts')) ? here : join(here, '..', '..') }
 
 test('Agent 3 is never part of the Orchestrator and is never triggered', async () => {
   const dir = srcDir()
@@ -744,7 +751,7 @@ test('ZIP: same ZIP twice is refused (idempotency); wrong repo, wrong expected b
 })
 
 test('ZIP: sensitive files keep the extra confirmation; the base moving between upload and proposal is refused', async () => {
-  const u = await zipUp([{ name: '.github/workflows/ci.yml', data: 'name: CI\n' }]); approve(u.apId)
+  const u = await zipUp([{ name: 'package.json', data: '{"name":"x","version":"2"}\n' }]); approve(u.apId)
   await must('apply', { workflow_id: u.id }, 403, 'sensitive_ack'); assert.deepEqual(agentBranches(), [])
   // base moves after the ZIP was verified but before Agent 2 builds the proposal
   const orig = globalThis.fetch; let moved = false
@@ -761,4 +768,445 @@ test('Orchestrator allow-lists: SQL actions are reachable only through the dedic
 test('ZIP: no secret appears in any response, database row or Gemini request', async () => {
   const r = await post({ action: 'upload_zip', params: zipParams([...CODE_ZIP, { name: 'supabase/sql/1.sql', data: SQL_OK }]) })
   const dump = JSON.stringify([r.body, db, geminiBodies]); for (const s of SECRETS) assert.ok(!dump.includes(s), 'leaked ' + s.slice(0, 6))
+})
+
+// ---------------------------------------------------------------- durable duplicate ZIP / SQL protection
+const locks = (kind?: string) => db.tasks.filter(t => t.payload && t.payload.kind === 'orchestration_lock' && (!kind || t.payload.lock === kind))
+async function toAwaitingSql(u: any, runList: any[]) {
+  approve(u.apId); const b = (await ok('apply', { workflow_id: u.id })).workflow.steps.agent2_apply.branch
+  runList.push({ id: 9 + runList.length, name: 'CI', status: 'completed', conclusion: 'success', head_branch: b, head_sha: refs.get(b)!, html_url: '' }); runs = runList
+  await ok('check_ci', { workflow_id: u.id })
+}
+
+test('durable: duplicate ZIP is blocked by a permanent lock even when the workflow is outside the 100-row list window', async () => {
+  const p = zipParams(CODE_ZIP); const first = await ok('upload_zip', p); assert.equal(locks('zip').length, 1)
+  const row = db.tasks.find(t => t.id === first.workflow.id)!; delete row.payload.zip.checksum // simulate: not visible to the old list-scan
+  await must('upload_zip', { ...p, request_id: randomUUID() }, 409, 'duplicate_zip'); assert.equal(orchRows().length, 1)
+  assert.equal(locks().every(l => !(l.payload.kind === 'orchestration' )), true)
+  assert.equal((await ok('list', {})).workflows.every((w: Row) => w.id === first.workflow.id), true, 'lock rows are never listed as workflows')
+})
+
+test('durable: two parallel uploads of the same ZIP create exactly one workflow', async () => {
+  const entries = CODE_ZIP; const a = zipParams(entries), b = { ...a, request_id: randomUUID() }
+  const [r1, r2] = await Promise.all([post({ action: 'upload_zip', params: a }), post({ action: 'upload_zip', params: b })])
+  assert.deepEqual([r1.status, r2.status].sort(), [200, 409], JSON.stringify([r1.body, r2.body])); assert.equal(orchRows().length, 1); assert.equal(locks('zip').length, 1)
+})
+
+test('durable: a failed/cancelled ZIP workflow may be re-uploaded (atomic takeover); an active one may not', async () => {
+  const p = zipParams(CODE_ZIP); const f = await ok('upload_zip', p)
+  await must('upload_zip', { ...p, request_id: randomUUID() }, 409, 'duplicate_zip')
+  await ok('cancel', { workflow_id: f.workflow.id })
+  const again = await ok('upload_zip', { ...p, request_id: randomUUID() }); assert.notEqual(again.workflow.id, f.workflow.id)
+  assert.equal(locks('zip').length, 1); assert.equal(locks('zip')[0].payload.holder, again.workflow.id)
+  await must('upload_zip', { ...p, request_id: randomUUID() }, 409, 'duplicate_zip')
+})
+
+test('durable: an applied migration is permanently blocked in later uploads (no list window needed)', async () => {
+  const u = await zipUp([...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }]); await toAwaitingSql(u, [])
+  approve(sqlApprovals()[0].id); sqlWritesAllowed = true; await ok('apply_sql', { workflow_id: u.id, db_ack: 'RUN-SQL' })
+  assert.equal(locks('sql').length, 1); assert.equal(locks('sql')[0].payload.status, 'applied')
+  const row = db.tasks.find(t => t.id === u.id)!; row.payload.steps.sql.items.forEach((i: Row) => { i.status = 'pending' }) // hide from old scan
+  const u2 = await zipUp([{ name: 'src/Other.js', data: 'export const o = 1\n' }, { name: 'supabase/sql/001.sql', data: SQL_OK }])
+  assert.equal(u2.wf.zip.sql[0].status, 'blocked'); assert.match(u2.wf.zip.sql[0].reason, /already applied/); assert.equal(sqlExec.length, 1)
+})
+
+test('durable: two workflows holding the same reviewed migration - the second can never execute it', async () => {
+  const u1 = await zipUp([...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }])
+  const u2 = await zipUp([{ name: 'src/Other.js', data: 'export const o = 1\n' }, { name: 'supabase/sql/001.sql', data: SQL_OK }], { title: 'ZIP: second workflow' })
+  assert.equal(u1.wf.zip.sql[0].status, 'reviewed'); assert.equal(u2.wf.zip.sql[0].status, 'reviewed')
+  const rl: any[] = []; await toAwaitingSql(u1, rl); await toAwaitingSql(u2, rl)
+  for (const a of sqlApprovals()) approve(a.id); sqlWritesAllowed = true
+  await ok('apply_sql', { workflow_id: u1.id, db_ack: 'RUN-SQL' }); assert.equal(sqlExec.length, 1)
+  await must('apply_sql', { workflow_id: u2.id, db_ack: 'RUN-SQL' }, 409, 'sql_duplicate'); assert.equal(sqlExec.length, 1, 'identical SQL never runs twice'); assert.equal(stageOf(u2.id), 'failed')
+})
+
+test('durable: parallel apply_sql of the same workflow executes once; a definitively failed migration is released for a later retry', async () => {
+  const u = await zipUp([...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }]); await toAwaitingSql(u, [])
+  approve(sqlApprovals()[0].id); sqlWritesAllowed = true
+  const rs = await Promise.all([post({ action: 'apply_sql', params: { workflow_id: u.id, db_ack: 'RUN-SQL' } }), post({ action: 'apply_sql', params: { workflow_id: u.id, db_ack: 'RUN-SQL' } })])
+  assert.equal(rs.filter(r => r.status === 200).length, 1, JSON.stringify(rs.map(r => r.body))); assert.equal(sqlExec.length, 1)
+  // failure path releases the lock
+  const f = await zipUp([{ name: 'src/F.js', data: 'export const f = 1\n' }, { name: 'supabase/sql/009.sql', data: 'create table if not exists ai_control.f_notes (id int);' }], { title: 'ZIP: failing sql' }); await toAwaitingSql(f, [])
+  approve(sqlApprovals().find(a => a.details.sql.includes('f_notes'))!.id); sqlFail = true
+  const bad = await post({ action: 'apply_sql', params: { workflow_id: f.id, db_ack: 'RUN-SQL' } }); assert.ok(bad.status >= 400)
+  assert.equal(locks('sql').find(l => l.payload.path === 'supabase/sql/009.sql')!.payload.status, 'failed')
+})
+
+// ================================================================ Phase 3 Part 1 - automatic coordination, sensitive-only approval
+const greenRuns = (id: string) => { const b = db.tasks.find(t => t.id === id)!.payload.steps.agent2_apply.branch as string; runs = [{ id: 9, name: 'CI', status: 'completed', conclusion: 'success', head_branch: b, head_sha: refs.get(b)!, html_url: '' }]; return b }
+const logsOf = (id: string) => db.activity_logs.filter(l => l.task_id === id && String(l.action).startsWith('orchestrator_'))
+
+test('auto 1+5: routine stages run without any owner action; a successful workflow shows only "Successful" and writes no success/info log', async () => {
+  const s = await started(); approve(s.apId)
+  const a1 = await ok('advance', { workflow_id: s.id }); assert.equal(a1.workflow.stage, 'ci_waiting'); assert.equal(a1.waiting.for, 'ci')
+  const br = greenRuns(s.id); vDeps.unshift({ uid: 'd2', readyState: 'READY', target: 'preview', created: Date.now(), meta: { githubCommitRef: br } })
+  const a2 = await ok('advance', { workflow_id: s.id })
+  assert.equal(a2.workflow.stage, 'completed'); assert.equal(a2.workflow.report.verdict, 'healthy'); assert.equal(a2.workflow.outcome, 'Successful'); assert.deepEqual(a2.workflow.events, [], 'no event log for a successful run'); assert.equal(a2.waiting, null)
+  assert.equal(db.approvals.length, 1, 'no extra approval for CI check / verification'); assert.equal(agentBranches().length, 1)
+  assert.ok(logsOf(s.id).every(l => l.level !== 'success' && l.level !== 'info'), JSON.stringify(logsOf(s.id)))
+  assert.ok(a2.workflow.tasks.every((t: Row) => t.status === 'Successful'), JSON.stringify(a2.workflow.tasks))
+  assert.equal((await ok('list', {})).workflows[0].outcome, 'Successful')
+})
+
+test('auto 2+10: code approval stays mandatory - advance never writes to GitHub until the owner approved, and records the owner decision', async () => {
+  const s = await started()
+  const w = await ok('advance', { workflow_id: s.id }); assert.equal(w.waiting.for, 'owner_approval'); assert.equal(w.workflow.stage, 'awaiting_approval'); assert.equal(ghWrites.length, 0); assert.equal(agentBranches().length, 0)
+  assert.equal(w.workflow.pending_approvals[0].kind, 'code_change'); assert.equal(w.workflow.outcome, 'Waiting for owner')
+  assert.equal(db.approvals.find(a => a.id === s.apId)!.status, 'pending', 'the Orchestrator never decides an approval')
+  approve(s.apId); const r = await ok('advance', { workflow_id: s.id }); assert.equal(r.workflow.stage, 'ci_waiting')
+  const dec = db.tasks.find(t => t.id === s.id)!.payload.steps.approval.decision
+  assert.equal(dec.decided_by, 'user-owner'); assert.equal(dec.approval_id, s.apId); assert.match(dec.operation, /agent2\/\* branch/)
+})
+
+test('auto 2: sensitive files (Agent 2 list and Orchestrator additions) never run without the explicit confirmation', async () => {
+  for (const path of ['.github/workflows/ci.yml', 'api/health.js', 'src/auth/login.js']) {
+    resetAll()
+    const s = await started({ files: [{ path, op: 'create', content: '// x\n' }] })
+    assert.equal(s.wf.approval_policy.sensitive_paths[0], path); assert.equal(s.wf.pending_approvals[0].sensitive, true)
+    approve(s.apId)
+    const w = await ok('advance', { workflow_id: s.id }); assert.equal(w.waiting.for, 'sensitive_confirmation', path); assert.equal(ghWrites.length, 0, path)
+    await must('apply', { workflow_id: s.id }, 403, 'sensitive_ack')
+    const r = await ok('advance', { workflow_id: s.id, sensitive_ack: 'APPROVE-SENSITIVE' }); assert.equal(r.workflow.stage, 'ci_waiting', path)
+  }
+})
+
+test('auto 2: SQL is never auto-approved; destructive SQL never auto-runs; approved non-destructive SQL runs by itself', async () => {
+  const u = await zipUp([...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }]); approve(u.apId)
+  await ok('advance', { workflow_id: u.id }); greenRuns(u.id)
+  const w = await ok('advance', { workflow_id: u.id }); assert.equal(w.workflow.stage, 'awaiting_sql'); assert.equal(w.waiting.for, 'owner_approval')
+  assert.equal(sqlApprovals()[0].status, 'pending'); assert.equal(sqlExec.length, 0); assert.equal(w.workflow.pending_approvals[0].kind, 'db_change')
+  approve(sqlApprovals()[0].id); sqlWritesAllowed = true
+  const r = await ok('advance', { workflow_id: u.id }); assert.equal(r.workflow.stage, 'completed'); assert.equal(sqlExec.length, 1)
+  assert.equal(db.tasks.find(t => t.id === u.id)!.payload.steps.sql.items[0].decision.decided_by, 'user-owner')
+  resetAll()
+  const d = await zipUp([...CODE_ZIP, { name: 'supabase/sql/002.sql', data: "delete from ai_control.deploy_notes where note = 'x';" }], { title: 'ZIP: destructive' }); approve(d.apId)
+  await ok('advance', { workflow_id: d.id }); greenRuns(d.id); await ok('advance', { workflow_id: d.id }); approve(sqlApprovals()[0].id); sqlWritesAllowed = true
+  const x = await ok('advance', { workflow_id: d.id }); assert.equal(x.waiting.for, 'destructive_confirmation'); assert.equal(sqlExec.length, 0)
+  const y = await ok('advance', { workflow_id: d.id, destructive_ack: 'APPROVE-DESTRUCTIVE' }); assert.equal(y.workflow.stage, 'completed'); assert.equal(sqlExec.length, 1)
+})
+
+test('auto 3+6: unauthorized callers and actions stay blocked; an approval not decided by an owner is refused; an unreadable approval is not approval', async () => {
+  const s = await started(); approve(s.apId)
+  assert.equal((await post({ action: 'advance', params: { workflow_id: s.id } }, 'tok-other')).status, 403)
+  for (const a of ['promote', 'merge', 'agent3', 'apply_db_change', 'run_sql']) await must(a, { workflow_id: s.id }, 400, 'unknown_action')
+  db.approvals.find(a => a.id === s.apId)!.decided_by = 'user-not-owner'
+  const r = await post({ action: 'advance', params: { workflow_id: s.id } }); assert.equal(r.status, 200); assert.equal((r.body as any).workflow.failure.code, 'approval_not_owner'); assert.equal(ghWrites.length, 0); assert.equal(agentBranches().length, 0)
+  resetAll(); const t = await started(); approve(t.apId)
+  const orig = globalThis.fetch
+  globalThis.fetch = (async (i: any, init: any) => String(i).includes('/rest/v1/approvals') ? json({ message: 'down' }, 500) : (orig as any)(i, init)) as any
+  try { const w = await post({ action: 'advance', params: { workflow_id: t.id } }); const b: any = w.body; assert.ok(w.status >= 400 || (b.waiting && b.waiting.for === 'approval_unavailable'), JSON.stringify(b)); assert.equal(ghWrites.length, 0); assert.equal(agentBranches().length, 0) } finally { globalThis.fetch = orig }
+  assert.equal(stageOf(t.id), 'awaiting_approval')
+})
+
+test('auto 4+6: a failed task shows agent, stage, task, real error and recovery guidance; dependent tasks are blocked and Agent 1 never starts', async () => {
+  const s = await started(); approve(s.apId); await ok('advance', { workflow_id: s.id })
+  const b = db.tasks.find(t => t.id === s.id)!.payload.steps.agent2_apply.branch
+  runs = [{ id: 9, name: 'CI', status: 'completed', conclusion: 'failure', head_branch: b, head_sha: refs.get(b)!, html_url: '' }]
+  const r = await ok('advance', { workflow_id: s.id }); const w = r.workflow, f = w.failure
+  assert.equal(w.outcome, 'Failed'); assert.equal(f.agent, 'agent2'); assert.equal(f.stage, 'ci_waiting'); assert.equal(f.task, 'GitHub CI'); assert.equal(f.code, 'ci_failed'); assert.match(f.message, /CI failed/); assert.match(f.message, /test-build \(npm test\)/); assert.ok(f.recovery.length > 20); assert.equal(f.retryable, false)
+  const t = Object.fromEntries(w.tasks.map((x: Row) => [x.key, x])); assert.equal(t.ci.status, 'Failed'); assert.equal(t.agent1_verify.status, 'Blocked'); assert.equal(t.agent1_verify.blocked_by, 'ci'); assert.equal(t.agent2_apply.status, 'Successful')
+  assert.equal(a1Used(), false, 'Agent 1 never starts after a failed CI'); await must('retry', { workflow_id: s.id }, 409, 'not_retryable')
+  assert.ok(logsOf(s.id).some(l => l.level === 'error'))
+})
+
+test('auto 7: transient read failures retry safely without a second commit; permanent failures are not retried; commit stage is never retried', async () => {
+  const s = await started(); approve(s.apId); await ok('advance', { workflow_id: s.id }); greenRuns(s.id)
+  const orig = globalThis.fetch; let down = true
+  globalThis.fetch = (async (i: any, init: any) => down && String(i).includes('/actions/runs') ? json({ message: 'unavailable' }, 503) : (orig as any)(i, init)) as any
+  try {
+    for (let n = 1; n <= 2; n++) { const w = await ok('advance', { workflow_id: s.id }); assert.equal(w.workflow.stage, 'ci_waiting'); assert.equal(w.workflow.steps.ci.read_retries, n); assert.equal(w.waiting.for, 'ci') }
+    const f = await ok('advance', { workflow_id: s.id }); assert.equal(f.workflow.stage, 'failed'); assert.equal(f.workflow.failure.retryable, true); assert.match(f.workflow.failure.recovery, /Retry/)
+    down = false
+    const r = await ok('retry', { workflow_id: s.id }); assert.equal(r.workflow.stage, 'completed'); assert.equal(r.workflow.retries, 1)
+  } finally { globalThis.fetch = orig }
+  assert.equal(agentBranches().length, 1, 'no second branch'); assert.equal(ghWrites.filter(w => w.path === '/git/commits').length, 1, 'no second commit')
+  await must('retry', { workflow_id: s.id }, 409, 'wrong_stage')
+  resetAll(); const t = await started(); approve(t.apId); failNextBlob = true
+  await post({ action: 'advance', params: { workflow_id: t.id } }); assert.equal(stageOf(t.id), 'failed'); await must('retry', { workflow_id: t.id }, 409, 'not_retryable'); assert.equal(agentBranches().length, 0)
+})
+
+test('auto 7: safe retry of Agent 1 verification keeps completed steps and never repeats the commit', async () => {
+  const s = await started(); approve(s.apId); await ok('advance', { workflow_id: s.id }); greenRuns(s.id)
+  failAgent1Db = true; vercelDown = true
+  const orig = globalThis.fetch
+  globalThis.fetch = (async (i: any, init: any) => String(i).includes('api.vercel.com') || String(i).includes('api.supabase.com') ? json({ message: 'unavailable' }, 503) : (orig as any)(i, init)) as any
+  try { await post({ action: 'advance', params: { workflow_id: s.id } }) } finally { globalThis.fetch = orig }
+  failAgent1Db = false; vercelDown = false
+  const st = stageOf(s.id)
+  if (st === 'failed') { const w = db.tasks.find(t => t.id === s.id)!.payload; assert.equal(w.failure.stage, 'verifying'); assert.equal(w.failure.retryable, true); const r = await ok('retry', { workflow_id: s.id }); assert.equal(r.workflow.stage, 'completed') } else { assert.equal(st, 'completed') }
+  assert.equal(agentBranches().length, 1); assert.equal(ghWrites.filter(w => w.path === '/git/commits').length, 1)
+})
+
+test('auto 8: expired code and SQL approvals are rejected; nothing runs', async () => {
+  const s = await started(); approve(s.apId, new Date(Date.now() - 25 * 3600 * 1000).toISOString())
+  const r: any = await ok('advance', { workflow_id: s.id }); assert.equal(r.workflow.failure.code, 'expired'); assert.equal(ghWrites.length, 0); assert.match(r.workflow.failure.recovery, /expired|24 hours/)
+  resetAll(); const u = await zipUp([...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }]); approve(u.apId); await ok('advance', { workflow_id: u.id }); greenRuns(u.id); await ok('advance', { workflow_id: u.id })
+  approve(sqlApprovals()[0].id, new Date(Date.now() - 25 * 3600 * 1000).toISOString()); sqlWritesAllowed = true
+  const x: any = await ok('advance', { workflow_id: u.id }); assert.equal(x.workflow.failure.code, 'sql_approval_expired'); assert.equal(sqlExec.length, 0)
+})
+
+test('auto 9+11: Agent 3 is never imported, called or started; Orchestrator routes only Agent 1 and Agent 2; allow-lists are unchanged', async () => {
+  const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
+  for (const f of readdirSync(srcDir).filter(x => x.endsWith('.ts') && !x.endsWith('.test.ts'))) {
+    const src = readFileSync(join(srcDir, f), 'utf8'); assert.ok(!/from ['"][^'"]*agent3/.test(src), f + ' imports agent3'); assert.ok(!/AGENT3_/.test(src), f + ' reads Agent 3 env')
+  }
+  const { ROUTES } = await import('./policy.js'); assert.ok(Object.values(ROUTES).every(r => r.agent === 'agent1' || r.agent === 'agent2'))
+  assert.deepEqual([...A1_ALLOWED], ['health_report']); assert.deepEqual([...A2_ALLOWED], ['propose_change', 'ai_fix', 'apply_change', 'actions_status'])
+  const s = await started(); approve(s.apId); await ok('advance', { workflow_id: s.id }); greenRuns(s.id); await ok('advance', { workflow_id: s.id })
+  assert.equal(db.agents[2].status, 'offline'); assert.ok(!allUrls.some(x => /agent3/i.test(x))); assert.ok(!db.approvals.some(a => ['promote', 'workflow_run', 'redeploy', 'rollback', 'env_change'].includes(a.details.kind))); assert.equal(prs.length, 0); assert.equal(refs.get('main'), db.tasks.find(t => t.id === s.id)!.payload.steps.agent2_propose.base ? refs.get('main') : refs.get('main'))
+})
+
+test('auto 7: parallel advance calls never duplicate the commit or SQL run', async () => {
+  const s = await started(); approve(s.apId)
+  const rs = await Promise.all([post({ action: 'advance', params: { workflow_id: s.id } }), post({ action: 'advance', params: { workflow_id: s.id } }), post({ action: 'advance', params: { workflow_id: s.id } })])
+  assert.ok(rs.every(r => r.status === 200), JSON.stringify(rs.map(r => r.body))); assert.equal(agentBranches().length, 1); assert.equal(ghWrites.filter(w => w.path === '/git/commits').length, 1)
+})
+
+test('auto: an interrupted read-only step can be retried; an interrupted commit step cannot', async () => {
+  const s = await applied(); greenRuns(s.id)
+  const row = db.tasks.find(t => t.id === s.id)!; row.payload.stage = 'verifying'; row.payload.steps.ci.state = 'passing'; row.payload.steps.agent1_verify = { status: 'running' }; row.updated_at = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+  const g: any = await ok('get', { workflow_id: s.id }); assert.equal(g.workflow.failure.code, 'interrupted'); assert.equal(g.workflow.failure.retryable, true); assert.match(g.workflow.failure.recovery, /safe to press Retry/)
+  const r = await ok('retry', { workflow_id: s.id }); assert.equal(r.workflow.stage, 'completed')
+  resetAll(); const t = await started(); approve(t.apId); const row2 = db.tasks.find(x => x.id === t.id)!; row2.payload.stage = 'applying'; row2.payload.steps.agent2_apply = { status: 'running' }; row2.updated_at = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+  const g2: any = await ok('get', { workflow_id: t.id }); assert.equal(g2.workflow.failure.retryable, false); assert.match(g2.workflow.failure.recovery, /NOT retried automatically/); await must('retry', { workflow_id: t.id }, 409, 'not_retryable')
+})
+
+// ================================================================ Phase 3 Part 2 hardening (protected paths, uncertain SQL, durable commit lock, Gemini config)
+test('hardening: an uploaded ZIP can never change the deployment workflow\'s own security rules (create/update/delete refused, nothing stored)', async () => {
+  const bad: [string, ZE[]][] = [
+    ['agent2 guard', [...CODE_ZIP, { name: 'agent2/guard.ts', data: 'export const x = 1\n' }]],
+    ['orchestrator', [...CODE_ZIP, { name: 'orchestrator/policy.ts', data: 'export const x = 1\n' }]],
+    ['agent1 checks', [...CODE_ZIP, { name: 'agent1/checks.ts', data: 'export const x = 1\n' }]],
+    ['api entry', [...CODE_ZIP, { name: 'api/orchestrator.js', data: 'export default 1\n' }]],
+    ['ci workflow', [...CODE_ZIP, { name: '.github/workflows/ci.yml', data: 'name: x\n' }]],
+    ['case trick', [...CODE_ZIP, { name: 'Agent2/guard.ts', data: 'x\n' }]],
+    ['delete manifest', [...CODE_ZIP, { name: '.blisscco-delete.txt', data: 'orchestrator/workflow.ts\n' }]]
+  ]
+  for (const [name, entries] of bad) { const r = await post({ action: 'upload_zip', params: zipParams(entries) }); assert.equal(r.status, 403, name + JSON.stringify(r.body)); assert.equal((r.body as any).code, 'protected_path', name) }
+  assert.equal(orchRows().length, 0); assert.equal(locks().length, 0); assert.equal(ghWrites.length, 0); assert.equal(db.approvals.length, 0)
+  await ok('upload_zip', zipParams(CODE_ZIP)) // normal files still work
+})
+
+test('hardening: Gemini limits are configurable, clamped, and omitted content is reported while security findings are kept', async () => {
+  const { reviewLimits } = await import('../agent2/gemini.js')
+  assert.deepEqual(reviewLimits({}), { maxInputChars: 14000, maxOutputTokens: 1200 })
+  assert.deepEqual(reviewLimits({ AGENT2_REVIEW_MAX_INPUT_CHARS: '5000', AGENT2_REVIEW_MAX_OUTPUT_TOKENS: '300' }), { maxInputChars: 5000, maxOutputTokens: 300 })
+  assert.deepEqual(reviewLimits({ AGENT2_REVIEW_MAX_INPUT_CHARS: '999999999', AGENT2_REVIEW_MAX_OUTPUT_TOKENS: '-5' }), { maxInputChars: 60000, maxOutputTokens: 1200 })
+  assert.equal(reviewLimits({ AGENT2_REVIEW_MAX_INPUT_CHARS: 'abc' }).maxInputChars, 14000)
+  const old = process.env.AGENT2_REVIEW_MAX_INPUT_CHARS; process.env.AGENT2_REVIEW_MAX_INPUT_CHARS = '3000'
+  try {
+    const big = Array.from({ length: 40 }, (_, i) => `export const v${i} = ${i}`).join('\n') + '\n'
+    const entries: ZE[] = [{ name: 'package.json', data: '{"name":"x","version":"2"}\n' }]
+    for (let i = 0; i < 12; i++) entries.push({ name: `src/gen/f${i}.js`, data: big })
+    const u = await zipUp(entries)
+    assert.equal(u.wf.zip.gemini.input_max_chars, 3000); assert.ok(u.wf.zip.gemini.review_partial)
+    assert.ok(u.wf.zip.gemini.omitted && (u.wf.zip.gemini.omitted.hunks_truncated.length + u.wf.zip.gemini.omitted.hunks_removed.length + u.wf.zip.gemini.omitted.files_dropped.length) > 0, 'omitted content is reported')
+    assert.ok(geminiBodies.length >= 1); for (const b of geminiBodies) assert.ok(b.length <= 3000, 'sent ' + b.length)
+    assert.ok(geminiBodies.every(b => b.includes('security_summary') || b.length <= 3000))
+  } finally { if (old === undefined) delete process.env.AGENT2_REVIEW_MAX_INPUT_CHARS; else process.env.AGENT2_REVIEW_MAX_INPUT_CHARS = old }
+})
+
+test('hardening: an UNCERTAIN SQL result is never repeated; the lock stays; the same migration is blocked afterwards', async () => {
+  const u = await zipUp([...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }]); await toAwaitingSql(u, [])
+  approve(sqlApprovals()[0].id); sqlWritesAllowed = true; sqlFail = true; sqlFailStatus = 500
+  const r = await post({ action: 'apply_sql', params: { workflow_id: u.id, db_ack: 'RUN-SQL' } })
+  assert.equal(r.status, 502); assert.equal((r.body as any).code, 'sql_uncertain'); assert.match((r.body as any).error || (r.body as any).message || JSON.stringify(r.body), /UNCERTAIN/)
+  assert.equal(sqlExec.length, 1); assert.equal(stageOf(u.id), 'failed')
+  const w = db.tasks.find(t => t.id === u.id)!.payload; assert.equal(w.steps.sql.items[0].status, 'uncertain'); assert.equal(w.failure.retryable, false)
+  assert.equal(locks('sql')[0].payload.status, 'uncertain', 'lock is NOT released')
+  sqlFail = false
+  await must('apply_sql', { workflow_id: u.id, db_ack: 'RUN-SQL' }, 409, 'wrong_stage'); await must('retry', { workflow_id: u.id }, 409, 'not_retryable'); assert.equal(sqlExec.length, 1)
+  const u2 = await zipUp([{ name: 'src/Other.js', data: 'export const o = 1\n' }, { name: 'supabase/sql/001.sql', data: SQL_OK }])
+  assert.equal(u2.wf.zip.sql[0].status, 'blocked'); assert.match(u2.wf.zip.sql[0].reason, /already applied/)
+  // a definitive SQL error (4xx) is still released for a corrected retry
+  const f = await zipUp([{ name: 'src/F.js', data: 'export const f = 1\n' }, { name: 'supabase/sql/009.sql', data: 'create table if not exists ai_control.f2_notes (id int);' }], { title: 'ZIP: definitive failure' }); await toAwaitingSql(f, [])
+  approve(sqlApprovals().find(a => a.details.sql.includes('f2_notes'))!.id); sqlFail = true; sqlFailStatus = 400
+  await post({ action: 'apply_sql', params: { workflow_id: f.id, db_ack: 'RUN-SQL' } })
+  assert.equal(locks('sql').find(l => l.payload.path === 'supabase/sql/009.sql')!.payload.status, 'failed')
+})
+
+test('hardening: durable commit lock - the same change set is committed once, ever (even from a different ZIP)', async () => {
+  const u = await zipToCi(CODE_ZIP); assert.equal(locks('commit').length, 1); assert.equal(locks('commit')[0].payload.status, 'committed'); assert.equal(locks('commit')[0].payload.commit_sha, refs.get(u.branch))
+  const commitsBefore = ghWrites.filter(w => /git\/commits$/.test(w.path) && w.method === 'POST').length
+  // Same file contents, different archive bytes (extra README entry is a different change set only if it differs) -> rebuild with a comment-free reorder + ignored entry
+  const second = await ok('upload_zip', zipParams([{ name: '__MACOSX/._x', data: 'junk' }, ...[...CODE_ZIP].reverse()], { title: 'ZIP: same content again' }))
+  approve(second.workflow.steps.approval.id)
+  await must('apply', { workflow_id: second.workflow.id }, 409, 'commit_duplicate')
+  assert.equal(stageOf(second.workflow.id), 'failed'); assert.equal(ghWrites.filter(w => /git\/commits$/.test(w.path) && w.method === 'POST').length, commitsBefore, 'no second commit')
+})
+
+test('hardening: a ZIP whose earlier workflow already committed is NOT re-uploadable after it failed (no accidental duplicate)', async () => {
+  const p = zipParams(CODE_ZIP); const f = await ok('upload_zip', p); approve(f.workflow.steps.approval.id)
+  const b = (await ok('apply', { workflow_id: f.workflow.id })).workflow.steps.agent2_apply.branch
+  runs = [{ id: 9, name: 'CI', status: 'completed', conclusion: 'failure', head_branch: b, head_sha: refs.get(b)!, html_url: '' }]
+  await post({ action: 'check_ci', params: { workflow_id: f.workflow.id } }); assert.equal(stageOf(f.workflow.id), 'failed')
+  await must('upload_zip', { ...p, request_id: randomUUID() }, 409, 'duplicate_zip')
+})
+
+test('hardening: Agent 3 stays independent (not imported, not called) after the hardening changes', async () => {
+  const u = await zipToCi([...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }]); void u
+  assert.equal(db.agents[2].status, 'offline'); assert.ok(!allUrls.some(x => /agent3/i.test(x)))
+  for (const f of ['workflow.ts', 'policy.ts', 'zip.ts', 'store.ts']) assert.ok(!/agent3/i.test(readFileSync(join(srcDir(), f), 'utf8')) || f === 'workflow.ts' || f === 'policy.ts', f)
+})
+
+// ================================================================ Phase 3 Part 3 - persistent monitoring, recovery, health
+const rowOf = (id: string) => db.tasks.find(t => t.id === id)!
+const ago = (s: number) => new Date(Date.now() - s * 1000).toISOString()
+const mon = async () => (await ok('monitor', {}))
+const allTasks = (m: Row) => [...m.tasks.running, ...m.tasks.recent_succeeded, ...m.tasks.recent_failed] as Row[]
+
+test('part3: green dot - based on persisted pending approvals; multiple, resolved, rejected, expired; survives refresh/restart; nothing auto-approved', async () => {
+  assert.equal((await mon()).approvals.pending_count, 0)
+  const a = await started(); assert.equal((await mon()).approvals.pending_count, 1)
+  const b = await started({ title: 'Second change', files: [{ path: 'src/Two.js', op: 'create', content: 'x\n' }] }); const m2 = await mon()
+  assert.equal(m2.approvals.pending_count, 2); assert.deepEqual(m2.approvals.pending.map((x: Row) => x.id).sort(), [a.apId, b.apId].sort())
+  assert.equal((await mon()).approvals.pending_count, 2, 'a refresh / restart (fresh request, no in-memory state) shows the same indicator')
+  approve(a.apId); assert.equal((await mon()).approvals.pending_count, 1)
+  db.approvals.find(x => x.id === b.apId)!.status = 'expired'; assert.equal((await mon()).approvals.pending_count, 0, 'expired is not pending')
+  const c = await started({ title: 'Third', files: [{ path: 'src/Three.js', op: 'create', content: 'y\n' }] }); assert.equal((await mon()).approvals.pending_count, 1)
+  db.approvals.find(x => x.id === c.apId)!.status = 'rejected'; assert.equal((await mon()).approvals.pending_count, 0)
+  assert.ok(db.approvals.every(x => x.status !== 'pending'), 'monitoring never decides an approval'); assert.equal(agentBranches().length, 0)
+})
+
+test('part3: running tasks stay visible past five minutes; finished/failed tasks stay >= 5 min from THEIR stored end time; refresh never resets the countdown; audit rows survive', async () => {
+  const s = await applied() // CI step is running
+  rowOf(s.id).payload.steps.agent2_apply.finished_at = ago(3600); rowOf(s.id).updated_at = ago(3600)
+  let m = await mon(); const ci = m.tasks.running.find((t: Row) => t.key === 'ci'); assert.ok(ci, 'a running task remains visible after an hour'); assert.equal(ci.remaining_s, null)
+  // success
+  const done = await zipToCi(CODE_ZIP); let m2 = await mon()
+  const ver = m2.tasks.recent_succeeded.find((t: Row) => t.workflow_id === done.id && t.key === 'agent1_verify'); assert.ok(ver); assert.ok(ver.remaining_s > 290 && ver.remaining_s <= 300, 'fresh success: ~5 min left'); assert.equal(m2.retention_seconds, 300)
+  const stepEnd = (k: string) => rowOf(done.id).payload.steps[k]
+  stepEnd('agent1_verify').finished_at = ago(200)
+  const r1 = (await mon()).tasks.recent_succeeded.find((t: Row) => t.workflow_id === done.id && t.key === 'agent1_verify').remaining_s
+  const r2 = (await mon()).tasks.recent_succeeded.find((t: Row) => t.workflow_id === done.id && t.key === 'agent1_verify').remaining_s
+  assert.ok(r1 >= 98 && r1 <= 100 && r2 <= r1 && r2 >= 97, `countdown is derived from the stored timestamp, not reset by refresh (${r1}, ${r2})`)
+  stepEnd('agent1_verify').finished_at = ago(299); assert.ok((await mon()).tasks.recent_succeeded.some((t: Row) => t.workflow_id === done.id && t.key === 'agent1_verify'), 'still visible just under five minutes')
+  stepEnd('agent1_verify').finished_at = ago(400); rowOf(done.id).finished_at = ago(400); rowOf(done.id).updated_at = ago(400)
+  assert.ok(!(await mon()).tasks.recent_succeeded.some((t: Row) => t.workflow_id === done.id && t.key === 'agent1_verify'), 'display entry expires')
+  assert.ok(rowOf(done.id) && rowOf(done.id).payload.stage === 'completed' && db.approvals.length > 0, 'permanent audit records are untouched')
+  assert.equal(retentionSeconds({ ORCH_VISIBILITY_SECONDS: '10' }), 300, 'never below five minutes'); assert.equal(retentionSeconds({ ORCH_VISIBILITY_SECONDS: '900' }), 900)
+  // failure
+  const f = await applied({ title: 'will fail' , files: [{ path: 'src/Fail.js', op: 'create', content: 'f\n' }] }); ciOverride = 'failing'
+  await post({ action: 'check_ci', params: { workflow_id: f.id } }); assert.equal(stageOf(f.id), 'failed')
+  const mf = await mon(); const ft = mf.tasks.recent_failed.find((t: Row) => t.workflow_id === f.id); assert.ok(ft, 'failed task visible'); assert.match(ft.error, /CI failed/); assert.ok(ft.remaining_s > 290)
+  rowOf(f.id).payload.failure.at = ago(400)
+  assert.ok(!(await mon()).tasks.recent_failed.some((t: Row) => t.workflow_id === f.id), 'failed entry expires after 5 min'); assert.ok(rowOf(f.id).payload.failure, 'failure record is kept')
+  void allTasks
+})
+
+test('part3: interrupted workflows are detected; an interrupted commit is VERIFIED on GitHub, found commits are never repeated, missing commits release the lock', async () => {
+  const u = await zipUp(CODE_ZIP); approve(u.apId); const b = (await ok('apply', { workflow_id: u.id })).workflow.steps.agent2_apply.branch
+  const commit = refs.get(b)!; const writes = ghWrites.length
+  // rewind the stored state to "crashed while applying": the commit really exists on GitHub
+  const row = rowOf(u.id); row.payload.stage = 'applying'; row.status = 'running'; row.payload.steps.agent2_apply = { status: 'running', agent: 'agent2', started_at: ago(900) }; delete row.payload.steps.ci; row.updated_at = ago(900)
+  const m = await mon(); assert.equal(m.interrupted.length, 1); assert.equal(m.interrupted[0].action, 'verify_commit'); assert.equal(m.interrupted[0].uncertain, true); assert.equal(m.failures.length, 1)
+  const r = await ok('resume', { workflow_id: u.id }); assert.equal(r.verified, 'commit_found'); assert.equal(r.workflow.stage, 'ci_waiting')
+  assert.equal(rowOf(u.id).payload.steps.agent2_apply.commit_sha, commit); assert.equal(ghWrites.length, writes, 'the completed commit was NOT repeated'); assert.equal(refs.get(b), commit)
+  assert.equal((await mon()).interrupted.length, 0)
+  // second case: crashed before anything reached GitHub
+  const v = await zipUp([{ name: 'src/Zed.js', data: 'z\n' }], { title: 'crash before commit' }); approve(v.apId); const b2 = (await ok('apply', { workflow_id: v.id })).workflow.steps.agent2_apply.branch
+  refs.delete(b2); const r2 = rowOf(v.id); r2.payload.stage = 'applying'; r2.payload.steps.agent2_apply = { status: 'running' }; delete r2.payload.steps.ci; r2.updated_at = ago(900)
+  const x = await ok('resume', { workflow_id: v.id }); assert.equal(x.verified, 'no_commit'); assert.equal(x.resumed, false); assert.equal(stageOf(v.id), 'failed')
+  assert.equal(locks('commit').find(l => l.payload.holder === v.id)!.payload.status, 'failed', 'commit lock released only after proving nothing was committed')
+  await must('resume', { workflow_id: v.id }, 200)
+})
+
+test('part3: a safe read-only interruption resumes and completes without repeating any earlier operation', async () => {
+  const u = await zipToCi(CODE_ZIP); const writes = ghWrites.length; const sqlN = sqlExec.length
+  const row = rowOf(u.id); row.payload.stage = 'verifying'; row.status = 'running'; row.payload.steps.agent1_verify = { status: 'running', agent: 'agent1', started_at: ago(900) }; delete row.payload.steps.agent1_verify.finished_at; delete row.result; row.finished_at = null; row.updated_at = ago(900)
+  assert.equal((await mon()).interrupted[0].action, 'retry_read_only')
+  const r = await ok('resume', { workflow_id: u.id }); assert.equal(r.workflow.stage, 'completed'); assert.equal(ghWrites.length, writes); assert.equal(sqlExec.length, sqlN); assert.equal(agentBranches().length, 1)
+})
+
+test('part3: uncertain SQL is verified before any retry; proven-not-run goes back to approval (never automatic when destructive); owner confirmation resolves the rest', async () => {
+  // (a) uncertain (5xx): resume cannot prove anything -> nothing re-run; owner attests "applied" -> continues to verification
+  const u = await zipUp([...CODE_ZIP, { name: 'supabase/sql/001.sql', data: SQL_OK }]); await toAwaitingSql(u, [])
+  approve(sqlApprovals()[0].id); sqlWritesAllowed = true; sqlFail = true; sqlFailStatus = 500
+  await must('apply_sql', { workflow_id: u.id, db_ack: 'RUN-SQL' }, 502, 'sql_uncertain'); assert.equal(sqlExec.length, 1); sqlFail = false
+  const m = await mon(); assert.equal(m.interrupted[0].action, 'verify_sql'); assert.equal(m.interrupted[0].uncertain, true)
+  const v = await ok('resume', { workflow_id: u.id }); assert.equal(v.verified, 'uncertain'); assert.equal(sqlExec.length, 1, 'verification never re-runs SQL'); assert.equal(stageOf(u.id), 'failed')
+  await must('resolve_sql', { workflow_id: u.id, path: 'supabase/sql/001.sql', outcome: 'applied' }, 403, 'ack'); assert.equal(sqlExec.length, 1)
+  await must('resolve_sql', { workflow_id: u.id, path: 'nope.sql', outcome: 'applied', ack: 'VERIFIED-IN-SUPABASE' }, 409)
+  const fin = await ok('resolve_sql', { workflow_id: u.id, path: 'supabase/sql/001.sql', outcome: 'applied', ack: 'VERIFIED-IN-SUPABASE' })
+  assert.equal(fin.workflow.stage, 'completed'); assert.equal(sqlExec.length, 1, 'confirmed-applied migration is not executed again'); assert.equal(locks('sql')[0].payload.status, 'applied')
+  assert.equal(rowOf(u.id).payload.steps.sql.items[0].resolved.outcome, 'applied')
+  // (b) owner says NOT applied: stays failed, lock released, approval cannot be reused
+  const w = await zipUp([{ name: 'src/W2.js', data: 'w\n' }, { name: 'supabase/sql/002.sql', data: 'create table if not exists ai_control.w2_notes (id int);' }], { title: 'second sql' }); await toAwaitingSql(w, [])
+  approve(sqlApprovals().find(a => a.details.sql.includes('w2_notes'))!.id); sqlFail = true; sqlFailStatus = 503
+  await post({ action: 'apply_sql', params: { workflow_id: w.id, db_ack: 'RUN-SQL' } }); sqlFail = false
+  const n = await ok('resolve_sql', { workflow_id: w.id, path: 'supabase/sql/002.sql', outcome: 'not_applied', ack: 'VERIFIED-IN-SUPABASE' })
+  assert.equal(n.workflow.stage, 'failed'); assert.equal(locks('sql').find(l => l.payload.path === 'supabase/sql/002.sql')!.payload.status, 'failed'); assert.equal(sqlExec.length, 2)
+  // (c) definitive 4xx failure of a DESTRUCTIVE migration: proven not run -> back to approval; never executes by itself
+  const d = await zipUp([{ name: 'src/D.js', data: 'd\n' }, { name: 'supabase/sql/003.sql', data: "delete from ai_control.deploy_notes where note = 'x';" }], { title: 'destructive' }); await toAwaitingSql(d, [])
+  approve(sqlApprovals().find(a => a.details.sql.includes('delete from'))!.id); sqlFail = true; sqlFailStatus = 400
+  await post({ action: 'apply_sql', params: { workflow_id: d.id, db_ack: 'RUN-SQL', destructive_ack: 'APPROVE-DESTRUCTIVE' } }); sqlFail = false; const execs = sqlExec.length
+  const back = await ok('resume', { workflow_id: d.id }); assert.equal(back.verified, 'not_applied'); assert.equal(stageOf(d.id), 'awaiting_sql'); assert.equal(sqlExec.length, execs)
+  const adv = await ok('advance', { workflow_id: d.id }); assert.equal(adv.waiting.for, 'destructive_confirmation'); assert.equal(sqlExec.length, execs, 'destructive SQL is never retried automatically')
+  await ok('apply_sql', { workflow_id: d.id, db_ack: 'RUN-SQL', destructive_ack: 'APPROVE-DESTRUCTIVE' }); assert.equal(sqlExec.length, execs + 1)
+})
+
+test('part3: controlled retries - configurable attempts, exponential backoff, total-duration cap, no retry of permanent errors, no infinite loop', async () => {
+  const transient = () => new AgentError('GitHub API 503', 503, 'github_read')
+  const env = { ORCH_RETRY_MAX_ATTEMPTS: '4', ORCH_RETRY_BASE_MS: '8', ORCH_RETRY_MAX_TOTAL_MS: '5000' }
+  const stamps: number[] = []; let n = 0
+  const v = await readOnlyWithRetry(async () => { stamps.push(Date.now()); if (++n < 3) throw transient(); return 'ok' }, env)
+  assert.equal(v, 'ok'); assert.equal(n, 3); assert.ok(stamps[1] - stamps[0] >= 7 && stamps[2] - stamps[1] >= 15, 'exponential backoff: ' + stamps.map((s, i) => i ? s - stamps[i - 1] : 0))
+  let calls = 0; await assert.rejects(readOnlyWithRetry(async () => { calls++; throw transient() }, env)); assert.equal(calls, 4, 'stops after the configured attempts')
+  calls = 0; await assert.rejects(readOnlyWithRetry(async () => { calls++; throw new AgentError('Forbidden', 403, 'forbidden') }, env)); assert.equal(calls, 1, 'unauthorized / permanent errors are never retried')
+  calls = 0; await assert.rejects(readOnlyWithRetry(async () => { calls++; throw transient() }, { ORCH_RETRY_MAX_ATTEMPTS: '6', ORCH_RETRY_BASE_MS: '50', ORCH_RETRY_MAX_TOTAL_MS: '120' })); assert.ok(calls <= 3, 'maximum total duration respected: ' + calls)
+  calls = 0; await assert.rejects(readOnlyWithRetry(async () => { calls++; throw transient() }, { ORCH_RETRY_MAX_ATTEMPTS: '999', ORCH_RETRY_BASE_MS: '0' })); assert.equal(calls, 6, 'attempts are clamped (no infinite loop)')
+  // manual retry limit and the never-retry list are unchanged
+  const u = await zipToCi(CODE_ZIP); void u
+})
+
+test('part3: two workers cannot run the same stage (parallel apply / resume execute once)', async () => {
+  const s = await started(); approve(s.apId)
+  const rs = await Promise.all([post({ action: 'apply', params: { workflow_id: s.id } }), post({ action: 'apply', params: { workflow_id: s.id } }), post({ action: 'advance', params: { workflow_id: s.id } })])
+  assert.ok(rs.filter(r => r.status === 200).length >= 1); assert.equal(agentBranches().length, 1); assert.equal(ghWrites.filter(w => w.method === 'POST' && w.path === '/git/commits').length, 1, 'exactly one commit')
+  const row = rowOf(s.id); row.payload.stage = 'applying'; row.payload.steps.agent2_apply = { status: 'running' }; delete row.payload.steps.ci; row.updated_at = ago(900)
+  const before = ghWrites.length
+  await Promise.all([post({ action: 'resume', params: { workflow_id: s.id } }), post({ action: 'resume', params: { workflow_id: s.id } })])
+  assert.equal(ghWrites.length, before, 'resume only reads'); assert.equal(agentBranches().length, 1)
+})
+
+test('part3: agent / integration health - states, cached polling, backoff, no secrets, Agent 3 untouched', async () => {
+  process.env.ORCH_HEALTH_TTL_SCALE = '1'
+  try {
+    const h = await ok('health', {}); const c = h.components
+    for (const k of ['orchestrator', 'agent1', 'agent2', 'gemini', 'github', 'supabase', 'vercel']) assert.equal(c[k].state, 'healthy', k + JSON.stringify(c[k]))
+    assert.equal(h.agent3.independent, true); assert.ok(!allUrls.some(x => /agent3/i.test(x))); assert.equal(db.agents[2].status, 'offline')
+    const body = JSON.stringify(h); for (const sct of SECRETS) assert.ok(!body.includes(sct), 'secret leaked in health')
+    const n = allUrls.length; const h2 = await ok('health', {}); assert.ok(!allUrls.slice(n).some(x => /api\.github\.com|api\.vercel\.com|generativelanguage|rest\/v1\/agents/.test(x)), 'second call reuses the cache: no provider is called again'); assert.equal(h2.components.github.cached, true)
+    // failure states
+    resetHealthCache(); healthStatus = { github: 401, gemini: 429, vercel: 403 }
+    const bad = (await ok('health', {})).components
+    assert.equal(bad.github.state, 'failed'); assert.equal(bad.gemini.state, 'busy'); assert.equal(bad.vercel.state, 'failed'); assert.equal(bad.agent2.state, 'failed'); assert.equal(bad.agent1.state, 'failed'); assert.equal(bad.orchestrator.state, 'healthy')
+    const m = allUrls.length; await ok('health', {}); assert.ok(!allUrls.slice(m).some(x => /api\.github\.com|api\.vercel\.com|generativelanguage/.test(x)), 'a failing service is not hammered (backoff)')
+    resetHealthCache(); healthStatus = { vercel: 503 }; assert.equal((await ok('health', {})).components.vercel.state, 'unavailable')
+    // not configured -> unknown; busy agent
+    resetHealthCache(); healthStatus = {}; const { AGENT1_VERCEL_TOKEN: _v, ...noVercel } = ENV
+    const r = await post({ action: 'health', params: {} }, 'tok-owner', noVercel); assert.equal((r.body as any).components.vercel.state, 'unknown')
+    resetHealthCache(); await applied(); assert.equal((await ok('health', {})).components.agent2.state, 'busy')
+    assert.equal((await post({ action: 'health', params: {} }, 'tok-other')).status, 403, 'owner only')
+  } finally { delete process.env.ORCH_HEALTH_TTL_SCALE }
+})
+
+test('part3: failure notifications - one per failure event with agent/stage/reason/recovery; none for success; history carries timeline fields', async () => {
+  const ok1 = await zipToCi(CODE_ZIP); const m0 = await mon(); assert.equal(m0.failures.length, 0, 'success creates no notification'); assert.ok(!db.activity_logs.some(l => l.level === 'error'))
+  const f = await applied({ title: 'ci will fail', files: [{ path: 'src/F2.js', op: 'create', content: 'f\n' }] }); ciOverride = 'failing'
+  await Promise.all([post({ action: 'check_ci', params: { workflow_id: f.id } }), post({ action: 'check_ci', params: { workflow_id: f.id } })])
+  assert.equal(db.activity_logs.filter(l => l.task_id === f.id && l.action === 'orchestrator_workflow_failed').length, 1, 'duplicate failure events are logged once')
+  const m = await mon(); assert.equal(m.failures.length, 1); const n = m.failures[0]
+  assert.equal(n.agent, 'agent2'); assert.equal(n.stage, 'ci_waiting'); assert.match(n.message, /CI failed/); assert.ok(n.recovery.length > 10); assert.equal((await mon()).failures[0].event_id, n.event_id, 'same event keeps its id (dashboard can de-duplicate)')
+  const list = (await ok('list', {})).workflows as Row[]; const wf = list.find(w => w.id === f.id)!, good = list.find(w => w.id === ok1.id)!
+  assert.ok(wf.started_at && wf.finished_at && wf.retries === 0 && wf.approval === 'approved'); assert.equal(wf.failure_detail.agent, 'agent2'); assert.ok(wf.failure_detail.recovery)
+  assert.ok(good.started_at && good.finished_at && good.failure_detail === null)
+})
+
+test('part3: monitoring is read-only, Agent 3 independent, no Agent 3 reference in the new code', async () => {
+  const s = await started(); const before = JSON.stringify(db.approvals); const w = ghWrites.length
+  await mon(); await ok('health', {}); assert.equal(JSON.stringify(db.approvals), before); assert.equal(ghWrites.length, w); assert.equal(sqlExec.length, 0); assert.equal(stageOf(s.id), 'awaiting_approval')
+  assert.ok(!allUrls.some(x => /agent3/i.test(x)))
+  const src = readFileSync(join(srcDir(), 'monitor.ts'), 'utf8'); assert.ok(!/from\s+['"][^'"]*agent3/.test(src) && !/AGENT3_/.test(src))
+  assert.ok((ACTIONS as readonly string[]).includes('monitor') && !(A2_ALLOWED as readonly string[]).includes('apply_promote'))
 })

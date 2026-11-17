@@ -14,6 +14,7 @@ import { useAgent1Heartbeat } from './Agent1.jsx'
 import { useAgent2Heartbeat } from './Agent2.jsx'
 import { useAgent3Heartbeat } from './Agent3.jsx'
 import { Icon } from './ui.jsx'
+import { usePendingApprovals, PendingDot } from './Monitor.jsx'
 
 const TABS = [
   ['overview', 'home', 'Overview'],
@@ -54,6 +55,7 @@ export default function App() {
     })
   }, [session, loadSettings])
 
+  const pending = usePendingApprovals(Boolean(owner))
   useAgent1Heartbeat(Boolean(owner))
   useAgent2Heartbeat(Boolean(owner))
   useAgent3Heartbeat(Boolean(owner))
@@ -74,7 +76,7 @@ export default function App() {
   const page = {
     overview: <Overview offlineSec={offlineSec} go={setTab} />,
     agents: <Agents offlineSec={offlineSec} />,
-    orchestrator: <Orchestrator />,
+    orchestrator: <Orchestrator go={setTab} />,
     tasks: <Tasks />,
     logs: <Logs />,
     approvals: <Approvals />,
@@ -90,7 +92,7 @@ export default function App() {
       <div className="nav">
         {TABS.map(([id, icon, label]) => (
           <button key={id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>
-            <Icon n={icon} />{label}
+            <Icon n={icon} />{label}{id === 'approvals' && <PendingDot count={pending.count} />}
           </button>
         ))}
       </div>

@@ -156,6 +156,7 @@ async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: string }): P
       total_added: previews.reduce((n, f) => n + f.added, 0),
       total_removed: previews.reduce((n, f) => n + f.removed, 0),
       total_change_bytes: files.reduce((n, f) => n + Buffer.byteLength(f.content || ''), 0),
+      security_summary: { sensitive_paths: sensitive.slice(0, 20), secret_scan: 'passed', deletes: previews.filter(f => f.op === 'delete').map(f => f.path).slice(0, 20) },
       files: digestFiles.map(({ sensitive: sens, ...f }) => ({
         ...f,
         file_type: f.path.includes('.') ? f.path.split('.').pop() : 'text',
@@ -169,10 +170,10 @@ async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: string }): P
     assertAgentBranch(branch, ctx.cfg.protectedBranches)
     const ap = await ctx.store.createApproval({
       task_id: taskId, title: `Code change: ${title}`,
-      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial) }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
+      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
     })
     await ctx.store.log('warn', 'agent2_approval_requested', 'Code change: ' + title, { approval_id: ap.id }, taskId, ctx.actor.id)
-    return { status: 'awaiting_approval', result: { approval_id: ap.id, branch, base: `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), estimated_cost_usd: Number(((ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1_000_000).toFixed(6)) }, base_sha: baseSha, next: 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.' + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, branch, base: `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null, estimated_cost_usd: Number(((ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1_000_000).toFixed(6)) }, base_sha: baseSha, next: 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.' + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
   })
 }
 

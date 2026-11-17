@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import { Badge, Err, CodeBlock, Empty, Loading, usePoll, q, timeAgo } from './ui.jsx'
+import { Monitor } from './Monitor.jsx'
 
 export async function callOrch(action, params = {}) {
   const { data } = await supabase.auth.getSession()
@@ -20,20 +21,19 @@ const STAGE_LABEL = {
   ci_waiting: 'Waiting for GitHub CI', awaiting_sql: 'Waiting for your SQL approval (Agent 1)', applying_sql: 'Agent 1 is running approved SQL', ci_passed: 'CI passed - Agent 1 next', verifying: 'Agent 1 is verifying',
   completed: 'Completed', failed: 'Stopped (failed)', cancelled: 'Cancelled'
 }
-const STEPS = [['proposing', 'Agent 2 proposal'], ['awaiting_approval', 'Your approval'], ['applying', 'Agent 2 commit'], ['ci_waiting', 'GitHub CI'], ['awaiting_sql', 'Agent 1 SQL'], ['verifying', 'Agent 1 verify'], ['completed', 'Done']]
-const norm = s => (s === 'ci_passed' ? 'verifying' : s === 'applying_sql' ? 'awaiting_sql' : s)
+const TASK_CLS = { Successful: 'good', Running: 'info', 'Waiting for owner': 'warn', Failed: 'bad', Blocked: 'mute', 'Not started': 'mute', Cancelled: 'mute' }
+const AGENT_LABEL = { agent1: 'Agent 1', agent2: 'Agent 2', owner: 'You' }
+const OUTCOME_CLS = { Successful: 'good', Running: 'info', 'Waiting for owner': 'warn', Failed: 'bad', Cancelled: 'mute', 'Completed with warnings': 'warn' }
 
-function Progress({ w }) {
-  const stopped = w.stage === 'failed' || w.stage === 'cancelled'
-  const hasSql = ((w.zip && w.zip.sql) || []).some(x => x.status === 'reviewed')
-  const steps = STEPS.filter(([s]) => s !== 'awaiting_sql' || hasSql)
-  const cur = steps.findIndex(([s]) => s === norm(stopped ? (w.failure && w.failure.stage) : w.stage))
+function Tasks({ w }) {
   return (
-    <div className="actions" style={{ margin: '8px 0' }}>
-      {steps.map(([s, label], i) => {
-        const cls = w.stage === 'completed' || i < cur ? 'good' : i === cur ? (stopped ? 'bad' : 'info') : 'mute'
-        return <span key={s} className={'badge ' + cls}>{label}</span>
-      })}
+    <div style={{ margin: '8px 0' }}>
+      {(w.tasks || []).map(t => (
+        <div className="row" key={t.key} style={{ margin: '3px 0' }}>
+          <span className="sub">{t.name}{t.status === 'Blocked' ? ' (blocked by ' + t.blocked_by + ')' : ''}</span>
+          <span className={'badge ' + (TASK_CLS[t.status] || 'mute')}>{t.status}</span>
+        </div>
+      ))}
     </div>
   )
 }
@@ -114,51 +114,77 @@ function Report({ r }) {
 function Detail({ id, onChanged, setErr }) {
   const [busy, setBusy] = useState('')
   const [ack, setAck] = useState(false)
-  const [dbAck, setDbAck] = useState(false)
   const [destAck, setDestAck] = useState(false)
-  const { data, error, loading, reload } = usePoll(() => callOrch('get', { workflow_id: id }), [id], 8000)
+  // The poll calls "advance": the server moves every stage that needs no owner decision and stops at the first one that does.
+  // The poll never sends a confirmation: sensitive / destructive steps only move when you tick and press Continue.
+  const { data, error, loading, reload } = usePoll(() => callOrch('advance', { workflow_id: id }), [id], 8000)
   const { data: ap } = usePoll(async () => {
-    const w = data && data.workflow; const aid = w && w.steps && w.steps.approval && w.steps.approval.id
+    const w = data && data.workflow; const aid = w && w.stage === 'awaiting_approval' && w.steps && w.steps.approval && w.steps.approval.id
     if (!aid) return null
     return (await q(supabase.from('approvals').select('id,status,decided_at,details').eq('id', aid).maybeSingle()))
   }, [data && data.workflow && data.workflow.rev], 8000)
-  const { data: sqlAps } = usePoll(async () => {
-    const w = data && data.workflow; const ids = ((w && w.steps && w.steps.sql && w.steps.sql.items) || []).map(i => i.approval_id).filter(Boolean)
-    if (!ids.length) return []
-    return (await q(supabase.from('approvals').select('id,status').in('id', ids)))
-  }, [data && data.workflow && data.workflow.rev], 8000)
-  const { data: agents } = usePoll(() => q(supabase.from('agents').select('slot,status,last_heartbeat_at').in('slot', [1, 2])), [], 10000)
   if (loading && !data) return <Loading />
   if (!data) return <Err msg={error} />
   const w = data.workflow
   const s = w.steps || {}
-  const ag = n => { const a = (agents || []).find(x => x.slot === n); return a ? a.status : '-' }
-  const sensitive = ap && ap.details && (ap.details.sensitive_paths || []).length > 0
+  const wait = data.waiting
+  const pend = w.pending_approvals || []
+  const sensitiveCode = pend.find(x => x.kind === 'code_change' && x.sensitive)
+  const destructive = pend.some(x => x.kind === 'db_change' && x.sensitive) || ((s.sql && s.sql.items) || []).some(it => it.risk === 'destructive')
   async function act(action, params = {}) {
     setBusy(action); setErr('')
     try { await callOrch(action, { workflow_id: id, ...params }) } catch (e) { setErr(e.message) }
     setBusy(''); reload(); onChanged()
   }
-  const apStatus = (ap && ap.status) || (s.approval && s.approval.status) || '-'
-  const ci = s.ci
+  const f = w.failure
+  const ok = w.outcome === 'Successful'
+
+  // Successful: only the status. No logs, no step details.
+  if (ok) return (
+    <div className="card">
+      <Err msg={error} />
+      <div className="row"><b>{w.title}</b><span className="badge good">Successful</span></div>
+      <div className="sub">{timeAgo(w.finished_at || w.updated_at)}</div>
+      {w.report && <details style={{ marginTop: 8 }}><summary className="sub" style={{ cursor: 'pointer' }}>Report</summary><Report r={w.report} /><CodeBlock label="rollback guidance" tone="warn" text={w.report.rollback_guidance || ''} /></details>}
+    </div>
+  )
+
   return (
     <div className="card">
       <Err msg={error} />
-      <div className="row"><b>{w.title}</b><Badge s={w.status} /></div>
-      <div className="sub">{STAGE_LABEL[w.stage] || w.stage} · {timeAgo(w.updated_at)}</div>
-      <Progress w={w} />
-      {w.failure && <CodeBlock label={w.stage === 'cancelled' ? 'cancelled' : 'workflow stopped'} tone="bad" text={w.failure.message + '\n(stage: ' + w.failure.stage + ', ' + w.failure.agent + ', ' + w.failure.code + ')'} />}
+      <div className="row"><b>{w.title}</b><span className={'badge ' + (OUTCOME_CLS[w.outcome] || 'mute')}>{w.outcome}</span></div>
+      <div className="sub">{STAGE_LABEL[w.stage] || w.stage} · {timeAgo(w.updated_at)}{w.running ? ' · running: ' + AGENT_LABEL[w.running.agent] + ' (' + w.running.action + ')' : ''}</div>
+      <Tasks w={w} />
 
-      <CodeBlock label="status" wrap={false} text={[
-        'Agent 2: ' + ag(2) + (s.agent2_propose ? ' · proposal ' + s.agent2_propose.status : ''),
-        'Agent 1: ' + ag(1) + (s.agent1_verify ? ' · verify ' + s.agent1_verify.status : ' · not started'),
-        'Approval: ' + apStatus,
-        'Commit: ' + (s.agent2_apply && s.agent2_apply.commit_sha ? String(s.agent2_apply.commit_sha).slice(0, 7) + ' on ' + s.agent2_apply.branch : '-'),
-        'GitHub CI: ' + (ci ? ci.state : '-'),
-        ...(s.sql ? ['SQL (Agent 1): ' + s.sql.status] : []),
-        'Vercel: ' + (w.report ? w.report.agent1.vercel.status : '-'),
-        'Supabase: ' + (w.report ? w.report.agent1.supabase.status : '-')
-      ].join('\n')} />
+      {f && w.stage !== 'cancelled' && (
+        <>
+          <CodeBlock label="failed" tone="bad" text={[
+            'Agent: ' + f.agent, 'Stage: ' + f.stage, 'Task: ' + (f.task || '-') + (f.task_id ? ' (' + f.task_id + ')' : ''), 'Code: ' + f.code, '', f.message
+          ].join('\n')} />
+          <CodeBlock label="what to do" tone="info" text={f.recovery || 'Read the error above and start a new workflow.'} />
+          {f.retryable && <div className="actions"><button className="btn" disabled={!!busy} onClick={() => act('retry')}>{busy === 'retry' ? 'Retrying...' : 'Retry (read-only step)'}</button></div>}
+        </>
+      )}
+      {w.stage === 'cancelled' && f && <CodeBlock label="cancelled" tone="bad" text={f.message} />}
+
+      {!f && wait && wait.for === 'approval_unavailable' && <CodeBlock label="approval system unavailable" tone="warn" text={wait.detail} />}
+      {!f && wait && wait.for === 'ci' && <CodeBlock label="waiting" tone="info" text={wait.detail} />}
+
+      {pend.length > 0 && (
+        <CodeBlock label="needs your approval" tone="warn" wrap={false} text={pend.map(x => (x.sensitive ? 'SENSITIVE  ' : '') + (x.kind === 'code_change' ? 'Code change' : 'SQL ' + (x.path || '')) + ' - ' + x.why).join('\n') + '\n\nOpen the Approvals tab. Everything after your approval continues by itself.'} />
+      )}
+      {(w.stage === 'awaiting_approval' && sensitiveCode && ap && ap.status === 'approved') || (wait && wait.for === 'sensitive_confirmation') ? (
+        <>
+          <label className="sub" style={{ display: 'block', margin: '6px 0' }}><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={ack} onChange={e => setAck(e.target.checked)} />I confirm: this change touches sensitive files ({((sensitiveCode && sensitiveCode.sensitive_paths) || []).join(', ')})</label>
+          <div className="actions"><button className="btn ok" disabled={!!busy || !ack} onClick={() => act('advance', { sensitive_ack: 'APPROVE-SENSITIVE' })}>{busy === 'advance' ? 'Continuing...' : 'Confirm and continue'}</button></div>
+        </>
+      ) : null}
+      {wait && wait.for === 'destructive_confirmation' && (
+        <>
+          <label className="sub" style={{ display: 'block', margin: '6px 0' }}><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={destAck} onChange={e => setDestAck(e.target.checked)} />I confirm: this SQL contains destructive statements (DELETE / UPDATE / ALTER ... DROP). It is never run automatically.</label>
+          <div className="actions"><button className="btn ok" disabled={!!busy || !destAck} onClick={() => act('advance', { destructive_ack: 'APPROVE-DESTRUCTIVE' })}>{busy === 'advance' ? 'Running SQL...' : 'Confirm and run SQL'}</button></div>
+        </>
+      )}
 
       {w.zip && <CodeBlock label="ZIP validation" tone="info" wrap={false} text={[
         'Repository: ' + w.repo + '  (base branch: ' + (w.zip.base_branch || '?') + ')',
@@ -168,74 +194,41 @@ function Detail({ id, onChanged, setErr }) {
         ...((w.zip.ignored_entries || []).length ? ['Skipped OS junk: ' + w.zip.ignored_entries.length] : []),
         'Secret scan: ' + (w.zip.secret_scan || 'passed')
       ].join('\n')} />}
-      {w.zip && <CodeBlock label="files in this ZIP" wrap={false} text={(w.zip.changed_files || []).map(f => f.op.toUpperCase() + '  ' + f.path + (f.sha256 ? '  ' + f.sha256.slice(0, 10) : '')).join('\n')} />}
+      {w.zip && <CodeBlock label="files in this ZIP" wrap={false} text={(w.zip.changed_files || []).map(x => x.op.toUpperCase() + '  ' + x.path + (x.sha256 ? '  ' + x.sha256.slice(0, 10) : '')).join('\n')} />}
       {w.zip && w.zip.gemini && <CodeBlock label="gemini review (compact diff only)" tone={w.zip.gemini.review_partial ? 'warn' : 'info'} wrap={false} text={[
         'Input cap: ' + w.zip.gemini.input_max_chars + ' chars, output cap: ' + w.zip.gemini.output_max_tokens + ' tokens',
         'Sent: ' + (w.zip.gemini.input_chars != null ? w.zip.gemini.input_chars + ' chars' : '-') + ' (ZIP and full files are never sent)',
         'Review: ' + (w.zip.gemini.review_available === false ? 'not available' : w.zip.gemini.review_partial ? 'PARTIAL - lower-priority hunks were truncated' : 'complete'),
+        ...(w.zip.gemini.omitted ? ['Omitted: ' + ((w.zip.gemini.omitted.files_dropped || []).length ? (w.zip.gemini.omitted.files_dropped.length + ' file(s) dropped (' + w.zip.gemini.omitted.files_dropped.slice(0, 5).join(', ') + '); ') : '') + (((w.zip.gemini.omitted.hunks_truncated || []).length + (w.zip.gemini.omitted.hunks_removed || []).length) + ' diff hunk(s) truncated/removed (' + [...(w.zip.gemini.omitted.hunks_truncated || []), ...(w.zip.gemini.omitted.hunks_removed || [])].slice(0, 5).join(', ') + '). Security findings are always kept.')] : []),
         'Tokens: ' + (w.zip.gemini.tokens_in ?? '-') + ' in / ' + (w.zip.gemini.tokens_out ?? '-') + ' out' + (w.zip.gemini.estimated_cost_usd != null ? '  ~$' + w.zip.gemini.estimated_cost_usd : '')
       ].join('\n')} />}
       {ap && ap.details && Array.isArray(ap.details.files) && ap.details.files.length > 0 && (
         <details open={w.stage === 'awaiting_approval'} style={{ marginTop: 6 }}>
           <summary className="sub" style={{ cursor: 'pointer' }}>Diff preview ({ap.details.files.length} files, base {String(ap.details.base_sha || '').slice(0, 7)})</summary>
-          {ap.details.files.map(f => <CodeBlock key={f.path} label={f.op + ' ' + f.path + '  +' + f.added + ' -' + f.removed + (f.sensitive ? '  [SENSITIVE]' : '')} tone={f.sensitive ? 'warn' : undefined} text={f.preview || '(no text preview)'} />)}
+          {ap.details.files.map(x => <CodeBlock key={x.path} label={x.op + ' ' + x.path + '  +' + x.added + ' -' + x.removed + (x.sensitive ? '  [SENSITIVE]' : '')} tone={x.sensitive ? 'warn' : undefined} text={x.preview || '(no text preview)'} />)}
         </details>
       )}
       {w.zip && (w.zip.sql || []).length > 0 && (
-        <CodeBlock label="sql migrations (separate approval, Agent 1)" tone={(w.zip.sql || []).some(x => x.status === 'blocked') ? 'warn' : 'info'} wrap={false} text={(w.zip.sql || []).map(x => {
+        <CodeBlock label="sql migrations (Agent 1)" tone={(w.zip.sql || []).some(x => x.status === 'blocked') ? 'warn' : 'info'} wrap={false} text={(w.zip.sql || []).map(x => {
           const it = ((s.sql && s.sql.items) || []).find(y => y.path === x.path)
-          const live = it && (sqlAps || []).find(a => a.id === it.approval_id)
-          return (x.status === 'blocked' ? 'BLOCKED  ' : (it ? String(it.status === 'pending' && live ? live.status : it.status).toUpperCase() : 'REVIEWED') + '  ') + x.path + (x.risk === 'destructive' ? '  [destructive: ' + (x.flags || []).join(', ') + ']' : '') + (x.reason ? '\n    ' + x.reason : '')
+          return (x.status === 'blocked' ? 'BLOCKED  ' : (it ? String(it.status).toUpperCase() : 'REVIEWED') + '  ') + x.path + (x.risk === 'destructive' ? '  [destructive: ' + (x.flags || []).join(', ') + ']' : '') + (x.reason ? '\n    ' + x.reason : '')
         }).join('\n')} />
       )}
       {w.zip && (w.zip.sql || []).filter(x => x.status === 'reviewed').map(x => <details key={x.path}><summary className="sub" style={{ cursor: 'pointer' }}>SQL text: {x.path}</summary><CodeBlock label={x.path} text={x.sql || ''} /></details>)}
-      {s.agent2_propose && s.agent2_propose.changed_files && <CodeBlock label={'proposal (' + s.agent2_propose.changed_files.length + ' files)'} wrap={false} text={s.agent2_propose.changed_files.map(f => f.op + ' ' + f.path + '  +' + f.added + ' -' + f.removed + (f.sensitive ? '  [SENSITIVE]' : '')).join('\n')} />}
       {s.agent2_propose && (s.agent2_propose.warnings || []).length > 0 && <CodeBlock label="agent 2 warnings" tone="warn" text={s.agent2_propose.warnings.join('\n')} />}
       {s.agent2_propose && s.agent2_propose.ai_review && <CodeBlock label="ai review" tone="info" text={s.agent2_propose.ai_review} />}
-      {ci && ci.state !== 'unknown' && <CodeBlock label={'github actions: ' + ci.state} wrap={false} text={(ci.runs || []).map(r => r.name + ' ' + r.status + '/' + (r.conclusion || '-') + '@' + r.sha).join('\n') || 'no run seen for this commit yet'} />}
-
-      {w.stage === 'awaiting_approval' && (
-        <>
-          <CodeBlock label="next" tone="info" text={apStatus === 'approved' ? 'Approved. Press Apply to let Agent 2 create its agent2/* branch and commit.' : 'Open the Approvals tab, review and approve (or reject). Then come back and press Apply.'} />
-          {sensitive && <label className="sub" style={{ display: 'block', margin: '6px 0' }}><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={ack} onChange={e => setAck(e.target.checked)} />I confirm: this change touches sensitive files ({ap.details.sensitive_paths.join(', ')})</label>}
-          <div className="actions">
-            <button className="btn ok" disabled={!!busy || apStatus !== 'approved' || (sensitive && !ack)} onClick={() => act('apply', ack ? { sensitive_ack: 'APPROVE-SENSITIVE' } : {})}>{busy === 'apply' ? 'Applying...' : 'Apply approved change'}</button>
-            <button className="btn ghost" disabled={!!busy} onClick={() => act('cancel')}>Cancel</button>
-          </div>
-        </>
-      )}
-      {w.stage === 'ci_waiting' && (
-        <div className="actions">
-          <button className="btn" disabled={!!busy} onClick={() => act('check_ci')}>{busy === 'check_ci' ? 'Checking...' : 'Check CI (Agent 1 starts when it passes)'}</button>
-          <button className="btn ghost" disabled={!!busy} onClick={() => act('cancel')}>Cancel</button>
-        </div>
-      )}
-      {w.stage === 'awaiting_sql' && (() => {
-        const items = (s.sql && s.sql.items) || []
-        const allOk = items.length > 0 && items.every(it => { const live = (sqlAps || []).find(a => a.id === it.approval_id); return (live && live.status === 'approved') || it.status === 'approved' })
-        const destructive = items.some(it => it.risk === 'destructive')
-        return (
-          <>
-            <CodeBlock label="next - sql" tone="info" text={allOk ? 'All SQL approvals are in. Press Run to let Agent 1 execute them (ai_control only, one transaction per file). Agent 1 verifies Supabase and Vercel afterwards.' : 'Open the Approvals tab and approve each SQL migration (or reject it to stop). Agent 1 runs nothing before that.'} />
-            <label className="sub" style={{ display: 'block', margin: '6px 0' }}><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={dbAck} onChange={e => setDbAck(e.target.checked)} />I confirm: run the approved SQL against Supabase (ai_control only)</label>
-            {destructive && <label className="sub" style={{ display: 'block', margin: '6px 0' }}><input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={destAck} onChange={e => setDestAck(e.target.checked)} />I confirm: this SQL contains destructive statements (DELETE / UPDATE / ALTER ... DROP)</label>}
-            <div className="actions">
-              <button className="btn ok" disabled={!!busy || !allOk || !dbAck || (destructive && !destAck)} onClick={() => act('apply_sql', { db_ack: 'RUN-SQL', ...(destAck ? { destructive_ack: 'APPROVE-DESTRUCTIVE' } : {}) })}>{busy === 'apply_sql' ? 'Running SQL...' : 'Run approved SQL'}</button>
-              <button className="btn ghost" disabled={!!busy} onClick={() => act('cancel')}>Cancel</button>
-            </div>
-          </>
-        )
-      })()}
-      {w.stage === 'ci_passed' && (
-        <div className="actions"><button className="btn" disabled={!!busy} onClick={() => act('verify')}>{busy === 'verify' ? 'Verifying...' : 'Run Agent 1 verification'}</button></div>
-      )}
+      {s.ci && s.ci.state === 'failing' && <CodeBlock label="github actions: failing" tone="bad" wrap={false} text={(s.ci.runs || []).map(r => r.name + ' ' + r.status + '/' + (r.conclusion || '-') + '@' + r.sha).join('\n') || 'no run detail'} />}
 
       {w.report && <><Report r={w.report} /><CodeBlock label="rollback guidance" tone="warn" text={w.report.rollback_guidance || 'No automatic rollback. Owner must review and revert through a separately approved change.'} /></>}
 
-      <details style={{ marginTop: 8 }}>
-        <summary className="sub" style={{ cursor: 'pointer' }}>History</summary>
-        <CodeBlock label="events" wrap={false} text={(w.events || []).map(e => (e.at || '').slice(11, 19) + '  ' + e.message).join('\n')} />
-      </details>
+      {['awaiting_approval', 'ci_waiting', 'awaiting_sql', 'ci_passed'].includes(w.stage) && <div className="actions"><button className="btn ghost" disabled={!!busy} onClick={() => act('cancel')}>Cancel</button></div>}
+
+      {w.events && w.events.length > 0 && (
+        <details style={{ marginTop: 8 }}>
+          <summary className="sub" style={{ cursor: 'pointer' }}>History</summary>
+          <CodeBlock label="events" wrap={false} text={w.events.map(e => (e.at || '').slice(11, 19) + '  ' + e.message).join('\n')} />
+        </details>
+      )}
     </div>
   )
 }
@@ -271,7 +264,7 @@ function ZipUpload({ repos, onCreated, setErr }) {
   </div>
 }
 
-export default function Orchestrator() {
+export default function Orchestrator({ go }) {
   const [err, setErr] = useState('')
   const [sel, setSel] = useState(() => (location.hash.startsWith('#wf=') ? location.hash.slice(4) : ''))
   const [repos, setRepos] = useState([])
@@ -282,16 +275,19 @@ export default function Orchestrator() {
   return (
     <>
       <Err msg={error} /><Err msg={err} />
+      <Monitor call={callOrch} onOpenWorkflow={pick} go={go} />
       <ZipUpload repos={repos} onCreated={pick} setErr={setErr} />
       <Create repos={repos} onCreated={pick} setErr={setErr} />
+      {list.filter(w => w.needs_owner).length > 0 && <div className="card"><b>Pending owner approvals</b> <span className="sub">{list.filter(w => w.needs_owner).length} workflow(s) wait for you in the Approvals tab. Only sensitive or mandatory steps ask; everything else runs by itself.</span></div>}
       {sel && <><h2>Current workflow</h2><Detail key={sel} id={sel} onChanged={reload} setErr={setErr} /></>}
       <h2>Task history</h2>
       {loading && !data ? <Loading /> : list.length === 0 ? <Empty text="No orchestrated tasks yet" /> : list.map(w => (
         <div className="card" key={w.id} onClick={() => pick(w.id)} style={{ cursor: 'pointer', outline: w.id === sel ? '1px solid var(--muted)' : 'none' }}>
-          <div className="row"><b>{w.title}</b><Badge s={w.status} /></div>
-          <div className="sub">{STAGE_LABEL[w.stage] || w.stage} · {timeAgo(w.created_at)}</div>
-          <div className="sub">{w.commit_sha ? 'commit ' + String(w.commit_sha).slice(0, 7) + ' · ' : ''}{w.ci ? 'CI ' + w.ci + ' · ' : ''}{w.verdict ? 'verdict ' + w.verdict : ''}</div>
-          {w.failure && <div className="sub" style={{ color: 'var(--bad, #c0392b)' }}>{w.failure}</div>}
+          <div className="row"><b>{w.title}</b><span className={'badge ' + (OUTCOME_CLS[w.outcome] || 'mute')}>{w.outcome}</span></div>
+          <div className="sub">{w.outcome === 'Successful' ? timeAgo(w.created_at) : (STAGE_LABEL[w.stage] || w.stage) + ' · ' + timeAgo(w.created_at)}</div>
+          <div className="sub">ID {String(w.id).slice(0, 8)} · {(w.agents || []).map(a => a === 'agent1' ? 'Agent 1' : 'Agent 2').join(' + ') || '-'} · started {timeAgo(w.started_at)}{w.finished_at ? ' · finished ' + timeAgo(w.finished_at) : ''}{w.retries ? ' · retries ' + w.retries : ''}{w.approval ? ' · approval ' + w.approval : ''}</div>
+          {w.needs_owner && <div className="sub">Needs your approval</div>}
+          {w.failure && <div className="sub" style={{ color: 'var(--bad, #c0392b)' }}>{w.failed_agent} / {w.failed_stage}: {w.failure}{w.failure_detail && w.failure_detail.recovery ? ' - ' + w.failure_detail.recovery : ''}</div>}
         </div>
       ))}
     </>

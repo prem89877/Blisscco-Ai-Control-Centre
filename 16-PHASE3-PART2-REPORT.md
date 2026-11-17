@@ -80,3 +80,26 @@ No import, no call, no env var in `orchestrator/*`; asserted by the existing tes
 5. ZIP with SQL touching `public.*`: confirm BLOCKED with reason.
 6. Try traversal / symlink / secret ZIPs.
 7. Confirm Agent 3 is only started manually.
+
+## 11. Durable duplicate ZIP + SQL execution protection (follow-up fix)
+
+* Replaced the "scan last 100 workflows" duplicate check with **permanent lock rows** in the existing `ai_control.tasks` table (`payload.kind = 'orchestration_lock'`, never listed as a workflow, no new table/migration). Row id = deterministic UUID of the key, so the primary key makes each claim atomic.
+* **ZIP lock** key = repo + ZIP SHA-256. Same ZIP → 409 `duplicate_zip` forever, race-safe (parallel uploads → one wins). Only if the holder workflow is `failed`/`cancelled`/never created, the lock is taken over atomically (compare-and-set on holder).
+* **SQL lock** key = migration SHA-256. Checked at upload (blocked) **and claimed for all files before any SQL runs** in `apply_sql` (409 `sql_duplicate`, workflow stops, nothing executed). Status `applied` is permanent; a definitively failed (rolled-back) migration is released for retry.
+* Unchanged: all Phase 3 Part 1 safeguards, Agent 1/2/3 code, approvals, db_ack/destructive_ack, checksum re-check, atomic claim in Agent 1.
+* Tests: 6 new durable tests; orchestrator suite 55/55, full suite 149/149.
+
+## 12. Hardening pass (Phase 3 Part 2 completion)
+
+Nothing rebuilt; only gaps against the Part 2 brief were closed.
+
+| Area | Change | Files |
+|---|---|---|
+| Workflow self-protection | An uploaded ZIP can never create/update/delete `orchestrator/`, `agent1/`, `agent2/`, `api/`, `.github/`, `supabase/`, `.blisscco/` (403 `protected_path`, case-insensitive, deletes included, nothing stored). Extra paths: `ORCH_ZIP_PROTECTED_EXTRA`. Change those only by a normal reviewed commit. | `orchestrator/policy.ts`, `workflow.ts` |
+| Uncertain SQL result | Only a provable rollback (Supabase 4xx SQL error, or refusal before execution) releases the SQL lock. Timeout / 5xx / network / already-claimed = **`sql_uncertain`**: lock stays `uncertain`, item marked `uncertain`, never retried, same migration blocked in later uploads, recovery text tells the owner to verify in Supabase first. | `policy.ts`, `workflow.ts` |
+| Durable commit protection | Permanent `commit:` lock (repo + per-file SHA-256 set, primary-key atomic) claimed before Agent 2 commits. Same change set can be committed once, even from a different ZIP (409 `commit_duplicate`). Released only on a definitive Agent 2 refusal. | `workflow.ts` |
+| Duplicate ZIP | A failed/cancelled workflow's ZIP lock is taken over only if it provably changed nothing (no commit, no SQL applied/uncertain). Otherwise 409 `duplicate_zip`. | `workflow.ts` |
+| Gemini limits | Configurable: `AGENT2_REVIEW_MAX_INPUT_CHARS` (default 14,000, clamp 2,000-60,000), `AGENT2_REVIEW_MAX_OUTPUT_TOKENS` (default 1,200, clamp 200-4,000). Digest has a top-level `security_summary` that survives hunk/file trimming. Omitted files/hunks are listed (`omitted`) and shown in the dashboard. | `agent2/gemini.ts`, `agent2/agent.ts`, `src/Orchestrator.jsx`, `.env.example` |
+| Tests | 6 new tests; one Part 2 test moved from `.github/` (now hard-blocked) to `package.json` as its "sensitive" example; Agent 3 source-scan test made path-robust. | `orchestrator/orchestrator.test.ts` |
+
+Executed here: `tsc --noEmit` (agent1/2/3/orchestrator) 0 errors; `tsx --test` all suites **167/167 pass**; `src/Orchestrator.jsx` compiled with esbuild. **`vite build` / `npm test` were NOT run** (no network, vite and `@types/node` not installed in this environment). Run `npm install && npm test && npm run build` locally.

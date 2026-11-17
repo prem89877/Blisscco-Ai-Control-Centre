@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { supabase } from './supabaseClient'
 import { usePoll, q, Badge, Err, Loading, Empty, timeAgo, logAction } from './ui.jsx'
+import { PendingDot } from './Monitor.jsx'
 
 function Pending({ a, onDone, setErr }) {
   const [note, setNote] = useState('')
@@ -37,7 +38,7 @@ function Pending({ a, onDone, setErr }) {
 export default function Approvals() {
   const [err, setErr] = useState('')
   const { data, error, loading, reload } = usePoll(() =>
-    q(supabase.from('approvals').select('*').order('requested_at', { ascending: false }).limit(100)))
+    q(supabase.from('approvals').select('*').order('requested_at', { ascending: false }).limit(100)), [], 6000)
   if (loading && !data) return <Loading />
   const all = data || []
   const pending = all.filter(a => a.status === 'pending')
@@ -46,7 +47,7 @@ export default function Approvals() {
   return (
     <>
       <Err msg={error} /><Err msg={err} />
-      <h2>Pending ({pending.length})</h2>
+      <h2>Pending ({pending.length}) <PendingDot count={pending.length} /></h2>
       {pending.length === 0 ? <Empty text="Nothing waiting for approval" /> : pending.map(a => <Pending key={a.id} a={a} onDone={reload} setErr={setErr} />)}
       <h2>History</h2>
       {done.length === 0 ? <Empty text="No decisions yet" /> : done.map(a => (
