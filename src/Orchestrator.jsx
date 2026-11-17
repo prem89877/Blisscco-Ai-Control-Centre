@@ -161,6 +161,7 @@ function Detail({ id, onChanged, setErr }) {
           <CodeBlock label="failed" tone="bad" text={[
             'Agent: ' + f.agent, 'Stage: ' + f.stage, 'Task: ' + (f.task || '-') + (f.task_id ? ' (' + f.task_id + ')' : ''), 'Code: ' + f.code, '', f.message
           ].join('\n')} />
+          {f.log && <CodeBlock label="error log" tone="bad" text={f.log} />}
           <CodeBlock label="what to do" tone="info" text={f.recovery || 'Read the error above and start a new workflow.'} />
           {f.retryable && <div className="actions"><button className="btn" disabled={!!busy} onClick={() => act('retry')}>{busy === 'retry' ? 'Retrying...' : 'Retry (read-only step)'}</button></div>}
         </>

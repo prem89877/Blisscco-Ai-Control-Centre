@@ -1,5 +1,5 @@
 import { loadConfig, readiness, secretValues, type Config } from './config.js'
-import { AgentError, clip, errMsg, redact } from './util.js'
+import { AgentError, clip, errMsg, extractFailedLog, redact, redactString } from './util.js'
 import { Store } from './store.js'
 import { GitHub, type CommitFile } from './github.js'
 import { planCommand, proposeFix, review, type AiResult } from './gemini.js'
@@ -100,7 +100,13 @@ export async function monitor(ctx: Ctx, repo: string, branch?: string) {
   const runs = await gh.runs(repo, branch, 5)
   const latest = runs[0]
   const overall = !latest ? 'none' : latest.status !== 'completed' ? 'running' : latest.conclusion === 'success' ? 'passing' : 'failing'
-  const failed = latest && latest.conclusion === 'failure' ? await gh.failedJobs(repo, latest.id).catch(() => []) : []
+  const failed: any[] = latest && latest.conclusion === 'failure' ? await gh.failedJobs(repo, latest.id).catch(() => []) : []
+  // Only when CI failed: attach the real error log of each failed job (max 3). Passing CI carries no log at all.
+  for (const j of failed.slice(0, 3)) {
+    const raw = j.job_id ? await gh.jobLog(repo, j.job_id) : ''
+    const log = redactString(extractFailedLog(raw), secretValues(ctx.cfg))
+    j.log = log || 'GitHub did not give the log for this job (it may have expired, or the token lacks Actions: Read). Open the run on GitHub.'
+  }
   const deployments = branch ? await gh.deployments(repo, branch).catch(() => []) : []
   return { repo, branch: branch || null, overall, runs, failed_jobs: failed, deployments }
 }

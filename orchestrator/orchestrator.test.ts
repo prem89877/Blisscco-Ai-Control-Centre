@@ -113,7 +113,12 @@ async function gh(method: string, path: string, url: URL, body: any): Promise<Re
   if ((r = /^\/actions\/workflows\/(\d+)\/dispatches$/.exec(p)) && method === 'POST') { if (dispatchStatus !== 204) return json({ message: "Workflow does not have 'workflow_dispatch' trigger" }, dispatchStatus); dispatches.push({ id: r[1], ref: body.ref }); return new Response(null, { status: 204 }) }
   if (p.startsWith('/commits')) return json([{ sha: refs.get('main'), commit: { message: 'init', author: { date: '2026-11-01' } } }])
   if (p.startsWith('/actions/runs') && !p.includes('/jobs')) { const b = url.searchParams.get('branch'); return json({ workflow_runs: runs.filter(x => !b || x.head_branch === b) }) }
-  if (p.includes('/actions/runs/') && p.endsWith('/jobs')) return json({ jobs: [{ name: 'test-build', conclusion: 'failure', steps: [{ name: 'npm test', conclusion: 'failure' }] }] })
+  if (p.includes('/actions/runs/') && p.endsWith('/jobs')) return json({ jobs: [{ id: 77, name: 'test-build', conclusion: 'failure', steps: [{ name: 'npm test', conclusion: 'failure' }] }] })
+  if (p === '/actions/jobs/77/logs') return new Response([
+    '2026-11-17T04:26:00.1000000Z ##[group]Run actions/checkout@v4', '2026-11-17T04:26:01.0000000Z checkout ok', '2026-11-17T04:26:01.5000000Z ##[endgroup]',
+    '2026-11-17T04:26:02.0000000Z ##[group]Run npm run build', '2026-11-17T04:26:03.0000000Z > next build', '2026-11-17T04:26:04.0000000Z Error: Cannot find module ./missing (token ghp_abcdefghijklmnopqrstuvwxyz1234)',
+    '2026-11-17T04:26:05.0000000Z ##[error]Process completed with exit code 1.', '2026-11-17T04:26:06.0000000Z ##[group]Post job cleanup.', '2026-11-17T04:26:06.5000000Z cleanup noise'
+  ].join('\n'), { status: 200, headers: { 'content-type': 'text/plain' } })
   if (p.startsWith('/deployments')) return json(refs.has(String(url.searchParams.get('ref'))) && url.searchParams.get('ref') !== 'main' ? [{ id: 7, environment: 'Preview', created_at: '2026-11-16' }] : [])
   if (p.startsWith('/pulls') && method === 'GET') { const head = (url.searchParams.get('head') || '').split(':')[1]; return json(prs.filter(x => x.head === head).map(x => ({ number: x.number, html_url: 'https://github.com/' + REPO + '/pull/' + x.number }))) }
   if (p === '/pulls' && method === 'POST') { const n = prs.length + 1; prs.push({ number: n, head: body.head, base: body.base }); return json({ number: n, html_url: 'https://github.com/' + REPO + '/pull/' + n }, 201) }
@@ -906,6 +911,9 @@ test('auto 4+6: a failed task shows agent, stage, task, real error and recovery 
   assert.equal(w.outcome, 'Failed'); assert.equal(f.agent, 'agent2'); assert.equal(f.stage, 'ci_waiting'); assert.equal(f.task, 'GitHub CI'); assert.equal(f.code, 'ci_failed'); assert.match(f.message, /CI failed/); assert.match(f.message, /test-build \(npm test\)/); assert.ok(f.recovery.length > 20); assert.equal(f.retryable, false)
   const t = Object.fromEntries(w.tasks.map((x: Row) => [x.key, x])); assert.equal(t.ci.status, 'Failed'); assert.equal(t.agent1_verify.status, 'Blocked'); assert.equal(t.agent1_verify.blocked_by, 'ci'); assert.equal(t.agent2_apply.status, 'Successful')
   assert.equal(a1Used(), false, 'Agent 1 never starts after a failed CI'); await must('retry', { workflow_id: s.id }, 409, 'not_retryable')
+  // The full error log of the failed step is carried (no timestamps, no other steps, no secrets); a passing CI carries none.
+  assert.match(f.log, /Cannot find module \.\/missing/); assert.match(f.log, /ERROR: Process completed with exit code 1\./); assert.match(f.log, /> Run npm run build/)
+  assert.doesNotMatch(f.log, /actions\/checkout|cleanup noise|2026-11-17T|ghp_abc/)
   assert.ok(logsOf(s.id).some(l => l.level === 'error'))
 })
 

@@ -101,7 +101,12 @@ export class GitHub {
   }
   async failedJobs(repo: string, runId: number) {
     const b = await this.call('GET', `/repos/${this.repo(repo)}/actions/runs/${runId}/jobs`)
-    return ((b.jobs || []) as any[]).filter(j => j.conclusion === 'failure').map(j => ({ job: String(j.name), failed_steps: ((j.steps || []) as any[]).filter(s => s.conclusion === 'failure').map(s => String(s.name)) }))
+    return ((b.jobs || []) as any[]).filter(j => j.conclusion === 'failure').map(j => ({ job: String(j.name), job_id: Number(j.id), failed_steps: ((j.steps || []) as any[]).filter(s => s.conclusion === 'failure').map(s => String(s.name)) }))
+  }
+  // Raw text log of one job (GitHub answers with a redirect to a short-lived file). '' when GitHub no longer has it or the token cannot read it.
+  async jobLog(repo: string, jobId: number): Promise<string> {
+    try { const b = await this.call('GET', `/repos/${this.repo(repo)}/actions/jobs/${Number(jobId)}/logs`); return typeof b === 'string' ? b : '' }
+    catch { return '' }
   }
   async deployments(repo: string, ref: string) {
     const b = await this.call('GET', `/repos/${this.repo(repo)}/deployments?ref=${encodeURIComponent(ref)}&per_page=5`)

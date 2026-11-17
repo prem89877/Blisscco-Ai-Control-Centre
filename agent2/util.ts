@@ -78,3 +78,23 @@ export async function jfetch(url: string, init: RequestInit = {}, timeoutMs = 15
 
 export function b64(s: string): string { return Buffer.from(s, 'utf8').toString('base64') }
 export function unb64(s: string): string { return Buffer.from(s.replace(/\n/g, ''), 'base64').toString('utf8') }
+
+// GitHub Actions job log -> only the failed step: timestamps/colour codes removed, from the failed step's header to its error.
+// Long output keeps the beginning and (mostly) the END, because the real error is at the end. Caller redacts secrets.
+export function extractFailedLog(raw: string, max = 12000): string {
+  const lines = String(raw || '').replace(/\r/g, '').split('\n')
+    .map(l => l.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, '').replace(/\u001b\[[0-9;]*m/g, ''))
+  if (!lines.some(l => l.trim())) return ''
+  const err = lines.findIndex(l => l.startsWith('##[error]'))
+  let start = Math.max(0, lines.length - 150), end = lines.length
+  if (err >= 0) {
+    start = 0
+    for (let i = err; i >= 0; i--) if (lines[i].startsWith('##[group]')) { start = i; break }
+    for (let i = err + 1; i < lines.length; i++) if (lines[i].startsWith('##[group]')) { end = i; break }
+  }
+  let text = lines.slice(start, end).filter(l => !l.startsWith('##[endgroup]'))
+    .map(l => l.replace(/^##\[group\]/, '> ').replace(/^##\[error\]/, 'ERROR: ').replace(/^##\[warning\]/, 'WARNING: '))
+    .join('\n').trim()
+  if (text.length > max) text = text.slice(0, 1500) + '\n\n... (middle of the log trimmed) ...\n\n' + text.slice(-(max - 1500))
+  return text
+}

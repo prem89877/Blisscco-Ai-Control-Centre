@@ -56,8 +56,9 @@ function Report({ res }) {
       {(r.warnings || []).length > 0 && <CodeBlock label="warnings" tone="warn" text={r.warnings.join('\n')} />}
       {files && <CodeBlock label={'changed files (' + r.changed_files.length + ')'} text={files} wrap={false} />}
       {lines.length > 0 && <CodeBlock label="summary" tone="good" text={lines.join('\n')} wrap={false} />}
-      {runs && <CodeBlock label="github actions" text={runs} wrap={false} />}
-      {(r.failed_jobs || []).length > 0 && <CodeBlock label="failed jobs" tone="bad" text={r.failed_jobs.map(j => j.job + ': ' + j.failed_steps.join(', ')).join('\n')} />}
+      {runs && r.overall !== 'passing' && <CodeBlock label="github actions" text={runs} wrap={false} />}
+      {(r.failed_jobs || []).length > 0 && <CodeBlock label="failed jobs" tone="bad" text={r.failed_jobs.map(j => j.job + ': ' + (j.failed_steps || []).join(', ')).join('\n')} />}
+      {(r.failed_jobs || []).filter(j => j.log).map((j, i) => <CodeBlock key={i} label={'error log - ' + j.job} tone="bad" text={j.log} />)}
       {r.next && <CodeBlock label="next step" tone="info" text={r.next} />}
       {r.content !== undefined && <CodeBlock label={r.path} wrap={false} text={r.content} />}
       {(r.top_level || r.files) && <CodeBlock label="files" wrap={false} text={r.top_level ? r.top_level.map(t => t.name + '  (' + t.files + ')').join('\n') : r.files.join('\n')} />}

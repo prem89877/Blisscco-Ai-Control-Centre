@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadConfig } from './config.js'
-import { redact } from './util.js'
+import { extractFailedLog, redact } from './util.js'
 import { assertAgentBranch, branchFor, classifyCommand, diffStats, gitBlobSha, isSensitivePath, scanSecrets, tokenize, validateFiles, validatePath } from './guard.js'
 import { handleRequest } from './server.js'
 import { makeCtx, runAction } from './agent.js'
@@ -572,4 +572,14 @@ test('ai_command: anything else (codespace, shell, production merge) is declined
   planReply = 'not json'; await must('ai_command', { repo: REPO, text: 'x' }, 502, 'ai_bad_output')
   await must('ai_command', { repo: REPO, text: '  ' }, 400)
   assert.equal(ghWrites.length, 0); assert.equal(db.approvals.length, 0)
+})
+
+test('extractFailedLog keeps only the failed step, strips timestamps, keeps the end of long output', () => {
+  const raw = ['2026-11-17T04:26:00.1Z ##[group]Run setup', '2026-11-17T04:26:01.0Z fine', '2026-11-17T04:26:02.0Z ##[group]Run npm run build',
+    ...Array.from({ length: 600 }, (_, i) => '2026-11-17T04:26:03.0Z line ' + i + ' ' + 'x'.repeat(40)), '2026-11-17T04:26:04.0Z \u001b[31mError: boom\u001b[0m',
+    '2026-11-17T04:26:05.0Z ##[error]Process completed with exit code 1.', '2026-11-17T04:26:06.0Z ##[group]Post job cleanup.', '2026-11-17T04:26:07.0Z noise'].join('\n')
+  const out = extractFailedLog(raw, 4000)
+  assert.ok(out.length <= 4100); assert.match(out, /Error: boom/); assert.match(out, /ERROR: Process completed with exit code 1\./)
+  assert.match(out, /middle of the log trimmed/); assert.doesNotMatch(out, /Run setup|noise|2026-11-17T|\u001b/)
+  assert.equal(extractFailedLog(''), ''); assert.equal(extractFailedLog('   \n '), '')
 })

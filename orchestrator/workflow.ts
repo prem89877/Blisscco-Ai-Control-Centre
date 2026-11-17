@@ -74,7 +74,7 @@ async function advance(o: OCtx, wf: Row, mutate: (p: Row) => void, extra: Row = 
 }
 
 const TASK_NAME: Record<string, string> = { agent2_propose: 'Agent 2: prepare proposal', approval: 'Owner approval', agent2_apply: 'Agent 2: commit to agent2/* branch', ci: 'GitHub CI', sql: 'Agent 1: SQL migration', agent1_verify: 'Agent 1: verify' }
-async function fail(o: OCtx, wf: Row, f: { agent: 'orchestrator' | 'agent1' | 'agent2'; code: string; message: string }): Promise<Row> {
+async function fail(o: OCtx, wf: Row, f: { agent: 'orchestrator' | 'agent1' | 'agent2'; code: string; message: string; log?: string }): Promise<Row> {
   const message = String(clean(o, f.message)).slice(0, 600)
   let row = wf
   let recorded = false
@@ -85,7 +85,8 @@ async function fail(o: OCtx, wf: Row, f: { agent: 'orchestrator' | 'agent1' | 'a
       p.failure = {
         stage: at, agent: f.agent, code: f.code, message, at: now(), task: TASK_NAME[key] || key,
         task_id: stp.agent2_task_id || stp.agent1_task_id || null,
-        retryable: (RETRYABLE_STAGES as readonly string[]).includes(at) && !NEVER_RETRY_CODES.includes(f.code)
+        retryable: (RETRYABLE_STAGES as readonly string[]).includes(at) && !NEVER_RETRY_CODES.includes(f.code),
+        ...(f.log ? { log: String(clean(o, f.log)).slice(0, 15000) } : {})
       }
       if (p.steps && p.steps[key]) p.steps[key].status = 'failed'
     }, { error_message: message })
@@ -338,11 +339,12 @@ export async function checkCi(o: OCtx, p: any) {
   }
   const runs: any[] = (res.result && res.result.runs) || []
   const state = evalCi(runs, commit)
-  const ciStep = { state, checked_at: now(), read_retries: 0, runs: runs.filter(r => r.sha && commit.startsWith(r.sha)).slice(0, 5), deployments: ((res.result && res.result.deployments) || []).slice(0, 5), failed_jobs: state === 'failing' ? ((res.result && res.result.failed_jobs) || []).slice(0, 5) : undefined }
+  const ciStep = { state, checked_at: now(), read_retries: 0, runs: runs.filter(r => r.sha && commit.startsWith(r.sha)).slice(0, 5), deployments: ((res.result && res.result.deployments) || []).slice(0, 5), failed_jobs: state === 'failing' ? ((res.result && res.result.failed_jobs) || []).slice(0, 5).map((j: any) => ({ job: j.job, failed_steps: j.failed_steps })) : undefined }
+  const ciLog = state === 'failing' ? ((res.result && res.result.failed_jobs) || []).slice(0, 3).filter((j: any) => j && j.log).map((j: any) => '===== ' + j.job + (j.failed_steps && j.failed_steps.length ? ' (' + j.failed_steps.join(', ') + ')' : '') + ' =====\n' + j.log).join('\n\n') : ''
   if (state === 'failing') {
     const jobs = ciStep.failed_jobs && ciStep.failed_jobs.length ? ' Failed: ' + ciStep.failed_jobs.map((j: any) => j.job + ' (' + (j.failed_steps || []).join(', ') + ')').join('; ') : ''
     await advance(o, wf, q => { q.steps.ci = ciStep })
-      .then(w => fail(o, w, { agent: 'agent2', code: 'ci_failed', message: `GitHub Actions CI failed for commit ${commit.slice(0, 7)}.` + jobs }))
+      .then(w => fail(o, w, { agent: 'agent2', code: 'ci_failed', message: `GitHub Actions CI failed for commit ${commit.slice(0, 7)}.` + jobs, log: ciLog }))
       .catch(() => {})
     throw withWf(new AgentError('CI failed for this commit; workflow stopped.' + jobs, 409, 'ci_failed'), wf.id)
   }
