@@ -28,11 +28,33 @@ const TABS = [
   ['settings', 'gear', 'Settings']
 ]
 
+// The open tab lives in the URL hash (#approvals), so a refresh, the back button or a shared
+// link returns to the same page. An unknown hash (for example a Supabase login token) is ignored.
+const TAB_IDS = TABS.map(t => t[0])
+function tabFromHash() {
+  let id = ''
+  try { id = decodeURIComponent((window.location.hash || '').replace(/^#\/?/, '')) } catch { /* bad hash: ignore */ }
+  return TAB_IDS.includes(id) ? id : 'overview'
+}
+
 export default function App() {
   const [session, setSession] = useState(undefined)
   const [owner, setOwner] = useState(null) // null=checking, false=denied, object=ok
-  const [tab, setTab] = useState('overview')
+  const [tab, setTabState] = useState(tabFromHash)
   const [offlineSec, setOfflineSec] = useState(120)
+
+  const setTab = useCallback(id => {
+    if (!TAB_IDS.includes(id)) return
+    setTabState(id)
+    if (window.location.hash !== '#' + id) window.history.pushState(null, '', '#' + id)
+  }, [])
+
+  useEffect(() => {
+    const onNav = () => setTabState(tabFromHash())
+    window.addEventListener('popstate', onNav)
+    window.addEventListener('hashchange', onNav)
+    return () => { window.removeEventListener('popstate', onNav); window.removeEventListener('hashchange', onNav) }
+  }, [])
 
   useEffect(() => {
     if (!configured) { setSession(null); return }
