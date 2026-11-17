@@ -42,7 +42,7 @@ function Report({ res, onRetest }) {
   const c = r.counts || {}
   return (
     <div className="card">
-      <div className="row"><b>{r.title || 'Result'}</b><Badge s={waiting ? 'awaiting_approval' : r.verdict === 'fail' ? 'failed' : r.verdict === 'attention' ? 'degraded' : 'ok'} /></div>
+      <div className="row"><b>{r.title || 'Result'}</b><Badge s={res.status === 'queued' ? 'queued' : waiting ? 'awaiting_approval' : r.verdict === 'fail' ? 'failed' : r.verdict === 'attention' ? 'degraded' : 'ok'} /></div>
       {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
       {r.unsupported && <CodeBlock label="not done" tone="warn" text={r.message} />}
       {r.verdict && <div className="sub" style={{ margin: '6px 0' }}>Verdict: <b>{r.verdict.toUpperCase()}</b> | {r.tests_passed}/{r.tests_run} checks ok | critical {c.critical} | high {c.high} | medium {c.medium} | low {c.low}</div>}
@@ -112,6 +112,8 @@ export default function Agent3Panel() {
   const [busy, setBusy] = useState('')
   const [text, setText] = useState('')
   const [ratePath, setRatePath] = useState('')
+  const [where, setWhere] = useState('vercel')
+  const [queuedId, setQueuedId] = useState('')
 
   useEffect(() => { callAgent3('heartbeat').then(setHb).catch(e => setErr(e.message)) }, [])
   const { data: ready, reload } = usePoll(() =>
@@ -120,9 +122,30 @@ export default function Agent3Panel() {
   const targets = (hb && hb.targets) || []
   const repos = (hb && hb.repos) || []
 
+  // Termux mode: the test is queued; the phone worker runs it; this page picks the result up.
+  useEffect(() => {
+    if (!queuedId) return
+    const t = setInterval(async () => {
+      try {
+        const rows = await q(supabase.from('tasks').select('id,status,result,error_message').eq('id', queuedId).limit(1))
+        const row = rows && rows[0]
+        if (row && row.status === 'succeeded') { setRes({ task_id: row.id, status: 'succeeded', result: row.result }); setQueuedId('') }
+        else if (row && ['failed', 'cancelled'].includes(row.status)) { setErr('Termux task ' + row.status + (row.error_message ? ': ' + row.error_message : '')); setQueuedId('') }
+      } catch { /* keep polling */ }
+    }, 4000)
+    return () => clearInterval(t)
+  }, [queuedId])
+
+  const QUEUEABLE = ['website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report']
   async function run(action, params = {}) {
     setBusy(action); setErr('')
-    try { setRes(await callAgent3(action, { target: target || targets[0], repo: repo || repos[0], ...params })) } catch (e) { setErr(e.message) }
+    try {
+      const base = { target: target || targets[0], repo: repo || repos[0] }
+      if (where === 'termux' && QUEUEABLE.includes(action)) {
+        const r = await callAgent3('queue_task', { task: action, ...base })
+        setRes(r); setQueuedId(r.task_id)
+      } else setRes(await callAgent3(action, { ...base, ...params }))
+    } catch (e) { setErr(e.message) }
     setBusy('')
   }
 
@@ -140,6 +163,11 @@ export default function Agent3Panel() {
       {rows.length > 0 && <><div className="sec-title">Approved - ready to run</div>{rows.map(a => <Apply key={a.id} a={a} onDone={reload} onResult={setRes} setErr={setErr} />)}</>}
       <div className="card">
         <b>Run a test</b> <span className="sub">(read-only; nothing is billed or written)</span>
+        <div className="filters" style={{ margin: '6px 0' }}>
+          <button className={'btn' + (where === 'vercel' ? '' : ' ghost')} onClick={() => setWhere('vercel')}>Run now (Vercel)</button>
+          <button className={'btn' + (where === 'termux' ? '' : ' ghost')} onClick={() => setWhere('termux')}>Run on Termux</button>
+        </div>
+        {where === 'termux' && <div className="sub">Termux me chalao: <code>npm run agent3 -- worker</code>. Result yahin aa jayega{queuedId ? ' (wait kar raha hoon...)' : ''}.</div>}
         <Pick options={targets} value={target || targets[0] || ''} set={setTarget} empty="Set AGENT3_TARGETS" />
         <Pick options={repos} value={repo || repos[0] || ''} set={setRepo} empty="No repo (secret/dependency scan skipped)" />
         <div className="actions" style={{ flexWrap: 'wrap' }}>
@@ -156,7 +184,7 @@ export default function Agent3Panel() {
         <input placeholder="/api/some-path (not a billing path)" value={ratePath} onChange={e => setRatePath(e.target.value)} autoCapitalize="none" />
         <button className="btn ghost" disabled={!!busy || !ratePath.startsWith('/') || !targets.length} onClick={() => run('request_rate_test', { path: ratePath })}>Request approval</button>
       </div>
-      <div className="sub">Browser click-through (login, advertiser, publisher, admin, mobile) runs in GitHub Actions: Actions → QA Playwright → Run workflow. Termux: <code>npm run agent3 -- report</code></div>
+      <div className="sub">Browser click-through (login, advertiser, publisher, admin, mobile) runs in GitHub Actions: Actions → QA Playwright → Run workflow. Termux: <code>npm run agent3 -- report</code> ya <code>worker</code></div>
     </>
   )
 }

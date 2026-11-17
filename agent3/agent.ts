@@ -8,8 +8,8 @@ import * as C from './checks.js'
 import type { Finding } from './checks.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
-export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
-export const ACTIONS = ['heartbeat', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command'] as const
+export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number>; adopt?: string }
+export const ACTIONS = ['heartbeat', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task'] as const
 export type Action = typeof ACTIONS[number]
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
 export const now = () => new Date().toISOString()
@@ -21,7 +21,9 @@ export async function withTask(ctx: Ctx, action: string, title: string, payload:
   const secrets = secretValues(ctx.cfg)
   await ctx.store.ensureAgent()
   await ctx.store.setStatus('running')
-  const task = await ctx.store.createTask({ title, description: 'Agent 3 - ' + action, status: 'running', payload: { action, ...payload }, created_by: ctx.actor.id, started_at: now() })
+  // A task queued from the dashboard and claimed by the Termux worker is reused (no duplicate task row).
+  const adopted = ctx.adopt; ctx.adopt = undefined
+  const task = adopted ? { id: adopted } : await ctx.store.createTask({ title, description: 'Agent 3 - ' + action, status: 'running', payload: { action, ...payload }, created_by: ctx.actor.id, started_at: now() })
   await ctx.store.log('info', `agent3_${action}_start`, title, {}, task.id, ctx.actor.id)
   try {
     const out = await fn(task.id)
@@ -451,6 +453,20 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   return { ...out, understood }
 }
 
+// ---------------------------------------------------------------- queue for the Termux worker (runs later, on the phone, no Vercel time limit)
+export const QUEUEABLE = ['website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report']
+async function queueTask(ctx: Ctx, p: any): Promise<any> {
+  const task = String(p.task || '')
+  if (!QUEUEABLE.includes(task)) throw new AgentError('This test cannot be queued', 400, 'bad_action')
+  const target = pickTarget(ctx, p)
+  const repo = p.repo ? validRepo(String(p.repo)) : null
+  if (repo && !ctx.cfg.githubRepos.some(r => r.toLowerCase() === repo.toLowerCase())) throw new AgentError('Repo not in AGENT3_GITHUB_REPOS', 403, 'repo_not_allowed')
+  await ctx.store.ensureAgent()
+  const t = await ctx.store.createTask({ title: 'Termux queue: ' + task + ' ' + target, description: 'Agent 3 - queued for Termux', status: 'queued', payload: { action: task, target, repo, runner: 'termux' }, created_by: ctx.actor.id })
+  await ctx.store.log('info', 'agent3_task_queued', task, {}, t.id, ctx.actor.id)
+  return { task_id: t.id, status: 'queued', result: { title: 'Queued for Termux', next: 'Termux me chalao: npm run agent3 -- worker --once   (live rakhna ho to --once hata do)' } }
+}
+
 // ---------------------------------------------------------------- dispatcher
 async function heartbeat(ctx: Ctx): Promise<any> {
   const a = await ctx.store.heartbeat()
@@ -470,6 +486,7 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'apply_rate_test': return applyRateTest(ctx, params)
     case 'retest': return retest(ctx, params)
     case 'ai_command': return aiCommand(ctx, params)
+    case 'queue_task': return queueTask(ctx, params)
     default: throw new AgentError('Unknown action', 400, 'bad_action')
   }
 }

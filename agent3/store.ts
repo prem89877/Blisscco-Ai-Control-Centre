@@ -74,6 +74,14 @@ export class Store {
   findApprovals(kind: string, branch: string): Promise<Row[]> {
     return this.rest('GET', `approvals?select=*&details->>kind=eq.${encodeURIComponent(kind)}&details->>branch=eq.${encodeURIComponent(branch)}&order=requested_at.desc`)
   }
+  // Termux worker: tasks the owner queued from the dashboard (oldest first). Claim is atomic (only one worker wins).
+  async queuedTasks(): Promise<Row[]> {
+    const a = await this.ensureAgent()
+    return this.rest('GET', `tasks?select=*&agent_id=eq.${a.id}&status=eq.queued&order=created_at.asc&limit=5`)
+  }
+  async claimTask(id: string): Promise<boolean> {
+    return (await this.rest('PATCH', `tasks?id=eq.${id}&status=eq.queued`, { status: 'running', started_at: new Date().toISOString() })).length > 0
+  }
   updateTask(id: string, patch: Row) { return this.rest('PATCH', `tasks?id=eq.${id}`, patch) }
 
   async log(level: 'info' | 'success' | 'warn' | 'error', action: string, message: string, metadata: Row = {}, taskId: string | null = null, actorId: string | null = null) {

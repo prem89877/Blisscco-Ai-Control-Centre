@@ -6,6 +6,7 @@ import * as C from './checks.js'
 import { redact } from './util.js'
 import { handleRequest } from './server.js'
 import { makeCtx, runAction } from './agent.js'
+import { workOnce } from './worker.js'
 
 const REF = 'abcdref'
 const SITE = 'https://qa.example.com'
@@ -339,6 +340,32 @@ test('failed run is logged and redacted; agent goes to error', async () => {
   assert.equal(db.agents.find(a => a.slot === 3)!.status, 'error')
   assert.ok(db.activity_logs.some(l => l.level === 'error'))
   assert.ok(!JSON.stringify(db).includes('sbp_wrongwrongwrongwrong'))
+})
+
+test('termux queue: dashboard queues, worker runs it on the SAME task, no duplicate', async () => {
+  const q = await runAction(ctx(), 'queue_task', { task: 'website_smoke' })
+  assert.equal(q.status, 'queued'); assert.equal(siteCalls.length, 0)
+  assert.equal(db.tasks.length, 1); assert.equal(db.tasks[0].status, 'queued')
+  const n = await workOnce(loadConfig(ENV))
+  assert.equal(n, 1); assert.equal(db.tasks.length, 1)
+  assert.equal(db.tasks[0].status, 'succeeded'); assert.ok(db.tasks[0].result.findings.length > 0)
+  assert.equal(await workOnce(loadConfig(ENV)), 0)
+})
+test('termux queue: only the six read-only tests; foreign targets and foreign queue rows are refused', async () => {
+  await assert.rejects(() => runAction(ctx(), 'queue_task', { task: 'apply_rate_test' }), /cannot be queued/)
+  await assert.rejects(() => runAction(ctx(), 'queue_task', { task: 'website_smoke', target: 'https://evil.com' }), /AGENT3_TARGETS/)
+  await runAction(ctx(), 'heartbeat')
+  const aid = db.agents.find(a => a.slot === 3)!.id
+  db.tasks = [
+    { id: uuid(), agent_id: aid, status: 'queued', payload: { action: 'apply_rate_test', runner: 'termux' } },
+    { id: uuid(), agent_id: aid, status: 'queued', payload: { action: 'website_smoke', target: 'https://evil.com', runner: 'termux' } },
+    { id: uuid(), agent_id: aid, status: 'queued', payload: { action: 'website_smoke', target: SITE } }
+  ]
+  const n = await workOnce(loadConfig(ENV))
+  assert.equal(n, 1)
+  assert.equal(db.tasks[0].status, 'queued'); assert.equal(db.tasks[2].status, 'queued')
+  assert.equal(db.tasks[1].status, 'failed'); assert.match(db.tasks[1].error_message, /AGENT3_TARGETS/)
+  assert.deepEqual(otherHostCalls, [])
 })
 
 // ================================================================ server
