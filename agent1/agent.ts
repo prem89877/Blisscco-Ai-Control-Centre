@@ -9,7 +9,7 @@ import { analyzeProject, analyzeRls, classifyDbChange, classifyExecutableSql, co
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
-export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'deploy_logs', 'request_redeploy', 'apply_redeploy', 'vercel_options', 'project_options', 'ai_command'] as const
+export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'github_branches', 'deploy_logs', 'request_redeploy', 'apply_redeploy', 'vercel_options', 'project_options', 'ai_command'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -95,13 +95,14 @@ async function collectRls(ctx: Ctx, ref?: string): Promise<Part<any>> {
   return { available: true, data: { by_schema: by, anon_probe: probe }, issues }
 }
 
-async function collectGithub(ctx: Ctx): Promise<Part<RepoReport[]>> {
+async function collectGithub(ctx: Ctx, selectedRepo?: string, selectedBranch?: string, expectedSha?: string): Promise<Part<RepoReport[]>> {
   if (!ctx.cfg.githubToken || !ctx.cfg.githubRepos.length) return { available: false, reason: 'AGENT1_GITHUB_TOKEN / AGENT1_GITHUB_REPOS not set', issues: [{ severity: 'info', area: 'config', message: 'GitHub checks not configured' }] }
   const g = new GitHub(ctx.cfg, ctx.calls)
   const issues: Issue[] = []
   const repos: RepoReport[] = []
-  for (const r of ctx.cfg.githubRepos) {
-    const rep = await g.inspect(r)
+  for (const r of (selectedRepo ? [selectedRepo] : ctx.cfg.githubRepos)) {
+    if (!ctx.cfg.githubRepos.some(x => x.toLowerCase() === r.toLowerCase())) throw new AgentError('Repo not allowed', 403, 'repo_not_allowed')
+    const rep = await g.inspect(r, selectedBranch, expectedSha)
     repos.push(rep)
     if (!rep.found) { issues.push({ severity: 'error', area: 'github', message: 'Repo not found or no access', target: r }); continue }
     for (const f of rep.committedEnvFiles || []) issues.push({ severity: 'critical', area: 'github', message: 'Env file committed to repo: ' + f, target: r })
@@ -116,11 +117,11 @@ async function safe<T>(label: string, area: Issue['area'], p: Promise<Part<T>>):
 }
 
 // ---------- actions ----------
-async function healthReport(ctx: Ctx): Promise<Out> {
+async function healthReport(ctx: Ctx, params: any = {}): Promise<Out> {
   const [vercel, rls, gh] = await Promise.all([
     safe('Vercel', 'vercel', collectVercel(ctx, { deployments: true, env: true })),
     safe('Supabase', 'supabase', collectRls(ctx)),
-    safe('GitHub', 'github', collectGithub(ctx))
+    safe('GitHub', 'github', collectGithub(ctx, params.repo ? String(params.repo) : undefined, params.branch ? String(params.branch) : undefined, params.branch_sha ? String(params.branch_sha) : undefined))
   ])
   const issues = sortIssues([...vercel.issues, ...rls.issues, ...gh.issues])
   const comp = (name: string, p: Part<unknown>) => ({ component: 'agent1_' + name, status: (!p.available ? 'degraded' : p.issues.some(i => i.severity === 'critical' || i.severity === 'error') ? 'degraded' : 'ok') as 'ok' | 'degraded', details: { reason: p.reason || null } })
@@ -253,8 +254,8 @@ async function applyDbChange(ctx: Ctx, p: any): Promise<Out> {
   })
 }
 
-async function githubStatus(ctx: Ctx): Promise<Out> {
-  const g = await collectGithub(ctx)
+async function githubStatus(ctx: Ctx, p: any = {}): Promise<Out> {
+  const g = await collectGithub(ctx, p.repo ? String(p.repo) : undefined, p.branch ? String(p.branch) : undefined, p.branch_sha ? String(p.branch_sha) : undefined)
   if (!g.available && g.reason) throw new AgentError(g.reason, 503, 'not_configured')
   return { result: { generated_at: now(), overall: overall(g.issues), counts: countIssues(g.issues), issues: sortIssues(g.issues), repos: g.data } }
 }
@@ -390,12 +391,13 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
 
 export async function runAction(ctx: Ctx, action: string, params: any = {}): Promise<any> {
   if (!(ACTIONS as readonly string[]).includes(action)) throw new AgentError('Unknown action', 400, 'unknown_action')
+  if (params.branch_context_required && ['health_report', 'github_status'].includes(action) && !params.branch) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
   switch (action as Action) {
     case 'heartbeat': {
       const agent = await ctx.store.heartbeat()
-      return { agent: { id: agent.id, name: agent.name, status: agent.status, last_heartbeat_at: agent.last_heartbeat_at }, ready: readiness(ctx.cfg), model: ctx.cfg.geminiModel }
+      return { agent: { id: agent.id, name: agent.name, status: agent.status, last_heartbeat_at: agent.last_heartbeat_at }, ready: readiness(ctx.cfg), repos: ctx.cfg.githubRepos, model: ctx.cfg.geminiModel }
     }
-    case 'health_report': return withTask(ctx, action, 'Infrastructure health report', {}, () => healthReport(ctx))
+    case 'health_report': return withTask(ctx, action, 'Infrastructure health report', { repo: params.repo || null, branch: params.branch || null }, () => healthReport(ctx, params))
     case 'vercel_status': return withTask(ctx, action, 'Vercel project & deployment status', {}, async () => partReport(ctx, await collectVercel(ctx, { deployments: true, env: false })))
     case 'env_audit': return withTask(ctx, action, 'Environment variable audit', {}, async () => partReport(ctx, await collectVercel(ctx, { deployments: false, env: true })))
     case 'supabase_schema': return withTask(ctx, action, 'Supabase schema inspection', { schema: params.schema || 'ai_control' }, () => schemaReport(ctx, params))
@@ -404,7 +406,8 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'apply_env_change': return applyEnvChange(ctx, params)
     case 'propose_db_change': return proposeDbChange(ctx, params)
     case 'apply_db_change': return applyDbChange(ctx, params)
-    case 'github_status': return withTask(ctx, action, 'GitHub repository status (read-only)', {}, () => githubStatus(ctx))
+    case 'github_branches': { const repo = String(params.repo || ctx.cfg.githubRepos[0] || ''); if (!ctx.cfg.githubRepos.includes(repo)) throw new AgentError('Repo not allowed', 403, 'repo_not_allowed'); return { result: { repo, branches: await new GitHub(ctx.cfg, ctx.calls).branches(repo) } } }
+    case 'github_status': return withTask(ctx, action, 'GitHub repository status (read-only)', { repo: params.repo || null, branch: params.branch || null }, () => githubStatus(ctx, params))
     case 'deploy_logs': return withTask(ctx, action, 'Vercel deployment error logs', { project: params.project || null }, () => deployLogs(ctx, params))
     case 'vercel_options': return vercelOptions(ctx)
     case 'request_redeploy': return requestRedeploy(ctx, params)

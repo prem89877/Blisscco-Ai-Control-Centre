@@ -117,6 +117,7 @@ async function gh(method: string, path: string, url: URL, body: any): Promise<Re
   if (p.startsWith('/git/matching-refs/heads/agent2/')) return json([...refs.keys()].filter(k => k.startsWith('agent2/')).map(k => ({ ref: 'refs/heads/' + k, object: { sha: refs.get(k) } })))
   if (p === '/actions/workflows') return json({ workflows: workflowList })
   if ((r = /^\/actions\/workflows\/(\d+)\/dispatches$/.exec(p)) && method === 'POST') { if (dispatchStatus !== 204) return json({ message: "Workflow does not have 'workflow_dispatch' trigger" }, dispatchStatus); dispatches.push({ id: r[1], ref: body.ref }); return new Response(null, { status: 204 }) }
+  if (p.startsWith('/branches')) { const all = [...refs.keys()].filter(k => !k.startsWith('agent2/') || true).sort(); const pg = Number(url.searchParams.get('page') || 1), per = Number(url.searchParams.get('per_page') || 30); return json(all.slice((pg - 1) * per, pg * per).map(k => ({ name: k, commit: { sha: refs.get(k) } }))) }
   if (p.startsWith('/commits')) return json([{ sha: refs.get('main'), commit: { message: 'init', author: { date: '2026-11-01' } } }])
   if (p.startsWith('/actions/runs') && !p.includes('/jobs')) { const b = url.searchParams.get('branch'); return json({ workflow_runs: runs.filter(x => !b || x.head_branch === b) }) }
   if (p.includes('/actions/runs/') && p.endsWith('/jobs')) return json({ jobs: [{ name: 'test-build', conclusion: 'failure', steps: [{ name: 'npm test', conclusion: 'failure' }] }] })
@@ -838,4 +839,128 @@ test('local_iterate: runs REAL checks, lets the model fix failures, re-runs, and
 test('local_iterate: refuses to run outside an agent2/* branch', async () => {
   const { w, home } = localRepo(); const ctx = lctx(w, home)
   await assert.rejects(runLocal(ctx, 'local_iterate', {}), /agent2/)
+})
+
+
+// ================================================================ dynamic GitHub branch selection
+function makeBranch(name: string, files: Record<string, string>) {
+  const t = new Map(treeOf(refs.get('main')!))
+  for (const [pth, c] of Object.entries(files)) t.set(pth, { mode: '100644', sha: putBlob(c) })
+  const s = putCommit(putTree(t), [refs.get('main')!], 'branch ' + name); refs.set(name, s); return s
+}
+const REL = 'release/1.0'
+const DEVFILE = 'export const onlyOnRelease = 1\n'
+
+test('branches: lists real branches incl. "/" names, flags the default, paginates beyond 100', async () => {
+  makeBranch(REL, { 'src/rel.js': DEVFILE })
+  for (let i = 0; i < 230; i++) refs.set('topic/t' + String(i).padStart(3, '0'), refs.get('main')!)
+  const r = (await ok('github_branches', { repo: REPO })).result
+  assert.equal(r.repo, REPO); assert.ok(r.branches.length >= 232)
+  assert.equal(r.branches.filter((b: any) => b.default).map((b: any) => b.name).join(), 'main')
+  assert.ok(r.branches.some((b: any) => b.name === REL && b.sha === refs.get(REL)))
+  await must('github_branches', { repo: 'evil/other' }, 403, 'repo_not_allowed')
+  assert.equal(ghWrites.length, 0)
+})
+test('inspect: reads code from a NON-default branch ("/" in name), pinned to its SHA; main content is not used', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE })
+  const r = (await ok('repo_inspect', { repo: REPO, ref: REL, branch_sha: sha, path: 'src/rel.js' })).result
+  assert.equal(r.content, DEVFILE); assert.equal(r.ref, REL); assert.equal(r.branch_sha, sha)
+  await must('repo_inspect', { repo: REPO, path: 'src/rel.js' }, 404) // default branch does not have it
+  assert.equal((await ok('repo_inspect', { repo: REPO, ref: REL })).result.file_count, 6)
+})
+test('inspect: moved or deleted selected branch is refused, never replaced by main', async () => {
+  const sha = makeBranch(REL, {})
+  await must('repo_inspect', { repo: REPO, ref: REL, branch_sha: 'f'.repeat(40) }, 409, 'base_changed')
+  refs.delete(REL)
+  const r = await post({ action: 'repo_inspect', params: { repo: REPO, ref: REL, branch_sha: sha } })
+  assert.ok(r.status >= 400 && r.status < 500, JSON.stringify(r.body))
+})
+test('server enforcement: branch_context_required without any branch is rejected (no default fallback)', async () => {
+  for (const a of ['repo_inspect', 'actions_status', 'propose_change', 'dev_chat']) await must(a, { repo: REPO, branch_context_required: true, title: 't', message: 'hi' }, 400, 'branch_required')
+  noWrites()
+})
+test('actions_status: CI is read for the selected branch, SHA-checked when a context SHA is sent', async () => {
+  const sha = makeBranch(REL, {})
+  runs = [{ id: 5, name: 'CI', status: 'completed', conclusion: 'success', head_branch: REL, head_sha: sha, html_url: 'u' }, { id: 6, name: 'CI', status: 'completed', conclusion: 'failure', head_branch: 'main', head_sha: 'x', html_url: 'u' }]
+  const r = (await ok('actions_status', { repo: REPO, branch: REL, branch_sha: sha })).result
+  assert.equal(r.overall, 'passing'); assert.equal(r.branch, REL); assert.equal(r.branch_sha, sha)
+  await must('actions_status', { repo: REPO, branch: REL, branch_sha: 'e'.repeat(40) }, 409, 'base_changed')
+  refs.delete(REL); await must('actions_status', { repo: REPO, branch: REL, branch_sha: sha }, 404, 'branch_not_found')
+})
+test('proposal from a selected base: base branch/SHA, working branch, commit destination and CI target are reported separately', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE })
+  const r = await ok('propose_change', { repo: REPO, base: REL, expected_base_sha: sha, title: 'Edit rel', files: [{ path: 'src/rel.js', op: 'update', content: 'export const onlyOnRelease = 2\n' }] })
+  assert.equal(ghWrites.length, 0)
+  const d = db.approvals.find(a => a.id === r.result.approval_id)!.details
+  assert.equal(d.repo, REPO); assert.equal(d.base_branch, REL); assert.equal(d.base_sha, sha)
+  assert.match(d.working_branch, /^agent2\//); assert.equal(d.commit_destination, d.working_branch); assert.equal(d.ci_target_branch, d.working_branch)
+  assert.notEqual(d.working_branch, d.base_branch)
+  assert.equal(r.result.base_branch, REL); assert.equal(r.result.base_sha, sha); assert.equal(r.result.working_branch, d.working_branch)
+})
+test('proposal: file that exists only on the selected branch can be modified; the same request on main fails; unknown base never falls back', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE })
+  const files = [{ path: 'src/rel.js', op: 'update', content: 'x\n' }]
+  await must('propose_change', { repo: REPO, title: 't', files }, 404) // default branch: file does not exist
+  await ok('propose_change', { repo: REPO, base: REL, title: 't', files })
+  await must('propose_change', { repo: REPO, base: 'no/such-branch', title: 't', files }, 404, 'not_found')
+  await must('propose_change', { repo: REPO, base: REL, expected_base_sha: 'd'.repeat(40), title: 't', files }, 409, 'base_changed')
+  assert.ok(sha); noWrites()
+})
+test('apply: working branch is created from the SELECTED base SHA; commit goes only to agent2/*; base and main untouched', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE }); const mainBefore = refs.get('main')!
+  const r = await ok('propose_change', { repo: REPO, base: REL, expected_base_sha: sha, title: 'Edit rel', files: [{ path: 'src/rel.js', op: 'update', content: 'export const onlyOnRelease = 2\n' }] })
+  approve(r.result.approval_id)
+  const a = (await ok('apply_change', { approval_id: r.result.approval_id })).result
+  assert.match(a.branch, /^agent2\//); assert.equal(a.base_branch, REL); assert.equal(a.base_sha, sha)
+  assert.equal(a.working_branch, a.branch); assert.equal(a.commit_destination, a.branch); assert.equal(a.ci_target_branch, a.branch)
+  assert.deepEqual(commits.get(a.commit_sha)!.parents, [sha])
+  assert.equal(blobs.get(trees.get(commits.get(a.commit_sha)!.tree)!.get('src/rel.js')!.sha), 'export const onlyOnRelease = 2\n')
+  assert.equal(refs.get(REL), sha); assert.equal(refs.get('main'), mainBefore)
+  assert.ok(branchesWritten().length > 0 && branchesWritten().every(x => x.includes('agent2/')), branchesWritten().join('\n'))
+  assert.match(a.compare_url, /compare\/release\/1\.0\.\.\.agent2\//)
+})
+test('approval is bound to repo+branch+SHA: base moved after proposal -> nothing written, approval not consumed', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE })
+  const r = await ok('propose_change', { repo: REPO, base: REL, expected_base_sha: sha, title: 'Edit rel', files: [{ path: 'src/rel.js', op: 'update', content: 'y\n' }] })
+  approve(r.result.approval_id)
+  refs.set(REL, putCommit(putTree(new Map(treeOf(sha))), [sha], 'someone pushed'))
+  await must('apply_change', { approval_id: r.result.approval_id }, 409, 'base_changed'); noWrites()
+  assert.equal(db.approvals.find(a => a.id === r.result.approval_id)!.status, 'approved')
+  assert.equal(db.approvals.find(a => a.id === r.result.approval_id)!.details.executed_at, undefined)
+  refs.delete(REL); await must('apply_change', { approval_id: r.result.approval_id }, 409, 'base_changed'); noWrites()
+})
+test('production protection stays: protected/base branches can never be a write destination or be promoted directly', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE })
+  for (const b of ['main', REL]) { await must('request_promote', { repo: REPO, branch: b }, 403, 'branch_blocked'); await must('request_rollback', { repo: REPO, branch: b }, 403, 'branch_blocked') }
+  const r = await ok('propose_change', { repo: REPO, base: 'main', title: 'x', files: [{ path: 'src/App.jsx', op: 'update', content: 'z\n' }] })
+  assert.match(db.approvals.find(a => a.id === r.result.approval_id)!.details.branch, /^agent2\//)
+  noWrites(); assert.equal(refs.get(REL), sha)
+})
+test('promote merges into the branch the work was based on (separate approval + production tick), not blindly into the default branch', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE }); const mainBefore = refs.get('main')!
+  const r = await ok('propose_change', { repo: REPO, base: REL, expected_base_sha: sha, title: 'Edit rel', files: [{ path: 'src/rel.js', op: 'update', content: 'export const onlyOnRelease = 3\n' }] })
+  approve(r.result.approval_id)
+  const a = (await ok('apply_change', { approval_id: r.result.approval_id })).result
+  const pr = await ok('request_promote', { repo: REPO, branch: a.branch })
+  const d = db.approvals.at(-1)!.details
+  assert.equal(d.base_branch, REL); assert.equal(d.branch, a.branch); assert.match(db.approvals.at(-1)!.title, /release\/1\.0/)
+  await must('apply_promote', { approval_id: pr.result.approval_id }, 409, 'not_approved')
+  assert.equal(refs.get(REL), sha); assert.equal(refs.get('main'), mainBefore)
+})
+test('dev_chat: analysis uses code of the selected branch only', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE })
+  chatReply = JSON.stringify({ mode: 'answer', answer: 'ok' })
+  const r = await ok('dev_chat', { repo: REPO, message: 'explain src/rel.js', ref: REL, branch_sha: sha })
+  assert.ok((r.context_files || r.result.context_files).includes('src/rel.js'), JSON.stringify(r))
+  assert.ok(geminiInputs.at(-1)!.input.includes('onlyOnRelease'))
+  await must('dev_chat', { repo: REPO, message: 'explain src/rel.js', ref: REL, branch_sha: 'c'.repeat(40) }, 409, 'base_changed')
+})
+test('dev_proposal: proposal is generated from the selected base branch and pinned to its SHA', async () => {
+  const sha = makeBranch(REL, { 'src/rel.js': DEVFILE })
+  devPlanReply = plan([{ path: 'src/rel.js' }])
+  const r = await proposal('change rel.js', { ref: REL, base: REL, branch_sha: sha })
+  assert.equal(r.status, 'awaiting_approval'); noWrites()
+  const ap = db.approvals.find(a => a.details.kind === 'code_change')!
+  assert.equal(ap.details.base_branch, REL); assert.equal(ap.details.base_sha, sha); assert.match(ap.details.working_branch, /^agent2\//)
+  await must('dev_proposal', { repo: REPO, request: 'change rel.js', ref: REL, base: REL, branch_sha: 'a'.repeat(40) }, 409, 'base_changed')
 })

@@ -36,6 +36,17 @@ export class GitHub {
 
   async info(repo: string) { const b = await this.call('GET', '/repos/' + this.repo(repo)); return { default_branch: String(b.default_branch), pushed_at: b.pushed_at as string, private: Boolean(b.private) } }
 
+  async branches(repo: string): Promise<{ name: string; default: boolean; sha: string }[]> {
+    const info = await this.call('GET', `/repos/${this.repo(repo)}`)
+    const out: any[] = []
+    for (let page = 1; page <= 100; page++) {
+      const rows = await this.call('GET', `/repos/${this.repo(repo)}/branches?per_page=100&page=${page}`)
+      out.push(...rows)
+      if (rows.length < 100) break
+    }
+    return out.map(b => ({ name: String(b.name), default: b.name === info.default_branch, sha: String(b.commit.sha) }))
+  }
+
   async branchSha(repo: string, branch: string): Promise<string | null> {
     const b = await this.call('GET', `/repos/${this.repo(repo)}/git/ref/heads/${branch.split('/').map(encodeURIComponent).join('/')}`, undefined, true)
     return b ? String(b.object.sha) : null

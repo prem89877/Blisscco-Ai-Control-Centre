@@ -10,7 +10,7 @@ import type { Finding } from './checks.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number>; adopt?: string; worker?: boolean; exec?: ExecFn }
-export const ACTIONS = ['heartbeat', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task', 'queue_local', 'request_local_command', 'queue_local_command', 'local_check', 'local_command'] as const
+export const ACTIONS = ['heartbeat', 'github_branches', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task', 'queue_local', 'request_local_command', 'queue_local_command', 'local_check', 'local_command'] as const
 export type Action = typeof ACTIONS[number]
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
 export const now = () => new Date().toISOString()
@@ -297,7 +297,7 @@ async function dbTest(ctx: Ctx): Promise<Out> {
 
 // ---------------------------------------------------------------- 6. security
 export const BUNDLE_LIMIT = 8
-export async function securityChecks(ctx: Ctx, origin: string, repo?: string) {
+export async function securityChecks(ctx: Ctx, origin: string, repo?: string, branch?: string, expectedSha?: string) {
   const f: Finding[] = [], ev: Ev[] = []
   // headers
   const home = await hit(ctx, origin, '/')
@@ -341,13 +341,17 @@ export async function securityChecks(ctx: Ctx, origin: string, repo?: string) {
     const gh = new GitHub(ctx.cfg, ctx.calls)
     const rp = validRepo(repo)
     if (!gh.repoAllowed(rp)) throw new AgentError('Repo not in AGENT3_GITHUB_REPOS', 403, 'repo_not_allowed')
-    const tree = await gh.tree(rp)
+    const selected = branch ? String(branch) : ''
+    const branchSha = selected ? await gh.branchSha(rp, selected) : null
+    if (selected && !branchSha) throw new AgentError('Selected branch no longer exists: ' + selected, 404, 'branch_not_found')
+    if (expectedSha && branchSha && branchSha.toLowerCase() !== expectedSha.toLowerCase()) throw new AgentError('Selected branch moved. Refresh before running QA.', 409, 'base_changed')
+    const tree = await gh.tree(rp, branchSha || undefined)
     const code = tree.filter(t => t.type === 'blob' && /\.(js|jsx|ts|tsx|json|md|yml|yaml|sql|html|toml)$/i.test(t.path) && !/(package-lock\.json|node_modules|\.min\.)/.test(t.path) && (t.size || 0) < 200_000).slice(0, 120)
     const envFiles = tree.filter(t => t.type === 'blob' && /(^|\/)\.env(\..+)?$/.test(t.path) && !/\.(example|sample|template)$/.test(t.path))
     for (const e of envFiles) f.push({ id: 'sec.env_committed', area: 'security', severity: 'critical', title: '.env file committed to the repository', evidence: e.path, fix: 'Remove it from git history, rotate every key inside, add to .gitignore.', target: e.path })
     let repoHits = 0
     for (let i = 0; i < code.length; i += 10) {
-      const batch = await Promise.all(code.slice(i, i + 10).map(async t => ({ t, txt: await gh.file(rp, t.path) })))
+      const batch = await Promise.all(code.slice(i, i + 10).map(async t => ({ t, txt: await gh.file(rp, t.path, 400_000, branchSha || branch) })))
       for (const { t, txt } of batch) {
         if (!txt) continue
         const hits = C.analyzeBundleText(t.path, txt)
@@ -355,18 +359,18 @@ export async function securityChecks(ctx: Ctx, origin: string, repo?: string) {
       }
     }
     ev.push({ check: 'Secrets in repository (code, config, SQL)', ok: repoHits === 0 && !envFiles.length, detail: `${code.length} file(s) scanned, ${repoHits} hit(s), ${envFiles.length} committed .env` })
-    const dep = await depAudit(ctx, gh, rp)
+    const dep = await depAudit(ctx, gh, rp, branchSha || branch)
     f.push(...dep.f); ev.push(dep.ev)
   } else ev.push({ check: 'Repository secrets + dependency vulnerabilities', ok: false, detail: 'SKIPPED: pass a repo and set AGENT3_GITHUB_TOKEN / AGENT3_GITHUB_REPOS' })
   return { f, ev }
 }
 
-async function depAudit(ctx: Ctx, gh: GitHub, repo: string): Promise<{ f: Finding[]; ev: Ev }> {
-  const pkgText = await gh.file(repo, 'package.json')
+async function depAudit(ctx: Ctx, gh: GitHub, repo: string, branch?: string): Promise<{ f: Finding[]; ev: Ev }> {
+  const pkgText = await gh.file(repo, 'package.json', 400_000, branch)
   if (!pkgText) return { f: [], ev: { check: 'Dependency vulnerabilities', ok: false, detail: 'SKIPPED: no package.json' } }
   const versions = new Map<string, Set<string>>()
   const add = (n: string, v: string) => { if (/^\d+\.\d+\.\d+/.test(v)) { if (!versions.has(n)) versions.set(n, new Set()); versions.get(n)!.add(v.split(/[-+]/)[0]) } }
-  const lock = await gh.file(repo, 'package-lock.json', 3_000_000)
+  const lock = await gh.file(repo, 'package-lock.json', 3_000_000, branch)
   let source = 'package-lock.json'
   if (lock) { try { for (const [k, v] of Object.entries((JSON.parse(lock).packages || {}) as Record<string, any>)) { const m = /node_modules\/((?:@[^/]+\/)?[^/]+)$/.exec(k); if (m && v.version) add(m[1], v.version) } } catch { /* fall through */ } }
   if (!versions.size) { source = 'package.json (ranges, approximate)'; const p = JSON.parse(pkgText); for (const [n, v] of Object.entries({ ...(p.dependencies || {}), ...(p.devDependencies || {}) })) add(n, String(v).replace(/^[\^~>=<\s]+/, '')) }
@@ -382,11 +386,26 @@ async function depAudit(ctx: Ctx, gh: GitHub, repo: string): Promise<{ f: Findin
   }
   return { f, ev: { check: 'Dependency vulnerabilities (npm advisories)', ok: !f.some(x => ['critical', 'high'].includes(x.severity)), detail: `${versions.size} package(s) from ${source}, ${f.length} advisory(ies)` } }
 }
+// Resolve + verify the owner-selected branch BEFORE any test runs. A deleted or moved branch fails the whole run loudly;
+// it is never swallowed into a "section failed" note and never replaced by the default branch.
+async function resolveBranchCtx(ctx: Ctx, p: any, repo?: string): Promise<{ repo: string | null; branch: string | null; branch_sha: string | null }> {
+  if (!p.branch) return { repo: repo || null, branch: null, branch_sha: null }
+  if (!repo || !ctx.cfg.githubToken) throw new AgentError('A branch is selected but no GitHub repository/token is configured for Agent 3', 400, 'branch_unavailable')
+  const gh = new GitHub(ctx.cfg, ctx.calls)
+  const rp = validRepo(repo)
+  if (!gh.repoAllowed(rp)) throw new AgentError('Repo not in AGENT3_GITHUB_REPOS', 403, 'repo_not_allowed')
+  const sha = await gh.branchSha(rp, String(p.branch))
+  if (!sha) throw new AgentError('Selected branch no longer exists: ' + p.branch, 404, 'branch_not_found')
+  if (p.branch_sha && sha.toLowerCase() !== String(p.branch_sha).toLowerCase()) throw new AgentError('Selected branch moved. Refresh before running QA.', 409, 'base_changed')
+  return { repo: rp, branch: String(p.branch), branch_sha: sha }
+}
 async function securityScan(ctx: Ctx, p: any): Promise<Out> {
   const origin = pickTarget(ctx, p)
-  return withTask(ctx, 'security_scan', 'Security scan ' + origin, { target: origin, repo: p.repo || null }, async () => {
-    const { f, ev } = await securityChecks(ctx, origin, p.repo ? String(p.repo) : ctx.cfg.githubRepos[0])
-    return { result: report('Security: secrets, auth bypass, headers, input validation, dependencies', f, ev, { target: origin }) }
+  const repo = p.repo ? String(p.repo) : ctx.cfg.githubRepos[0]
+  const bc = await resolveBranchCtx(ctx, p, repo)
+  return withTask(ctx, 'security_scan', 'Security scan ' + origin, { target: origin, repo: p.repo || null, branch: bc.branch, branch_sha: bc.branch_sha }, async () => {
+    const { f, ev } = await securityChecks(ctx, origin, repo, bc.branch || undefined, bc.branch_sha || undefined)
+    return { result: report('Security: secrets, auth bypass, headers, input validation, dependencies', f, ev, { target: origin, repo: bc.repo, branch: bc.branch, branch_sha: bc.branch_sha }) }
   })
 }
 
@@ -394,7 +413,8 @@ async function securityScan(ctx: Ctx, p: any): Promise<Out> {
 async function fullReport(ctx: Ctx, p: any): Promise<Out> {
   const origin = pickTarget(ctx, p)
   const repo = p.repo ? String(p.repo) : ctx.cfg.githubRepos[0]
-  return withTask(ctx, 'full_report', 'Full QA & security report ' + origin, { target: origin, repo: repo || null }, async () => {
+  const bc = await resolveBranchCtx(ctx, p, repo)
+  return withTask(ctx, 'full_report', 'Full QA & security report ' + origin, { target: origin, repo: repo || null, branch: bc.branch, branch_sha: bc.branch_sha }, async () => {
     const parts: { name: string; f: Finding[]; ev: Ev[] }[] = []
     const guarded = async (name: string, fn: () => Promise<{ f: Finding[]; ev: Ev[] }>) => {
       try { parts.push({ name, ...(await fn()) }) } catch (e) { parts.push({ name, f: [], ev: [{ check: name, ok: false, detail: 'FAILED TO RUN: ' + errMsg(e).slice(0, 160) }] }) }
@@ -404,13 +424,13 @@ async function fullReport(ctx: Ctx, p: any): Promise<Out> {
       guarded('auth', () => authChecks(ctx, origin)),
       guarded('api', () => apiChecks(ctx, origin)),
       guarded('database', () => dbChecks(ctx)),
-      guarded('security', () => securityChecks(ctx, origin, repo))
+      guarded('security', () => securityChecks(ctx, origin, repo, bc.branch || undefined, bc.branch_sha || undefined))
     ])
     const ORDER = ['website', 'auth', 'api', 'database', 'security']
     parts.sort((a, b) => ORDER.indexOf(a.name) - ORDER.indexOf(b.name))
     const findings = parts.flatMap(x => x.f)
     const evidence = parts.flatMap(x => x.ev.map(e => ({ ...e, check: x.name + ': ' + e.check })))
-    const rep: any = report('Full QA, Testing & Security report', findings, evidence, { target: origin, sections: parts.map(x => ({ name: x.name, findings: x.f.length, tests: x.ev.length, passed: x.ev.filter(e => e.ok).length })), not_run: evidence.filter(e => /SKIPPED|FAILED TO RUN/.test(e.detail)).map(e => e.check), billing_safety: 'No billing event, charge, earning or payout was created. Billing-risk endpoints received only no-key/invalid-key requests. Database access was read-only.', rate_limit: 'Not run automatically: needs your approval (Rate-limit test).' })
+    const rep: any = report('Full QA, Testing & Security report', findings, evidence, { target: origin, repo: repo || null, branch: bc.branch, branch_sha: bc.branch_sha, sections: parts.map(x => ({ name: x.name, findings: x.f.length, tests: x.ev.length, passed: x.ev.filter(e => e.ok).length })), not_run: evidence.filter(e => /SKIPPED|FAILED TO RUN/.test(e.detail)).map(e => e.check), billing_safety: 'No billing event, charge, earning or payout was created. Billing-risk endpoints received only no-key/invalid-key requests. Database access was read-only.', rate_limit: 'Not run automatically: needs your approval (Rate-limit test).' })
     const ai = await summarize(ctx.cfg, { verdict: rep.verdict, counts: rep.counts, top: rep.findings.slice(0, 15).map((x: Finding) => ({ sev: x.severity, title: x.title, target: x.target, fix: x.fix })), not_run: rep.not_run })
     await recordAi(ctx, 'summary', ai)
     if (ai.text) rep.ai_summary = ai.text; else rep.ai_note = ai.error
@@ -426,12 +446,12 @@ async function retest(ctx: Ctx, p: any): Promise<any> {
   if (!old || !pl || !RETESTABLE.includes(pl.action)) throw new AgentError('Task cannot be retested', 404, 'not_found')
   const key = (f: Finding) => f.id + '|' + (f.target || '')
   const before = new Map<string, Finding>(((old.result && old.result.findings) || []).map((f: Finding) => [key(f), f]))
-  const fresh: any = await runAction(ctx, pl.action, { target: pl.target, repo: pl.repo || undefined })
+  const fresh: any = await runAction(ctx, pl.action, { target: pl.target, repo: pl.repo || undefined, ...(pl.branch ? { branch: pl.branch, branch_context_required: true } : {}) })
   const after = new Map<string, Finding>(((fresh.result && fresh.result.findings) || []).map((f: Finding) => [key(f), f]))
   const fixed = [...before.keys()].filter(k => !after.has(k)).map(k => before.get(k)!)
   const still = [...after.keys()].filter(k => before.has(k)).map(k => after.get(k)!)
   const added = [...after.keys()].filter(k => !before.has(k)).map(k => after.get(k)!)
-  const retestResult = { retest_of: old.id, action: pl.action, fixed: fixed.map(f => f.title + ' (' + (f.target || '') + ')'), still_failing: still.map(f => f.severity + ': ' + f.title + ' (' + (f.target || '') + ')'), new_findings: added.map(f => f.severity + ': ' + f.title + ' (' + (f.target || '') + ')'), verdict_before: old.result && old.result.verdict, verdict_after: fresh.result && fresh.result.verdict }
+  const retestResult = { retest_of: old.id, action: pl.action, repo: pl.repo || null, branch: pl.branch || null, previous_branch_sha: pl.branch_sha || null, branch_sha: (fresh.result && fresh.result.branch_sha) || null, fixed: fixed.map(f => f.title + ' (' + (f.target || '') + ')'), still_failing: still.map(f => f.severity + ': ' + f.title + ' (' + (f.target || '') + ')'), new_findings: added.map(f => f.severity + ': ' + f.title + ' (' + (f.target || '') + ')'), verdict_before: old.result && old.result.verdict, verdict_after: fresh.result && fresh.result.verdict }
   await ctx.store.log('info', 'agent3_retest', `${fixed.length} fixed, ${still.length} still failing, ${added.length} new`, { retest_of: old.id, new_task: fresh.task_id }, fresh.task_id, ctx.actor.id)
   return { task_id: fresh.task_id, status: 'succeeded', result: { ...fresh.result, retest: retestResult } }
 }
@@ -536,8 +556,10 @@ async function heartbeat(ctx: Ctx): Promise<any> {
 }
 
 export async function runAction(ctx: Ctx, action: string, params: any = {}): Promise<any> {
+  if (params.branch_context_required && ['security_scan', 'full_report'].includes(action) && !params.branch) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
   switch (action as Action) {
     case 'heartbeat': return heartbeat(ctx)
+    case 'github_branches': { const gh = new GitHub(ctx.cfg, ctx.calls); const repo = validRepo(String(params.repo || ctx.cfg.githubRepos[0] || '')); if (!gh.repoAllowed(repo)) throw new AgentError('Repo not in AGENT3_GITHUB_REPOS', 403, 'repo_not_allowed'); return { result: { repo, branches: await gh.branches(repo) } } }
     case 'website_smoke': return websiteSmoke(ctx, params)
     case 'auth_check': return authCheck(ctx, params)
     case 'api_test': return apiTest(ctx, params)

@@ -1,3 +1,5 @@
+import { BranchSelector } from './BranchSelector.jsx'
+import { scopeParams } from './branchContext.js'
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import { Badge, Err, CodeBlock, usePoll, q } from './ui.jsx'
@@ -9,7 +11,7 @@ export async function callAgent3(action, params = {}) {
   const r = await fetch('/api/agent3', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-    body: JSON.stringify({ action, params })
+    body: JSON.stringify({ action, params: scopeParams('agent3', action, params) })
   })
   const body = await r.json().catch(() => ({}))
   if (!r.ok) throw new Error(body.error || 'Request failed (' + r.status + ')')
@@ -44,6 +46,7 @@ function Report({ res, onRetest }) {
   return (
     <div className="card">
       <div className="row"><b>{r.title || 'Result'}</b><Badge s={res.status === 'queued' ? 'queued' : waiting ? 'awaiting_approval' : r.verdict === 'fail' ? 'failed' : r.verdict === 'attention' ? 'degraded' : 'ok'} /></div>
+      {(r.repo || r.branch) && <CodeBlock label="GitHub branch context" tone="info" text={[r.repo && 'Repository: ' + r.repo, r.branch && 'Branch: ' + r.branch, r.branch_sha && 'Commit: ' + String(r.branch_sha).slice(0, 7)].filter(Boolean).join('\\n')} wrap={false} />}
       {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
       {r.unsupported && <CodeBlock label="not done" tone="warn" text={r.message} />}
       {r.verdict && <div className="sub" style={{ margin: '6px 0' }}>Verdict: <b>{r.verdict.toUpperCase()}</b> | {r.tests_passed}/{r.tests_run} checks ok | critical {c.critical} | high {c.high} | medium {c.medium} | low {c.low}</div>}
@@ -214,6 +217,7 @@ export default function Agent3Panel() {
           <div className="sub" style={{ marginTop: 6 }}>{hb.safety}</div>
         </div>
       )}
+      <BranchSelector agent="agent3" repos={repos} initialRepo={repos[0] || ''} call={callAgent3} />
       {res && <Report res={res} onRetest={id => run('retest', { task_id: id })} />}
       <PendingInline kinds={['rate_test', 'local_command']} onDone={reload} />
       {rows.length > 0 && <><div className="sec-title">Approved - ready to run</div>{rows.map(a => <Apply key={a.id} a={a} onDone={reload} onResult={setRes} setErr={setErr} />)}</>}

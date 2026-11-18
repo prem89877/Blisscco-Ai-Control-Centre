@@ -13,14 +13,30 @@ export class GitHub {
     return r.body
   }
   repoAllowed(repo: string) { return this.cfg.githubRepos.some(r => r.toLowerCase() === repo.toLowerCase()) }
-  async tree(repo: string): Promise<{ path: string; type: string; size?: number; sha: string }[]> {
+  async branches(repo: string): Promise<{ name: string; default: boolean; sha: string }[]> {
     const info = await this.get(`/repos/${repo}`)
     if (!info) throw new AgentError('Repo not found', 404, 'not_found')
-    const t = await this.get(`/repos/${repo}/git/trees/${encodeURIComponent(info.default_branch)}?recursive=1`)
+    const out: any[] = []
+    for (let page = 1; page <= 100; page++) {
+      const rows = await this.get(`/repos/${repo}/branches?per_page=100&page=${page}`)
+      if (!rows) throw new AgentError('Branch list unavailable', 404, 'not_found')
+      out.push(...rows)
+      if (rows.length < 100) break
+    }
+    return out.map(b => ({ name: String(b.name), default: b.name === info.default_branch, sha: String(b.commit.sha) }))
+  }
+  async branchSha(repo: string, branch: string): Promise<string | null> {
+    const b = await this.get(`/repos/${repo}/git/ref/heads/${branch.split('/').map(encodeURIComponent).join('/')}`)
+    return b?.object?.sha ? String(b.object.sha) : null
+  }
+  async tree(repo: string, branch?: string): Promise<{ path: string; type: string; size?: number; sha: string }[]> {
+    const info = await this.get(`/repos/${repo}`)
+    if (!info) throw new AgentError('Repo not found', 404, 'not_found')
+    const t = await this.get(`/repos/${repo}/git/trees/${encodeURIComponent(branch || info.default_branch)}?recursive=1`)
     return (t && t.tree) || []
   }
-  async file(repo: string, path: string, max = 400_000): Promise<string | null> {
-    const f = await this.get(`/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}`)
+  async file(repo: string, path: string, max = 400_000, branch?: string): Promise<string | null> {
+    const f = await this.get(`/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(branch || (await this.get(`/repos/${repo}`)).default_branch)}`)
     if (!f || Array.isArray(f) || !f.content) return null
     if (f.size > max) return null
     return Buffer.from(String(f.content).replace(/\n/g, ''), 'base64').toString('utf8')

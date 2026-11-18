@@ -1,3 +1,5 @@
+import { BranchSelector } from './BranchSelector.jsx'
+import { scopeParams } from './branchContext.js'
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import { Badge, Err, CodeBlock, usePoll, q } from './ui.jsx'
@@ -9,7 +11,7 @@ export async function callAgent2(action, params = {}) {
   const r = await fetch('/api/agent2', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-    body: JSON.stringify({ action, params })
+    body: JSON.stringify({ action, params: scopeParams('agent2', action, params) })
   })
   const body = await r.json().catch(() => ({}))
   if (!r.ok) throw new Error(body.error || 'Request failed (' + r.status + ')')
@@ -37,6 +39,9 @@ function Report({ res }) {
   if (r.commit_sha) lines.push('commit: ' + String(r.commit_sha).slice(0, 7))
   if (r.merge_sha) lines.push('merge: ' + String(r.merge_sha).slice(0, 7))
   if (r.base) lines.push('base: ' + r.base)
+  if (r.base_branch) lines.push('base branch: ' + r.base_branch)
+  if (r.base_sha) lines.push('base SHA: ' + String(r.base_sha).slice(0, 7))
+  if (r.working_branch) lines.push('working branch: ' + r.working_branch)
   if (r.overall) lines.push('CI: ' + r.overall)
   if (r.deployment_trigger) lines.push('deployment: ' + r.deployment_trigger)
   if (r.pr_url) lines.push('PR: ' + r.pr_url)
@@ -49,6 +54,7 @@ function Report({ res }) {
   return (
     <div className="card">
       <div className="row"><b>Result</b><Badge s={waiting ? 'awaiting_approval' : 'ok'} /></div>
+      {lines.length > 0 && <CodeBlock label="GitHub branch context" tone="info" text={lines.join('\\n')} wrap={false} />}
       {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
       {r.needs_split && <CodeBlock label="too big for one proposal" tone="warn" text={r.message} />}
       {r.dev_report && <DevReport r={r.dev_report} />}
@@ -218,7 +224,7 @@ function Apply({ a, onDone, onResult, setErr }) {
   return (
     <div className="card">
       <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
-      {d.kind === 'code_change' && <div className="sub">{d.files.length} file(s) to {d.branch}</div>}
+      {d.kind === 'code_change' && <div className="sub">{d.repo} | base: {d.base_branch}@{String(d.base_sha || '').slice(0, 7)} | working: {d.working_branch || d.branch} | commit: {d.commit_destination || d.branch} | CI: {d.ci_target_branch || d.branch} | {d.files.length} file(s)</div>}
       {needAck && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> {k.ackText}</label>}
       <button className="btn ok" disabled={busy || (needAck && !ack)} onClick={go}>{busy ? k.busy : k.label}</button>
     </div>
@@ -386,7 +392,7 @@ function Proposals({ mode, onResult, setErr }) {
       {rows.map(a => (
         <div className="card" key={a.id}>
           <div className="row"><b>{a.title}</b><Badge s={a.details.executed_at ? 'ok' : a.status} /></div>
-          <div className="sub">{(a.details.files || []).length} file(s) &rarr; {a.details.branch}{a.details.commit_sha ? ' @' + String(a.details.commit_sha).slice(0, 7) : ''}</div>
+          <div className="sub">{(a.details.files || []).length} file(s) &rarr; working: {a.details.branch} | base: {a.details.base_branch || '-'} @ {String(a.details.base_sha || '').slice(0, 7)}{a.details.commit_sha ? ' | commit @' + String(a.details.commit_sha).slice(0, 7) : ''}</div>
           {(a.details.warnings || []).length > 0 && <CodeBlock label="warnings" tone="warn" text={a.details.warnings.join('\n')} />}
           <div className="actions">
             <button className="btn ghost" onClick={() => setOpen(open === a.id ? '' : a.id)}>{open === a.id ? 'Hide' : mode === 'pending' ? 'Details' : 'Report'}</button>
@@ -429,6 +435,7 @@ export default function Agent2Panel() {
           <div className="sub" style={{ marginTop: 6 }}>Never writes to: {(hb.protected_branches || []).join(', ')}. Works only on agent2/* branches.</div>
         </div>
       )}
+      <BranchSelector agent="agent2" repos={repos} initialRepo={repos[0] || ''} call={callAgent2} />
       {res && <Report res={res} />}
       <PendingInline kinds={[...Object.keys(APPLY), 'git_push', 'command']} onDone={reload} />
       {remote.length > 0 && <><div className="sec-title">Approved - ready to apply</div>{remote.map(a => <Apply key={a.id} a={a} onDone={reload} onResult={setRes} setErr={setErr} />)}</>}

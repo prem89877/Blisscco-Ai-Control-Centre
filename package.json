@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "agent1": "tsc -p agent1/tsconfig.json && node agent1/dist/cli.js",
     "agent2": "tsc -p agent2/tsconfig.json && node agent2/dist/cli.js",
-    "test": "tsc -p agent1/tsconfig.json && tsc -p agent2/tsconfig.json && tsc -p agent3/tsconfig.json && tsc -p orchestrator/tsconfig.json && node --test \"agent1/dist/*.test.js\" \"agent2/dist/*.test.js\" \"agent3/dist/*.test.js\" \"orchestrator/dist/orchestrator/*.test.js\"",
+    "test": "tsc -p agent1/tsconfig.json && tsc -p agent2/tsconfig.json && tsc -p agent3/tsconfig.json && tsc -p orchestrator/tsconfig.json && node --test \"agent1/dist/*.test.js\" \"agent2/dist/*.test.js\" \"agent3/dist/*.test.js\" \"orchestrator/dist/orchestrator/*.test.js\" \"src/*.test.js\"",
     "agent3": "tsc -p agent3/tsconfig.json && node agent3/dist/cli.js"
   },
   "dependencies": {

@@ -1,3 +1,5 @@
+import { BranchSelector } from './BranchSelector.jsx'
+import { scopeParams } from './branchContext.js'
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
 import { Badge, Err, CodeBlock, usePoll, q, timeAgo } from './ui.jsx'
@@ -9,7 +11,7 @@ export async function callAgent1(action, params = {}) {
   const r = await fetch('/api/agent1', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-    body: JSON.stringify({ action, params })
+    body: JSON.stringify({ action, params: scopeParams('agent1', action, params) })
   })
   const body = await r.json().catch(() => ({}))
   if (!r.ok) throw new Error(body.error || 'Request failed (' + r.status + ')')
@@ -46,10 +48,12 @@ function Report({ res }) {
   }
   const tone = r.overall === 'critical' ? 'bad' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'info' : 'good'
   const badge = r.overall === 'critical' ? 'error' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'awaiting_approval' : 'ok'
+  const branchInfo = (r.repos || []).map(x => x.repo + ' @ ' + (x.branch || x.defaultBranch || '-') + (x.branchSha ? ' (' + x.branchSha.slice(0, 7) + ')' : '')).join('\\n')
   const issues = (r.issues || []).map(i => '[' + String(i.severity).toUpperCase() + '] ' + (i.target ? i.target + ': ' : '') + i.message).join('\n')
   return (
     <div className="card">
       <div className="row"><b>Result</b><Badge s={badge} /></div>
+      {branchInfo && <CodeBlock label="GitHub branch context" tone="info" text={branchInfo} wrap={false} />}
       {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
       {r.ai_summary && <CodeBlock label="summary" tone={tone} text={r.ai_summary} />}
       {r.ai_note && <CodeBlock label="ai note" tone="warn" text={'AI summary unavailable: ' + r.ai_note} />}
@@ -291,6 +295,7 @@ export default function Agent1Panel() {
           <div className="filters" style={{ marginTop: 6 }}>{SETUP.map(([k, l]) => <span key={k} className={'badge ' + (hb.ready[k] ? 'good' : 'mute')}>{l}{hb.ready[k] ? ' ✓' : ' ✗'}</span>)}</div>
         </div>
       )}
+      <BranchSelector agent="agent1" repos={(hb && hb.repos) || []} initialRepo={(hb && hb.repos && hb.repos[0]) || ''} call={callAgent1} />
       <div className="sec-title">Run a check</div>
       <div className="actions" style={{ marginBottom: 10 }}>
         {RUNS.map(([a, l]) => <button key={a} className="btn ghost" disabled={!!busy} onClick={() => run(a)}>{busy === a ? 'Running...' : l}</button>)}

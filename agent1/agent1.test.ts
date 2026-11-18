@@ -32,7 +32,10 @@ let seq = 0
 let geminiText: string | null = null // when set, the fake Gemini answers with this text (planner tests)
 const uuid = () => '00000000-0000-4000-8000-' + String(++seq).padStart(12, '0')
 
+let ghRefs: Record<string, string> = {}
+let ghQueries: string[] = []
 function reset() {
+  ghRefs = { main: 'a'.repeat(40), 'release/1.0': 'b'.repeat(40) }; ghQueries = []
   seq = 0; geminiText = null; ext = []; dbWrites = []; sqlExec = []; vercelWrites = []
   db = { agents: [1, 2, 3].map(s => ({ id: uuid(), slot: s, name: 'Agent ' + s, description: 'Placeholder - not built yet', status: 'offline', last_heartbeat_at: null, updated_at: new Date().toISOString(), config: {} })), tasks: [], approvals: [], activity_logs: [], api_usage: [], system_health: [], owners: [{ user_id: 'user-owner', role: 'owner' }] }
   envs = [
@@ -81,6 +84,11 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   if (url.host === 'api.github.com') {
     ext.push({ method, url: url.host + url.pathname })
     const p = url.pathname
+    ghQueries.push(p + url.search)
+    const refM = /^\/repos\/[^/]+\/[^/]+\/git\/ref\/heads\/(.+)$/.exec(p)
+    if (refM) { const sh = ghRefs[decodeURIComponent(refM[1])]; return sh ? json({ object: { sha: sh } }) : json({ message: 'Not Found' }, 404) }
+    if (p.endsWith('/branches')) { const all = Object.entries(ghRefs); const pg = Number(url.searchParams.get('page') || 1); return json(all.slice((pg - 1) * 100, pg * 100).map(([name, sha]) => ({ name, commit: { sha } }))) }
+    if (p.endsWith('/actions/runs')) return json({ workflow_runs: [{ name: 'ci', status: 'completed', conclusion: 'success', head_branch: url.searchParams.get('branch') || 'main' }] })
     if (p.endsWith('/commits')) return json([{ sha: 'abcdef123456', commit: { message: 'msg', author: { date: '2026-11-10' } } }])
     if (p.endsWith('/actions/runs')) return json({ workflow_runs: [{ name: 'ci', status: 'completed', conclusion: 'success', head_branch: 'main' }] })
     if (p.includes('/git/trees/')) return json({ tree: [{ type: 'blob', path: '.env.example' }, { type: 'blob', path: 'src/App.jsx' }] })
@@ -397,4 +405,59 @@ test('ai_command: Supabase dropdown project is used for schema checks (allow-lis
   assert.ok(ext.some(c => c.url === 'api.supabase.com/v1/projects/testref12345/database/query/read-only'))
   assert.ok(!ext.some(c => c.url.includes('/projects/' + REF + '/')))
   assert.equal(sqlExec.length, 0)
+})
+
+
+// ================================================================ dynamic GitHub branch selection
+const REPO1 = 'me/blisscco-ai-control-center'
+test('branches: Agent 1 lists real branches with default flag and "/" names; unknown repo is refused', async () => {
+  reset()
+  const r: any = await post({ action: 'github_branches', params: { repo: REPO1 } })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  assert.deepEqual(r.body.result.branches.map((b: any) => [b.name, b.default]), [['main', true], ['release/1.0', false]])
+  assert.equal((await post({ action: 'github_branches', params: { repo: 'evil/other' } }) as any).status, 403)
+  assert.equal(JSON.stringify(r.body).includes(GHTOKEN), false)
+})
+test('branches: pagination beyond 100 branches', async () => {
+  reset(); for (let i = 0; i < 150; i++) ghRefs['t/' + i] = 'c'.repeat(40)
+  const r: any = await post({ action: 'github_branches', params: { repo: REPO1 } })
+  assert.equal(r.body.result.branches.length, 152)
+})
+test('github_status on a selected non-default branch: commits, CI runs and tree are pinned to that branch SHA', async () => {
+  reset()
+  const sel = { repo: REPO1, branch: 'release/1.0', branch_sha: 'b'.repeat(40), branch_context_required: true }
+  const r: any = await post({ action: 'github_status', params: sel })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  const rep = r.body.result.repos[0]
+  assert.equal(rep.branch, 'release/1.0'); assert.equal(rep.branchSha, 'b'.repeat(40)); assert.equal(rep.defaultBranch, 'main')
+  assert.ok(ghQueries.some(q => q.includes('/git/ref/heads/release/1.0')), ghQueries.join('\n')) // "/" kept as a path separator
+  assert.ok(ghQueries.some(q => q.includes('/commits?sha=' + 'b'.repeat(40))))
+  assert.ok(ghQueries.some(q => q.includes('/actions/runs?branch=release%2F1.0')))
+  assert.ok(ghQueries.some(q => q.includes('/git/trees/' + 'b'.repeat(40))))
+  assert.ok(!ghQueries.some(q => /\/git\/trees\/main/.test(q)), 'default branch must not be used')
+  assert.ok(ext.filter(c => c.url.startsWith('api.github.com')).every(c => c.method === 'GET'))
+})
+test('health_report carries the selected repo + branch + SHA context', async () => {
+  reset()
+  const r: any = await post({ action: 'health_report', params: { repo: REPO1, branch: 'release/1.0', branch_sha: 'b'.repeat(40), branch_context_required: true } })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  const g = JSON.stringify(r.body)
+  assert.ok(g.includes('release/1.0') && g.includes('b'.repeat(40)))
+})
+test('deleted, moved or unavailable branch is an error - never replaced by the default branch', async () => {
+  reset()
+  const base = { repo: REPO1, branch_context_required: true }
+  const gone: any = await post({ action: 'github_status', params: { ...base, branch: 'gone/branch', branch_sha: 'b'.repeat(40) } })
+  assert.equal(gone.status, 404, JSON.stringify(gone.body))
+  const moved: any = await post({ action: 'github_status', params: { ...base, branch: 'release/1.0', branch_sha: 'e'.repeat(40) } })
+  assert.equal(moved.status, 409, JSON.stringify(moved.body))
+  const none: any = await post({ action: 'github_status', params: base })
+  assert.equal(none.status, 400, JSON.stringify(none.body))
+  assert.equal((await post({ action: 'github_status', params: { repo: 'evil/other', branch: 'main', branch_context_required: true } }) as any).status, 403)
+  assert.ok(!ghQueries.some(q => /\/git\/trees\/main/.test(q)))
+})
+test('Agent 1 still works without a selection (legacy default-branch report) when the server flag is not set', async () => {
+  reset()
+  const r: any = await post({ action: 'github_status' })
+  assert.equal(r.status, 200); assert.equal(r.body.result.repos[0].found, true)
 })

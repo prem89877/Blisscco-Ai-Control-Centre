@@ -15,14 +15,15 @@ const str = (v: unknown, n: number) => String(v ?? '').slice(0, n)
 const strs = (v: unknown, n = 12, len = 300) => (Array.isArray(v) ? v : []).map(x => str(x, len)).filter(Boolean).slice(0, n)
 
 // ---------------------------------------------------------------- repository context (read only, bounded)
-export interface RepoCtx { repo: string; ref: string; tree: { path: string; sha: string }[]; files: { path: string; content: string; redacted?: boolean; truncated?: boolean }[]; omitted: string[] }
+export interface RepoCtx { repo: string; ref: string; sha: string; tree: { path: string; sha: string }[]; files: { path: string; content: string; redacted?: boolean; truncated?: boolean }[]; omitted: string[] }
 
-async function treeFor(ctx: Ctx, repo: string, ref?: string) {
+async function treeFor(ctx: Ctx, repo: string, ref?: string, expectedSha?: string) {
   const gh = new GitHub(ctx.cfg, ctx.calls)
   const info = await gh.info(repo)
   const r = ref || info.default_branch
   const sha = await gh.branchSha(repo, r)
   if (!sha) throw new AgentError('Branch not found: ' + r, 404, 'not_found')
+  if (expectedSha && expectedSha.toLowerCase() !== sha.toLowerCase()) throw new AgentError('Selected branch moved. Refresh and re-run analysis.', 409, 'base_changed')
   return { gh, ref: r, tree: await gh.tree(repo, await gh.commitTreeSha(repo, sha)), sha }
 }
 
@@ -59,16 +60,16 @@ export const mentionedPaths = (text: string, tree: { path: string }[]): string[]
 
 const KEY = ['package.json', 'README.md', '00-README.md', '01-ARCHITECTURE.md']
 
-async function gather(ctx: Ctx, repo: string, ref: string | undefined, text: string, explicit: string[]): Promise<RepoCtx & { gh: GitHub }> {
+async function gather(ctx: Ctx, repo: string, ref: string | undefined, text: string, explicit: string[], expectedSha?: string): Promise<RepoCtx & { gh: GitHub }> {
   const lim = devLimits()
-  const { gh, ref: r, tree } = await treeFor(ctx, repo, ref)
+  const { gh, ref: r, tree, sha } = await treeFor(ctx, repo, ref, expectedSha)
   const mention = mentionedPaths(text, tree)
   const paths = [...explicit, ...mention, ...(explicit.length || mention.length ? [] : KEY.filter(k => tree.some(t => t.path === k)).slice(0, 2))]
   const { files, omitted } = await readFiles(gh, repo, tree, paths, lim, secretValues(ctx.cfg))
-  return { repo, ref: r, tree, files, omitted, gh }
+  return { repo, ref: r, sha, tree, files, omitted, gh }
 }
 
-const compact = (r: RepoCtx) => ({ ref: r.ref, file_count: r.tree.length, file_list: r.tree.map(t => t.path).slice(0, 600), files: r.files, omitted: r.omitted })
+const compact = (r: RepoCtx) => ({ ref: r.ref, branch_sha: r.sha, file_count: r.tree.length, file_list: r.tree.map(t => t.path).slice(0, 600), files: r.files, omitted: r.omitted })
 const hist = (h: unknown, n: number) => (Array.isArray(h) ? h : []).slice(-n).map((m: any) => ({ role: m && m.role === 'assistant' ? 'assistant' : 'user', text: str(m && m.text, 2000) }))
 
 const needAi = (r: AiResult, what: string) => { if (!r.text) throw new AgentError(`Gemini could not ${what}: ${r.error || 'no answer'}`, 502, 'gemini') }
@@ -82,8 +83,12 @@ async function devChat(ctx: Ctx, p: any): Promise<any> {
   const repo = p.repo ? validRepo(p.repo) : ''
   let context_note: string | undefined
   if (repo) {
-    try { rc = await gather(ctx, repo, p.ref ? String(p.ref) : undefined, message, (Array.isArray(p.paths) ? p.paths : []).map(String)) }
-    catch (e) { context_note = 'Repository context unavailable: ' + (e as Error).message.slice(0, 160) } // general questions still get answered
+    try { rc = await gather(ctx, repo, p.ref ? String(p.ref) : undefined, message, (Array.isArray(p.paths) ? p.paths : []).map(String), p.branch_sha ? String(p.branch_sha) : undefined) }
+    catch (e) {
+      // A selected branch that moved or vanished is a hard error: never answer as if it were analysed, never fall back to another branch.
+      if ((p.ref || p.branch_sha) && ['base_changed', 'branch_not_found', 'not_found'].includes(String((e as any).code))) throw e
+      context_note = 'Repository context unavailable: ' + (e as Error).message.slice(0, 160) // general questions still get answered
+    }
   }
   const ai = await chatAi(ctx.cfg, { message, history: hist(p.history, lim.historyTurns), repo: rc ? compact(rc) : null, repo_context_note: context_note || null })
   await recordAi(ctx, 'dev_chat', ai)
@@ -100,7 +105,7 @@ async function devChat(ctx: Ctx, p: any): Promise<any> {
   }
   if (mode === 'proposal') {
     if (!repo) return { status: 'succeeded', mode: 'answer', answer: answer + '\n\n(Select a repository to let me prepare a proposal.)', context_note }
-    const out = await devProposal(ctx, { repo, request: str(j.proposal_request || message, 4000), ref: p.ref, history: p.history })
+    const out = await devProposal(ctx, { repo, request: str(j.proposal_request || message, 4000), ref: p.ref, branch_sha: p.branch_sha, history: p.history })
     return { ...out, mode: 'proposal', answer }
   }
   return { status: 'succeeded', mode, answer, context_files: rc ? rc.files.map(f => f.path) : [], context_note }
@@ -113,7 +118,7 @@ async function devAssist(ctx: Ctx, p: any): Promise<any> {
   const paths: string[] = (Array.isArray(p.paths) ? p.paths : []).map(String)
   if (!text.trim() && !paths.length && !p.error_log) throw new AgentError('Give a question, file paths or an error log', 400)
   let rc: (RepoCtx & { gh: GitHub }) | null = null
-  if (p.repo) rc = await gather(ctx, validRepo(p.repo), p.ref ? String(p.ref) : undefined, text + ' ' + str(p.error_log, 3000), paths)
+  if (p.repo) rc = await gather(ctx, validRepo(p.repo), p.ref ? String(p.ref) : undefined, text + ' ' + str(p.error_log, 3000), paths, p.branch_sha ? String(p.branch_sha) : undefined)
   const ai = await assist(ctx.cfg, kind, { task: kind, text, error_log: str(p.error_log, 8000), code: str(p.code, 20000), repo: rc ? compact(rc) : null })
   await recordAi(ctx, 'dev_assist_' + kind, ai)
   needAi(ai, kind)
@@ -154,7 +159,8 @@ async function devProposal(ctx: Ctx, p: any): Promise<any> {
     const secrets = secretValues(ctx.cfg)
     // 1-2. understand + inspect
     await progress('inspect', 'reading repository')
-    const rc = await gather(ctx, repo, p.ref ? String(p.ref) : undefined, request, (Array.isArray(p.paths) ? p.paths : []).map(String))
+    const rc = await gather(ctx, repo, p.ref ? String(p.ref) : undefined, request, (Array.isArray(p.paths) ? p.paths : []).map(String), p.branch_sha ? String(p.branch_sha) : undefined)
+    if (p.branch_sha && String(p.branch_sha).toLowerCase() !== rc.sha.toLowerCase()) throw new AgentError('Selected base branch moved since selection. Refresh the branch and run a fresh analysis.', 409, 'base_changed')
     const base = String(p.base || p.ref || '') || undefined
     // 3-4. analyse + plan (pass 1 may ask to read more files, pass 2 sees them)
     await progress('plan', 'analysing existing code and planning')
@@ -216,7 +222,7 @@ async function devProposal(ctx: Ctx, p: any): Promise<any> {
     }
     // 10. submit for owner approval via the existing guarded pipeline (branch name, base pin, content hash, secret scan, sensitive ack)
     await progress('submit', 'creating approval')
-    const out = await proposeChange(ctx, { repo, title: str(p.title || plan.summary || request, 100), description: str(plan.summary || request, 1000), base, files }, { explanation: str(report.review.what_changed || plan.summary, 500), dev_report: report })
+    const out = await proposeChange(ctx, { repo, expected_base_sha: rc.sha, title: str(p.title || plan.summary || request, 100), description: str(plan.summary || request, 1000), base, files }, { explanation: str(report.review.what_changed || plan.summary, 500), dev_report: report })
     await progress('awaiting_approval')
     return { status: 'awaiting_approval', result: { ...out.result, dev_report: report, progress: stages } }
   })
@@ -302,6 +308,10 @@ async function devDiagnose(ctx: Ctx, p: any): Promise<any> {
     const wait = Math.min(Math.max(Number(p.wait_ms) || 0, 0), 25_000)
     if (wait) await new Promise(r => setTimeout(r, wait))
     const mon = await monitor(ctx, repo, branch)
+    if (branch && p.branch_sha) {
+      const current = await new GitHub(ctx.cfg, ctx.calls).branchSha(repo, branch)
+      if (!current || current.toLowerCase() !== String(p.branch_sha).toLowerCase()) throw new AgentError('Selected branch moved or was deleted. Refresh before CI diagnosis.', 409, 'base_changed')
+    }
     // Never invent a result: only a completed run with a conclusion counts.
     if (mon.overall !== 'failing') return { result: { ci: mon.overall, runs: mon.runs, failed_jobs: [], note: mon.overall === 'passing' ? 'GitHub Actions reports success for the latest run.' : mon.overall === 'running' ? 'CI is still running. Check again shortly.' : 'No GitHub Actions run found for this branch yet.' } }
     const logs = mon.failed_jobs.map((j: any) => ({ job: j.job, steps: j.failed_steps, log: j.log }))

@@ -50,6 +50,9 @@ let mgmtPolicies: Row[]
 let rateLimit: boolean
 let rateCount: number
 let repoFiles: Record<string, string>
+let a3Refs: Record<string, string> = {}
+let filesBySha: Record<string, Record<string, string>> = {}
+let a3Queries: string[] = []
 
 const GOOD_HEADERS = { 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer', 'content-security-policy': "default-src 'self'; frame-ancestors 'none'", 'strict-transport-security': 'max-age=63072000', 'permissions-policy': 'camera=()' }
 const PAGE = (vp: boolean) => `<!doctype html><html lang="en"><head><title>Blisscco</title>${vp ? '<meta name="viewport" content="width=device-width, initial-scale=1">' : ''}<script src="/assets/app.js"></script></head><body>Login password</body></html>`
@@ -127,10 +130,17 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   if (url.host === 'registry.npmjs.org') return json({ 'left-pad': [{ id: 1, title: 'Prototype pollution', severity: 'high', vulnerable_versions: '<1.3.1', url: 'https://github.com/advisories/x' }] })
   if (url.host === 'api.github.com') {
     if (h.authorization !== 'Bearer ' + ENV.AGENT3_GITHUB_TOKEN) return json({}, 401)
+    a3Queries.push(url.pathname + url.search)
     if (url.pathname === '/repos/me/site') return json({ default_branch: 'main' })
-    if (url.pathname.startsWith('/repos/me/site/git/trees/')) return json({ tree: Object.entries(repoFiles).map(([path, c]) => ({ path, type: 'blob', size: c.length, sha: 'x' })) })
+    const refM = /^\/repos\/me\/site\/git\/ref\/heads\/(.+)$/.exec(url.pathname)
+    if (refM) { const sh = a3Refs[decodeURIComponent(refM[1])]; return sh ? json({ object: { sha: sh } }) : json({ message: 'Not Found' }, 404) }
+    if (url.pathname === '/repos/me/site/branches') { const pg = Number(url.searchParams.get('page') || 1); return json(Object.entries(a3Refs).slice((pg - 1) * 100, pg * 100).map(([name, sha]) => ({ name, commit: { sha } }))) }
+    const files = (id: string | null) => (id && filesBySha[id]) || repoFiles
+    const tr = /^\/repos\/me\/site\/git\/trees\/(.+)$/.exec(url.pathname)
+    if (tr) { const fl = files(decodeURIComponent(tr[1])); return json({ tree: Object.entries(fl).map(([path, c]) => ({ path, type: 'blob', size: c.length, sha: 'x' })) }) }
     const m = /^\/repos\/me\/site\/contents\/(.+)$/.exec(url.pathname)
-    if (m && repoFiles[decodeURIComponent(m[1])] != null) { const c = repoFiles[decodeURIComponent(m[1])]; return json({ content: Buffer.from(c).toString('base64'), size: c.length }) }
+    const fl2 = files(url.searchParams.get('ref'))
+    if (m && fl2[decodeURIComponent(m[1])] != null) { const c = fl2[decodeURIComponent(m[1])]; return json({ content: Buffer.from(c).toString('base64'), size: c.length }) }
     return json({}, 404)
   }
   if (url.host === 'generativelanguage.googleapis.com') {
@@ -146,6 +156,7 @@ const realFetch = globalThis.fetch
 test.before(() => { globalThis.fetch = fake as any })
 test.after(() => { globalThis.fetch = realFetch })
 test.beforeEach(() => {
+  a3Refs = { main: 'a'.repeat(40), 'release/1.0': 'b'.repeat(40) }; filesBySha = {}; a3Queries = []
   seq = 0; siteInsecure = true; siteCalls = []; otherHostCalls = []; sqlSeen = []; rateLimit = true; rateCount = 0; planReply = '{}'
   repoFiles = { 'package.json': '{"name":"x","dependencies":{"left-pad":"1.0.0"}}', 'src/a.js': `const k = "${SVC_JWT}"`, '.env': 'A=1', 'README.md': 'hi' }
   mgmtTables = [
@@ -499,4 +510,55 @@ test('server: auth, owner check, method', async () => {
 test('redact removes secrets', () => {
   const r = redact({ a: 'x ' + SERVICE + ' y', token: 'abc', n: [GEMKEY] }, [SERVICE])
   assert.ok(!JSON.stringify(r).includes(SERVICE)); assert.ok(!JSON.stringify(r).includes(GEMKEY))
+})
+
+
+// ================================================================ dynamic GitHub branch selection
+const RELSHA = 'b'.repeat(40)
+const sel = (extra: any = {}) => ({ repo: 'me/site', branch: 'release/1.0', branch_sha: RELSHA, branch_context_required: true, ...extra })
+test('branches: Agent 3 lists real branches (default flagged, "/" names, paginated); other repos refused', async () => {
+  for (let i = 0; i < 120; i++) a3Refs['t/' + i] = 'c'.repeat(40)
+  const r: any = await handleRequest({ method: 'POST', headers: { authorization: 'Bearer tok-owner' }, body: { action: 'github_branches', params: { repo: 'me/site' } } }, ENV)
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  const b = r.body.result.branches
+  assert.equal(b.length, 122); assert.deepEqual(b.filter((x: any) => x.default).map((x: any) => x.name), ['main']); assert.ok(b.some((x: any) => x.name === 'release/1.0'))
+  const bad: any = await handleRequest({ method: 'POST', headers: { authorization: 'Bearer tok-owner' }, body: { action: 'github_branches', params: { repo: 'evil/x' } } }, ENV)
+  assert.equal(bad.status, 403)
+})
+test('security scan tests the SELECTED branch code (not the default branch) and reports repo/branch/SHA', async () => {
+  filesBySha[RELSHA] = { 'package.json': '{"name":"x","dependencies":{}}', 'src/a.js': 'export const ok = 1', 'README.md': 'hi' } // clean release branch
+  const rel = await runAction(ctx(), 'security_scan', sel())
+  assert.ok(!ids(rel).includes('sec.env_committed'), 'release branch has no .env: ' + ids(rel))
+  assert.match(JSON.stringify(rel.result.evidence), /3 file\(s\) scanned, 0 hit\(s\), 0 committed \.env/)
+  assert.equal(rel.result.repo, 'me/site'); assert.equal(rel.result.branch, 'release/1.0'); assert.equal(rel.result.branch_sha, RELSHA)
+  assert.ok(a3Queries.some(q => q.includes('/git/trees/' + RELSHA)) && a3Queries.some(q => q.includes('ref=' + RELSHA)))
+  assert.ok(!a3Queries.some(q => q.includes('/git/trees/main')))
+  const def = await runAction(ctx(), 'security_scan', {}) // default branch still has the problems -> proves the two runs differ
+  assert.ok(ids(def).includes('sec.env_committed'))
+})
+test('full report: branch context in report and task payload; a clean branch gives a different repo section', async () => {
+  filesBySha[RELSHA] = { 'package.json': '{"name":"x"}', 'src/a.js': 'export const ok = 1' }
+  const r = await runAction(ctx(), 'full_report', sel())
+  assert.equal(r.result.branch, 'release/1.0'); assert.equal(r.result.branch_sha, RELSHA); assert.equal(r.result.repo, 'me/site')
+  const t = db.tasks.find((x: any) => x.payload.action === 'full_report')!
+  assert.equal(t.payload.branch, 'release/1.0'); assert.equal(t.payload.branch_sha, RELSHA)
+})
+test('deleted / moved / missing branch fails the whole run - no fallback to default', async () => {
+  delete a3Refs['release/1.0']
+  await assert.rejects(() => runAction(ctx(), 'security_scan', sel()), (e: any) => e.status === 404 && e.code === 'branch_not_found')
+  await assert.rejects(() => runAction(ctx(), 'full_report', sel()), (e: any) => e.status === 404)
+  a3Refs['release/1.0'] = 'd'.repeat(40)
+  await assert.rejects(() => runAction(ctx(), 'security_scan', sel()), (e: any) => e.status === 409 && e.code === 'base_changed')
+  await assert.rejects(() => runAction(ctx(), 'full_report', { repo: 'me/site', branch_context_required: true }), (e: any) => e.status === 400 && e.code === 'branch_required')
+  await assert.rejects(() => runAction(ctx(), 'security_scan', sel({ repo: 'evil/x' })), (e: any) => e.status === 403)
+  assert.ok(!a3Queries.some(q => q.includes('/git/trees/main')))
+})
+test('regression retest re-runs against the SAME branch (never the default) and re-resolves its current head', async () => {
+  filesBySha[RELSHA] = { 'package.json': '{"name":"x"}', 'src/a.js': 'export const ok = 1' }
+  await runAction(ctx(), 'security_scan', sel())
+  const t = db.tasks.find((x: any) => x.payload.action === 'security_scan')!
+  a3Queries = []; a3Refs['release/1.0'] = 'f'.repeat(40); filesBySha['f'.repeat(40)] = { 'package.json': '{"name":"x"}', 'src/a.js': 'export const ok = 2' } // branch moved since
+  const rt = await runAction(ctx(), 'retest', { task_id: t.id })
+  assert.equal(rt.result.retest.branch, 'release/1.0'); assert.equal(rt.result.retest.previous_branch_sha, RELSHA); assert.equal(rt.result.retest.branch_sha, 'f'.repeat(40))
+  assert.ok(a3Queries.some(q => q.includes('/git/trees/' + 'f'.repeat(40))) && !a3Queries.some(q => q.includes('/git/trees/main')))
 })

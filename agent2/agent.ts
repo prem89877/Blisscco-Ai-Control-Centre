@@ -10,7 +10,7 @@ import { assertAgentBranch, branchFor, diffStats, gitBlobSha, isProtected, LIMIT
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
 // Actions that need only GitHub + Supabase, so they can run on Vercel (/api/agent2) and in Termux.
-export const ACTIONS = ['heartbeat', 'repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'apply_change', 'request_promote', 'apply_promote', 'request_rollback', 'apply_rollback', 'ai_command', 'request_workflow', 'apply_workflow', 'dev_chat', 'dev_assist', 'dev_proposal', 'dev_diagnose'] as const
+export const ACTIONS = ['heartbeat', 'github_branches', 'repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'apply_change', 'request_promote', 'apply_promote', 'request_rollback', 'apply_rollback', 'ai_command', 'request_workflow', 'apply_workflow', 'dev_chat', 'dev_assist', 'dev_proposal', 'dev_diagnose'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -80,26 +80,31 @@ async function repoInspect(ctx: Ctx, p: any): Promise<Out> {
   const ref = String(p.ref || info.default_branch)
   const sha = await gh.branchSha(repo, ref)
   if (!sha) throw new AgentError('Branch not found: ' + ref, 404, 'not_found')
+  if (p.branch_sha && String(p.branch_sha).toLowerCase() !== sha.toLowerCase()) throw new AgentError('Selected branch moved. Refresh before inspection.', 409, 'base_changed')
   const tree = await gh.tree(repo, await gh.commitTreeSha(repo, sha))
   const path = p.path ? validatePath(p.path) : ''
   if (path) {
     const hit = tree.find(e => e.path === path)
     if (hit) {
       const text = await gh.blobText(repo, hit.sha, 1_000_000)
-      return { result: { repo, ref, path, bytes: Buffer.byteLength(text), content: text.slice(0, READ_LIMIT), truncated: text.length > READ_LIMIT } }
+      return { result: { repo, ref, branch_sha: sha, path, bytes: Buffer.byteLength(text), content: text.slice(0, READ_LIMIT), truncated: text.length > READ_LIMIT } }
     }
     const children = tree.filter(e => e.path.startsWith(path + '/')).map(e => e.path).slice(0, 200)
     if (!children.length) throw new AgentError('Path not found: ' + path, 404, 'not_found')
-    return { result: { repo, ref, path, files: children } }
+    return { result: { repo, ref, branch_sha: sha, path, files: children } }
   }
   const top = new Map<string, number>()
   for (const e of tree) { const t = e.path.split('/')[0]; top.set(e.path.includes('/') ? t + '/' : t, (top.get(e.path.includes('/') ? t + '/' : t) || 0) + 1) }
-  return { result: { repo, ref, default_branch: info.default_branch, pushed_at: info.pushed_at, file_count: tree.length, top_level: [...top.entries()].map(([name, files]) => ({ name, files })).slice(0, 80), recent_commits: await gh.recentCommits(repo, ref, 5) } }
+  return { result: { repo, ref, branch_sha: sha, default_branch: info.default_branch, pushed_at: info.pushed_at, file_count: tree.length, top_level: [...top.entries()].map(([name, files]) => ({ name, files })).slice(0, 80), recent_commits: await gh.recentCommits(repo, ref, 5) } }
 }
 
-export async function monitor(ctx: Ctx, repo: string, branch?: string) {
+export async function monitor(ctx: Ctx, repo: string, branch?: string, pinSha?: string) {
   const gh = new GitHub(ctx.cfg, ctx.calls)
+  // Branch existence + SHA pinning is enforced whenever the caller carries a selected-branch context (pinSha).
+  const pinned = branch && pinSha ? await gh.branchSha(repo, branch) : null
+  if (branch && pinSha && !pinned) throw new AgentError('Selected branch no longer exists: ' + branch, 404, 'branch_not_found')
   const runs = await gh.runs(repo, branch, 5)
+  if (branch && pinSha && pinned && (await gh.branchSha(repo, branch)) !== pinned) throw new AgentError('Selected branch moved during GitHub checks. Refresh and retry.', 409, 'base_changed')
   const latest = runs[0]
   const overall = !latest ? 'none' : latest.status !== 'completed' ? 'running' : latest.conclusion === 'success' ? 'passing' : 'failing'
   const failed: any[] = latest && latest.conclusion === 'failure' ? await gh.failedJobs(repo, latest.id).catch(() => []) : []
@@ -110,11 +115,17 @@ export async function monitor(ctx: Ctx, repo: string, branch?: string) {
     j.log = log || 'GitHub did not give the log for this job (it may have expired, or the token lacks Actions: Read). Open the run on GitHub.'
   }
   const deployments = branch ? await gh.deployments(repo, branch).catch(() => []) : []
-  return { repo, branch: branch || null, overall, runs, failed_jobs: failed, deployments }
+  return { repo, branch: branch || null, branch_sha: pinned, overall, runs, failed_jobs: failed, deployments }
 }
 
 async function actionsStatus(ctx: Ctx, p: any): Promise<Out> {
-  return { result: await monitor(ctx, validRepo(p.repo), p.branch ? String(p.branch) : undefined) }
+  const repo = validRepo(p.repo)
+  if (p.branch && p.branch_sha) {
+    const sha = await new GitHub(ctx.cfg, ctx.calls).branchSha(repo, String(p.branch))
+    if (!sha) throw new AgentError('Selected branch no longer exists: ' + p.branch, 404, 'branch_not_found')
+    if (sha.toLowerCase() !== String(p.branch_sha).toLowerCase()) throw new AgentError('Selected branch moved. Refresh before checking CI.', 409, 'base_changed')
+  }
+  return { result: await monitor(ctx, repo, p.branch ? String(p.branch) : undefined, p.branch && p.branch_sha ? String(p.branch_sha) : undefined) }
 }
 
 // ---------------------------------------------------------------- propose (nothing is written to GitHub)
@@ -178,10 +189,10 @@ export async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: strin
     assertAgentBranch(branch, ctx.cfg.protectedBranches)
     const ap = await ctx.store.createApproval({
       task_id: taskId, title: `Code change: ${title}`,
-      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, dev_report: fix ? fix.dev_report : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
+      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, branch, working_branch: branch, commit_destination: branch, ci_target_branch: branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, dev_report: fix ? fix.dev_report : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
     })
     await ctx.store.log('warn', 'agent2_approval_requested', 'Code change: ' + title, { approval_id: ap.id }, taskId, ctx.actor.id)
-    return { status: 'awaiting_approval', result: { approval_id: ap.id, branch, base: `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null, estimated_cost_usd: Number(((ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1_000_000).toFixed(6)) }, base_sha: baseSha, next: 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.' + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, repo, branch, working_branch: branch, commit_destination: branch, ci_target_branch: branch, base_branch: base, base: `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null, estimated_cost_usd: Number(((ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1_000_000).toFixed(6)) }, base_sha: baseSha, next: 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.' + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
   })
 }
 
@@ -195,6 +206,7 @@ async function aiFix(ctx: Ctx, p: any): Promise<any> {
   const base = String(p.base || info.default_branch)
   const sha = await gh.branchSha(repo, base)
   if (!sha) throw new AgentError('Base branch not found: ' + base, 404, 'not_found')
+  if (p.expected_base_sha && String(p.expected_base_sha).toLowerCase() !== sha.toLowerCase()) throw new AgentError('Selected base branch moved; refresh and re-analyse before continuing.', 409, 'base_changed')
   const tree = await gh.tree(repo, await gh.commitTreeSha(repo, sha))
   const current: { path: string; content: string }[] = []
   for (const path of paths) {
@@ -230,8 +242,11 @@ async function applyChange(ctx: Ctx, p: any): Promise<any> {
   if (stored.length !== (d.files as any[]).length) throw new AgentError('Stored change set does not match the approval; request the change again', 409, 'content_mismatch')
   assertAgentBranch(d.branch, ctx.cfg.protectedBranches)
   return withTask(ctx, 'apply_change', 'Apply: ' + ap.title, { approval_id: ap.id, branch: d.branch }, async () => {
-    await claim(ctx, ap, d)
     const gh = new GitHub(ctx.cfg, ctx.calls)
+    // Approval is bound to repo + base branch + base SHA. If the base moved or vanished, nothing is claimed or written.
+    const currentBaseSha = await gh.branchSha(d.repo, d.base_branch)
+    if (!currentBaseSha || currentBaseSha.toLowerCase() !== String(d.base_sha).toLowerCase()) throw new AgentError('Base branch changed or was deleted after approval. Request a fresh analysis and approval.', 409, 'base_changed')
+    await claim(ctx, ap, d)
     let created = false
     try {
       await gh.createBranch(d.repo, d.branch, d.base_sha)
@@ -241,7 +256,7 @@ async function applyChange(ctx: Ctx, p: any): Promise<any> {
       if (ap.task_id) await ctx.store.updateTask(ap.task_id, { status: 'succeeded', finished_at: now(), result: { applied: true, branch: d.branch, commit_sha: commitSha } })
       await ctx.store.log('success', 'agent2_branch_pushed', `${d.repo} ${d.branch}`, { approval_id: ap.id, commit: commitSha }, null, ctx.actor.id)
       const mon = await monitor(ctx, d.repo, d.branch).catch(() => null)
-      return { result: { applied: true, repo: d.repo, branch: d.branch, commit_sha: commitSha, base: `${d.base_branch}@${String(d.base_sha).slice(0, 7)}`, changed_files: d.files.map((e: any) => ({ path: e.path, op: e.op, added: e.added, removed: e.removed })), compare_url: `https://github.com/${d.repo}/compare/${d.base_branch}...${d.branch}`, ci_runs: mon ? mon.runs : [], deployments: mon ? mon.deployments : [], deployment_trigger: mon && (mon.runs.length || mon.deployments.length) ? 'triggered (see ci_runs / deployments)' : 'not seen yet; open Monitor in about a minute', production_touched: false, rollback: 'Request rollback deletes this branch; ' + d.base_branch + ' was never touched.' } }
+      return { result: { applied: true, repo: d.repo, branch: d.branch, working_branch: d.branch, ci_target_branch: d.branch, commit_destination: d.branch, base_branch: d.base_branch, base_sha: d.base_sha, commit_sha: commitSha, base: `${d.base_branch}@${String(d.base_sha).slice(0, 7)}`, changed_files: d.files.map((e: any) => ({ path: e.path, op: e.op, added: e.added, removed: e.removed })), compare_url: `https://github.com/${d.repo}/compare/${d.base_branch}...${d.branch}`, ci_runs: mon ? mon.runs : [], deployments: mon ? mon.deployments : [], deployment_trigger: mon && (mon.runs.length || mon.deployments.length) ? 'triggered (see ci_runs / deployments)' : 'not seen yet; open Monitor in about a minute', production_touched: false, rollback: 'Request rollback deletes this branch; ' + d.base_branch + ' was never touched.' } }
     } catch (e) {
       if (created) await gh.deleteBranch(d.repo, d.branch).catch(() => {}) // leave nothing half-done so a retry is clean
       await release(ctx, ap, d, e)
@@ -261,9 +276,14 @@ async function requestPromote(ctx: Ctx, p: any): Promise<any> {
     const headSha = await gh.branchSha(repo, branch)
     if (!headSha) throw new AgentError('Branch not found: ' + branch, 404, 'not_found')
     const mon = await monitor(ctx, repo, branch)
-    const production = isProtected(info.default_branch, ctx.cfg.protectedBranches)
-    const title = `Promote ${branch} -> ${info.default_branch}${production ? ' - PRODUCTION' : ''}`
-    const ap = await ctx.store.createApproval({ task_id: taskId, title, details: { kind: 'promote', repo, branch, base_branch: info.default_branch, head_sha: headSha, production, ci: mon.overall, ci_runs: mon.runs.slice(0, 3), note: 'Opens a pull request and squash-merges it. Merge is pinned to head_sha: if the branch changes after approval, nothing is merged.' } })
+    // Merge target = the base branch this working branch was created from (recorded in its approved change),
+    // else the owner's explicitly selected base. The repo default is used only when nothing else is known.
+    const recorded = (await ctx.store.findApprovals('code_change', branch)).find(a => a.details && a.details.executed_at && a.details.repo === repo)
+    const baseBranch = String((recorded && recorded.details.base_branch) || p.base || info.default_branch)
+    if (!(await gh.branchSha(repo, baseBranch))) throw new AgentError('Merge target branch not found: ' + baseBranch, 404, 'branch_not_found')
+    const production = baseBranch === info.default_branch || isProtected(baseBranch, ctx.cfg.protectedBranches)
+    const title = `Promote ${branch} -> ${baseBranch}${production ? ' - PRODUCTION' : ''}`
+    const ap = await ctx.store.createApproval({ task_id: taskId, title, details: { kind: 'promote', repo, branch, base_branch: baseBranch, head_sha: headSha, production, ci: mon.overall, ci_runs: mon.runs.slice(0, 3), note: 'Opens a pull request and squash-merges it. Merge is pinned to head_sha: if the branch changes after approval, nothing is merged.' } })
     await ctx.store.log('warn', 'agent2_approval_requested', title, { approval_id: ap.id }, taskId, ctx.actor.id)
     return { status: 'awaiting_approval', result: { approval_id: ap.id, production, ci: mon.overall, next: 'Approve in the Approvals tab, then press Merge in the Agent 2 console' + (production ? ' (needs the PRODUCTION tick).' : '.') } }
   })
@@ -373,6 +393,7 @@ async function requestWorkflow(ctx: Ctx, p: any): Promise<any> {
     if (!/^[\w./-]{1,100}$/.test(ref) || ref.includes('..')) throw new AgentError('Bad branch name', 400)
     const head = await gh.branchSha(repo, ref)
     if (!head) throw new AgentError('Branch not found: ' + ref, 404, 'not_found')
+    if (p.branch_sha && head.toLowerCase() !== String(p.branch_sha).toLowerCase()) throw new AgentError('Selected branch moved. Refresh before dispatching workflow.', 409, 'base_changed')
     const all = await gh.workflows(repo)
     const file = (w: { path: string }) => w.path.split('/').pop()!.toLowerCase()
     let hits = all.filter(w => file(w) === wanted || w.name.toLowerCase() === wanted || String(w.id) === wanted)
@@ -443,11 +464,13 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
 
 export async function runAction(ctx: Ctx, action: string, params: any = {}): Promise<any> {
   if (!(ACTIONS as readonly string[]).includes(action)) throw new AgentError('Unknown action', 400, 'unknown_action')
+  if (params.branch_context_required && ['repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'request_workflow', 'dev_chat', 'dev_assist', 'dev_proposal', 'dev_diagnose'].includes(action) && !params.branch && !params.ref && !params.base) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
   switch (action as Action) {
     case 'heartbeat': {
       const agent = await ctx.store.heartbeat()
       return { agent: { id: agent.id, name: agent.name, status: agent.status, last_heartbeat_at: agent.last_heartbeat_at }, ready: readiness(ctx.cfg), repos: ctx.cfg.githubRepos, protected_branches: ctx.cfg.protectedBranches, model: ctx.cfg.geminiModel }
     }
+    case 'github_branches': { const gh = new GitHub(ctx.cfg, ctx.calls); const repo = gh.repo(validRepo(params.repo)); return { result: { repo, branches: await gh.branches(repo) } } }
     case 'repo_inspect': return withTask(ctx, action, 'Inspect repo ' + String(params.repo || '') + (params.path ? '/' + params.path : ''), { repo: params.repo, path: params.path || null }, () => repoInspect(ctx, params))
     case 'actions_status': return withTask(ctx, action, 'GitHub Actions status ' + String(params.repo || ''), { repo: params.repo, branch: params.branch || null }, () => actionsStatus(ctx, params))
     case 'propose_change': return proposeChange(ctx, params)
