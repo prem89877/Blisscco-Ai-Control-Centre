@@ -1,4 +1,4 @@
-import { BranchSelector } from './BranchSelector.jsx'
+import { BranchSelector, SelectedLine, selectedRepo, useSelection } from './BranchSelector.jsx'
 import { scopeParams } from './branchContext.js'
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
@@ -51,9 +51,23 @@ function Report({ res }) {
   if (r.started) lines.push('started: yes')
   const files = (r.changed_files || []).map(f => f.op + ' ' + f.path + (f.added != null ? '  +' + f.added + ' -' + f.removed : '') + (f.sensitive ? '  [SENSITIVE]' : '')).join('\n')
   const runs = (r.runs || r.ci_runs || []).map(x => x.name + ' ' + x.status + '/' + (x.conclusion || '-') + ' ' + x.branch + '@' + x.sha).join('\n')
+  const sc = r.scope || {}
+  const baseName = sc.base_branch || r.base_branch || r.ref || null
+  const baseSha = sc.base_sha || r.base_sha || r.branch_sha || null
+  const working = sc.working_branch || r.working_branch || null
+  const commitDest = sc.commit_destination || r.commit_destination || null
+  const ciTarget = sc.ci_target_branch || r.ci_target_branch || null
+  const showScope = Boolean(baseName || working || ciTarget)
   return (
     <div className="card">
       <div className="row"><b>Result</b><Badge s={waiting ? 'awaiting_approval' : 'ok'} /></div>
+      {showScope && <CodeBlock label="Base vs Working branch" tone="info" wrap={false} text={[
+        (sc.repo || r.repo) ? 'Repository: ' + (sc.repo || r.repo) : null,
+        'Base (selected): ' + (baseName || '-') + (baseSha ? ' @ ' + String(baseSha).slice(0, 7) : ''),
+        'Working: ' + (working || 'none (read-only; nothing is written)'),
+        'Commit destination: ' + (commitDest || (working ? working : 'none')) + (commitDest ? '  (the base branch is never written)' : ''),
+        'CI target: ' + (ciTarget || '-')
+      ].filter(Boolean).join('\n')} />}
       {lines.length > 0 && <CodeBlock label="GitHub branch context" tone="info" text={lines.join('\\n')} wrap={false} />}
       {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
       {r.needs_split && <CodeBlock label="too big for one proposal" tone="warn" text={r.message} />}
@@ -81,28 +95,23 @@ function Report({ res }) {
   )
 }
 
-function RepoPick({ repos, repo, setRepo }) {
-  return (
-    <select value={repo} onChange={e => setRepo(e.target.value)} disabled={!repos.length}>
-      {!repos.length && <option value="">No repos in AGENT2_GITHUB_REPOS</option>}
-      {repos.map(r => <option key={r} value={r}>{r}</option>)}
-    </select>
-  )
+// There is NO per-card repository/branch picker: the BranchSelector above is the only control (repo + branch + SHA).
+function RepoPick() {
+  return <SelectedLine agent="agent2" label="Uses the selector above" />
 }
 
 function AskBox({ repos, onResult, setErr }) {
-  const [repo, setRepo] = useState('')
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent2('ai_command', { repo: repo || repos[0], text })); setText('') } catch (e) { setErr(e.message) }
+    try { onResult(await callAgent2('ai_command', { repo: selectedRepo('agent2', repos), text })); setText('') } catch (e) { setErr(e.message) }
     setBusy(false)
   }
   return (
     <div className="card">
       <b>Quick command</b> <span className="sub">(one safe GitHub action: CI status, branches, workflow, delete agent2 branch)</span>
-      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <RepoPick />
       <textarea rows={3} placeholder="e.g. agent2 test branch delete karo / ci workflow check karo / db integration workflow run karo" value={text} onChange={e => setText(e.target.value)} />
       <button className="btn" disabled={busy || !text.trim()} onClick={go}>{busy ? 'Thinking...' : 'Do it'}</button>
     </div>
@@ -110,32 +119,30 @@ function AskBox({ repos, onResult, setErr }) {
 }
 
 function Inspect({ repos, onResult, setErr }) {
-  const [repo, setRepo] = useState('')
   const [path, setPath] = useState('')
-  const [branch, setBranch] = useState('')
   const [busy, setBusy] = useState('')
-  const r = repo || repos[0] || ''
+  const sel = useSelection('agent2') // follows the dropdown; this panel has NO branch field of its own
   async function go(action, params) {
     setBusy(action); setErr('')
-    try { onResult(await callAgent2(action, { repo: r, ...params })) } catch (e) { setErr(e.message) }
+    // only the repo + optional path are sent: branch/ref/base/SHA are attached from the dropdown selection by scopeParams
+    try { onResult(await callAgent2(action, { repo: selectedRepo('agent2', repos), ...params })) } catch (e) { setErr(e.message) }
     setBusy('')
   }
   return (
     <div className="card">
       <b>Inspect &amp; monitor</b>
-      <RepoPick repos={repos} repo={r} setRepo={setRepo} />
-      <input placeholder="Branch (optional)" value={branch} onChange={e => setBranch(e.target.value)} autoCapitalize="none" />
+      <RepoPick />
+      <div className="sub">Branch: <b>{sel ? sel.branch : '(none selected)'}</b> (change it in the selector above; it cannot be overridden here)</div>
       <input placeholder="File or folder path (optional)" value={path} onChange={e => setPath(e.target.value)} autoCapitalize="none" />
       <div className="actions">
-        <button className="btn ghost" disabled={!!busy || !r} onClick={() => go('repo_inspect', { path: path || undefined, ref: branch || undefined })}>{busy === 'repo_inspect' ? 'Reading...' : 'Inspect'}</button>
-        <button className="btn ghost" disabled={!!busy || !r} onClick={() => go('actions_status', { branch: branch || undefined })}>{busy === 'actions_status' ? 'Checking...' : 'GitHub Actions'}</button>
+        <button className="btn ghost" disabled={!!busy || !sel} onClick={() => go('repo_inspect', { path: path || undefined })}>{busy === 'repo_inspect' ? 'Reading...' : 'Inspect'}</button>
+        <button className="btn ghost" disabled={!!busy || !sel} onClick={() => go('actions_status', {})}>{busy === 'actions_status' ? 'Checking...' : 'GitHub Actions'}</button>
       </div>
     </div>
   )
 }
 
 function Propose({ repos, onResult, setErr }) {
-  const [repo, setRepo] = useState('')
   const [title, setTitle] = useState('')
   const [json, setJson] = useState('')
   const [busy, setBusy] = useState(false)
@@ -143,7 +150,7 @@ function Propose({ repos, onResult, setErr }) {
     setBusy(true); setErr('')
     try {
       const parsed = JSON.parse(json)
-      onResult(await callAgent2('propose_change', { repo: repo || repos[0], title, files: Array.isArray(parsed) ? parsed : parsed.files }))
+      onResult(await callAgent2('propose_change', { repo: selectedRepo('agent2', repos), title, files: Array.isArray(parsed) ? parsed : parsed.files }))
       setJson('')
     } catch (e) { setErr(e instanceof SyntaxError ? 'The change is not valid JSON: ' + e.message : e.message) }
     setBusy(false)
@@ -151,7 +158,7 @@ function Propose({ repos, onResult, setErr }) {
   return (
     <div className="card">
       <b>Submit code</b> <span className="sub">(from you or Claude; nothing is written until you approve)</span>
-      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <RepoPick />
       <input placeholder="Title, e.g. Fix login redirect" value={title} onChange={e => setTitle(e.target.value)} />
       <textarea rows={6} placeholder={CHANGE_EXAMPLE} value={json} onChange={e => setJson(e.target.value)} autoCapitalize="none" spellCheck="false" />
       <button className="btn" disabled={busy || !title || !json} onClick={go}>{busy ? 'Checking...' : 'Request approval'}</button>
@@ -160,21 +167,20 @@ function Propose({ repos, onResult, setErr }) {
 }
 
 function Fix({ repos, onResult, setErr }) {
-  const [repo, setRepo] = useState('')
   const [paths, setPaths] = useState('')
   const [problem, setProblem] = useState('')
   const [log, setLog] = useState('')
   const [busy, setBusy] = useState(false)
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent2('ai_fix', { repo: repo || repos[0], paths: paths.split(',').map(s => s.trim()).filter(Boolean), problem, error_log: log || undefined })); setProblem(''); setLog('') }
+    try { onResult(await callAgent2('ai_fix', { repo: selectedRepo('agent2', repos), paths: paths.split(',').map(s => s.trim()).filter(Boolean), problem, error_log: log || undefined })); setProblem(''); setLog('') }
     catch (e) { setErr(e.message) }
     setBusy(false)
   }
   return (
     <div className="card">
       <b>Fix a bug with AI</b> <span className="sub">(Gemini drafts it; you still approve)</span>
-      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <RepoPick />
       <input placeholder="Files, comma separated (max 5)" value={paths} onChange={e => setPaths(e.target.value)} autoCapitalize="none" />
       <textarea rows={3} placeholder="What is wrong?" value={problem} onChange={e => setProblem(e.target.value)} />
       <textarea rows={3} placeholder="Error log (optional)" value={log} onChange={e => setLog(e.target.value)} spellCheck="false" />
@@ -184,18 +190,17 @@ function Fix({ repos, onResult, setErr }) {
 }
 
 function BranchRequest({ title, hint, action, repos, onResult, setErr }) {
-  const [repo, setRepo] = useState('')
   const [branch, setBranch] = useState('')
   const [busy, setBusy] = useState(false)
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent2(action, { repo: repo || repos[0], branch })) } catch (e) { setErr(e.message) }
+    try { onResult(await callAgent2(action, { repo: selectedRepo('agent2', repos), branch })) } catch (e) { setErr(e.message) }
     setBusy(false)
   }
   return (
     <div className="card">
       <b>{title}</b> <span className="sub">{hint}</span>
-      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <RepoPick />
       <input placeholder="agent2/branch-name" value={branch} onChange={e => setBranch(e.target.value)} autoCapitalize="none" />
       <button className="btn" disabled={busy || !branch.startsWith('agent2/')} onClick={go}>Request approval</button>
     </div>
@@ -217,7 +222,7 @@ function Apply({ a, onDone, onResult, setErr }) {
   const needAck = d.kind === 'code_change' ? (d.sensitive_paths || []).length > 0 : Boolean(d.production)
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent2(k.action, { approval_id: a.id, [k.ack]: ack ? k.ackValue : undefined })); onDone() }
+    try { onResult(await callAgent2(k.action, { repo: d.repo, approval_id: a.id, [k.ack]: ack ? k.ackValue : undefined })); onDone() } // repo => its saved branch selection is validated against this approval's recorded base
     catch (e) { setErr(e.message) }
     setBusy(false)
   }
@@ -225,6 +230,8 @@ function Apply({ a, onDone, onResult, setErr }) {
     <div className="card">
       <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
       {d.kind === 'code_change' && <div className="sub">{d.repo} | base: {d.base_branch}@{String(d.base_sha || '').slice(0, 7)} | working: {d.working_branch || d.branch} | commit: {d.commit_destination || d.branch} | CI: {d.ci_target_branch || d.branch} | {d.files.length} file(s)</div>}
+      {d.kind !== 'code_change' && <div className="sub">{d.repo} | base: {d.base_branch || d.ref || '-'}{d.base_sha ? '@' + String(d.base_sha).slice(0, 7) : ''}{d.branch ? ' | working: ' + d.branch : ''}{d.ref && d.ref.startsWith('agent2/') ? ' | working: ' + d.ref : ''}</div>}
+      <SelectedLine agent="agent2" label="Selector" />
       {needAck && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> {k.ackText}</label>}
       <button className="btn ok" disabled={busy || (needAck && !ack)} onClick={go}>{busy ? k.busy : k.label}</button>
     </div>
@@ -255,7 +262,6 @@ function DevReport({ r }) {
 }
 
 function Chat({ repos, onResult, setErr, goTab }) {
-  const [repo, setRepo] = useState('')
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [msgs, setMsgs] = useState([])
@@ -264,7 +270,7 @@ function Chat({ repos, onResult, setErr, goTab }) {
     const history = msgs.slice(-10).map(m => ({ role: m.role, text: m.text }))
     setMsgs(m => [...m, { role: 'user', text: message }]); setText(''); setBusy(true); setErr('')
     try {
-      const r = await callAgent2('dev_chat', { repo: repo || repos[0] || undefined, message, history })
+      const r = await callAgent2('dev_chat', { repo: selectedRepo('agent2', repos) || undefined, message, history })
       setMsgs(m => [...m, { role: 'assistant', text: r.answer || '', mode: r.mode, agent: r.responsible_agent, res: r.mode === 'proposal' ? r : null, files: r.context_files }])
       if (r.mode === 'proposal') onResult(r)
     } catch (e) { setErr(e.message) }
@@ -273,7 +279,7 @@ function Chat({ repos, onResult, setErr, goTab }) {
   return (
     <div className="card">
       <b>Ask Agent 2</b> <span className="sub">(Hindi / English / Hinglish. Questions get answers; build requests become a proposal for your approval)</span>
-      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <RepoPick />
       {msgs.map((m, i) => (
         <div key={i} className="msg" style={m.role === 'user' ? { background: 'transparent' } : undefined}>
           <b>{m.role === 'user' ? 'You' : 'Agent 2'}</b>
@@ -293,21 +299,20 @@ function Chat({ repos, onResult, setErr, goTab }) {
 }
 
 function ProposalForm({ title, hint, defaultKind, fixedKind, placeholder, initialText, repos, onResult, setErr }) {
-  const [repo, setRepo] = useState('')
   const [kind, setKind] = useState(defaultKind || 'feature')
   const [request, setRequest] = useState(initialText || '')
   const [paths, setPaths] = useState('')
   const [busy, setBusy] = useState(false)
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent2('dev_proposal', { repo: repo || repos[0], kind: fixedKind || kind, request, paths: paths.split(',').map(x => x.trim()).filter(Boolean) })); setRequest('') }
+    try { onResult(await callAgent2('dev_proposal', { repo: selectedRepo('agent2', repos), kind: fixedKind || kind, request, paths: paths.split(',').map(x => x.trim()).filter(Boolean) })); setRequest('') }
     catch (e) { setErr(e.message) }
     setBusy(false)
   }
   return (
     <div className="card">
       <b>{title}</b> <span className="sub">{hint}</span>
-      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <RepoPick />
       {!fixedKind && <select value={kind} onChange={e => setKind(e.target.value)}>{KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>}
       <textarea rows={4} placeholder={placeholder} value={request} onChange={e => setRequest(e.target.value)} />
       <input placeholder="Files to look at (optional, comma separated)" value={paths} onChange={e => setPaths(e.target.value)} autoCapitalize="none" />
@@ -325,7 +330,6 @@ const ASSIST = {
 }
 function Assist({ kind, repos, setErr, onPropose }) {
   const c = ASSIST[kind]
-  const [repo, setRepo] = useState('')
   const [text, setText] = useState('')
   const [paths, setPaths] = useState('')
   const [log, setLog] = useState('')
@@ -333,13 +337,13 @@ function Assist({ kind, repos, setErr, onPropose }) {
   const [out, setOut] = useState(null)
   async function go() {
     setBusy(true); setErr(''); setOut(null)
-    try { setOut(await callAgent2('dev_assist', { kind, repo: repo || repos[0] || undefined, text, error_log: log || undefined, paths: paths.split(',').map(x => x.trim()).filter(Boolean) })) } catch (e) { setErr(e.message) }
+    try { setOut(await callAgent2('dev_assist', { kind, repo: selectedRepo('agent2', repos) || undefined, text, error_log: log || undefined, paths: paths.split(',').map(x => x.trim()).filter(Boolean) })) } catch (e) { setErr(e.message) }
     setBusy(false)
   }
   return (
     <div className="card">
       <b>{c.title}</b> <span className="sub">(answer only; nothing is changed)</span>
-      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <RepoPick />
       <input placeholder="Files (optional, comma separated)" value={paths} onChange={e => setPaths(e.target.value)} autoCapitalize="none" />
       <textarea rows={3} placeholder={c.ph} value={text} onChange={e => setText(e.target.value)} />
       {c.log && <textarea rows={3} placeholder="Error log / stack trace" value={log} onChange={e => setLog(e.target.value)} spellCheck="false" />}

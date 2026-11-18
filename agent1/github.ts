@@ -42,13 +42,14 @@ export class GitHub {
     return out.map(b => ({ name: String(b.name), default: b.name === info.body.default_branch, sha: String(b.commit.sha) }))
   }
 
-  async inspect(repo: string, selectedBranch?: string, expectedSha?: string): Promise<RepoReport> {
+  async inspect(repo: string, selectedBranch?: string, expectedSha?: string, strict = false): Promise<RepoReport> {
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new AgentError('Bad repo name: ' + repo, 400)
     const info = await this.get('/repos/' + repo)
     if (info.status === 404) return { repo, found: false }
     if (!info.ok) throw new AgentError('GitHub API ' + info.status, 502, 'github')
-    // Legacy callers (CLI / heartbeat with no owner selection) keep the original default-branch behaviour.
-    // Any caller that selects a branch gets a SHA-pinned, branch-specific inspection and NEVER falls back.
+    // Legacy callers (CLI / heartbeat with no owner selection and strict=false) keep the original default-branch behaviour.
+    // Dashboard callers (strict=true) MUST name a branch: it is SHA-pinned and the repository default is never substituted.
+    if (strict && !selectedBranch) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
     const pinned = Boolean(selectedBranch)
     const branch = selectedBranch || info.body.default_branch
     const refPath = String(branch).split('/').map(encodeURIComponent).join('/')

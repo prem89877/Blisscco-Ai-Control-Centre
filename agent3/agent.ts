@@ -297,7 +297,7 @@ async function dbTest(ctx: Ctx): Promise<Out> {
 
 // ---------------------------------------------------------------- 6. security
 export const BUNDLE_LIMIT = 8
-export async function securityChecks(ctx: Ctx, origin: string, repo?: string, branch?: string, expectedSha?: string) {
+export async function securityChecks(ctx: Ctx, origin: string, repo?: string, branch?: string, expectedSha?: string, strict = false) {
   const f: Finding[] = [], ev: Ev[] = []
   // headers
   const home = await hit(ctx, origin, '/')
@@ -342,16 +342,19 @@ export async function securityChecks(ctx: Ctx, origin: string, repo?: string, br
     const rp = validRepo(repo)
     if (!gh.repoAllowed(rp)) throw new AgentError('Repo not in AGENT3_GITHUB_REPOS', 403, 'repo_not_allowed')
     const selected = branch ? String(branch) : ''
+    // Dashboard (strict) scans must name a branch. Only legacy callers (CLI / Termux queue without a branch) read the default branch, explicitly.
+    if (strict && !selected) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
     const branchSha = selected ? await gh.branchSha(rp, selected) : null
     if (selected && !branchSha) throw new AgentError('Selected branch no longer exists: ' + selected, 404, 'branch_not_found')
     if (expectedSha && branchSha && branchSha.toLowerCase() !== expectedSha.toLowerCase()) throw new AgentError('Selected branch moved. Refresh before running QA.', 409, 'base_changed')
-    const tree = await gh.tree(rp, branchSha || undefined)
+    const ref = branchSha || (await gh.defaultBranch(rp)) // legacy default only when no branch was given
+    const tree = await gh.tree(rp, ref)
     const code = tree.filter(t => t.type === 'blob' && /\.(js|jsx|ts|tsx|json|md|yml|yaml|sql|html|toml)$/i.test(t.path) && !/(package-lock\.json|node_modules|\.min\.)/.test(t.path) && (t.size || 0) < 200_000).slice(0, 120)
     const envFiles = tree.filter(t => t.type === 'blob' && /(^|\/)\.env(\..+)?$/.test(t.path) && !/\.(example|sample|template)$/.test(t.path))
     for (const e of envFiles) f.push({ id: 'sec.env_committed', area: 'security', severity: 'critical', title: '.env file committed to the repository', evidence: e.path, fix: 'Remove it from git history, rotate every key inside, add to .gitignore.', target: e.path })
     let repoHits = 0
     for (let i = 0; i < code.length; i += 10) {
-      const batch = await Promise.all(code.slice(i, i + 10).map(async t => ({ t, txt: await gh.file(rp, t.path, 400_000, branchSha || branch) })))
+      const batch = await Promise.all(code.slice(i, i + 10).map(async t => ({ t, txt: await gh.file(rp, t.path, 400_000, ref) })))
       for (const { t, txt } of batch) {
         if (!txt) continue
         const hits = C.analyzeBundleText(t.path, txt)
@@ -359,13 +362,17 @@ export async function securityChecks(ctx: Ctx, origin: string, repo?: string, br
       }
     }
     ev.push({ check: 'Secrets in repository (code, config, SQL)', ok: repoHits === 0 && !envFiles.length, detail: `${code.length} file(s) scanned, ${repoHits} hit(s), ${envFiles.length} committed .env` })
-    const dep = await depAudit(ctx, gh, rp, branchSha || branch)
+    const dep = await depAudit(ctx, gh, rp, ref)
     f.push(...dep.f); ev.push(dep.ev)
+    if (selected && branchSha) { // the branch must not have moved while it was being read
+      const after = await gh.branchSha(rp, selected)
+      if (!after || after.toLowerCase() !== branchSha.toLowerCase()) throw new AgentError('Selected branch moved during the repository scan. Refresh and retry.', 409, 'base_changed')
+    }
   } else ev.push({ check: 'Repository secrets + dependency vulnerabilities', ok: false, detail: 'SKIPPED: pass a repo and set AGENT3_GITHUB_TOKEN / AGENT3_GITHUB_REPOS' })
   return { f, ev }
 }
 
-async function depAudit(ctx: Ctx, gh: GitHub, repo: string, branch?: string): Promise<{ f: Finding[]; ev: Ev }> {
+async function depAudit(ctx: Ctx, gh: GitHub, repo: string, branch: string): Promise<{ f: Finding[]; ev: Ev }> {
   const pkgText = await gh.file(repo, 'package.json', 400_000, branch)
   if (!pkgText) return { f: [], ev: { check: 'Dependency vulnerabilities', ok: false, detail: 'SKIPPED: no package.json' } }
   const versions = new Map<string, Set<string>>()
@@ -389,7 +396,9 @@ async function depAudit(ctx: Ctx, gh: GitHub, repo: string, branch?: string): Pr
 // Resolve + verify the owner-selected branch BEFORE any test runs. A deleted or moved branch fails the whole run loudly;
 // it is never swallowed into a "section failed" note and never replaced by the default branch.
 async function resolveBranchCtx(ctx: Ctx, p: any, repo?: string): Promise<{ repo: string | null; branch: string | null; branch_sha: string | null }> {
-  if (!p.branch) return { repo: repo || null, branch: null, branch_sha: null }
+  if (p.branch_context_required && !p.branch) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
+  if (p.branch_context_required && !p.repo) throw new AgentError('Select a GitHub repository together with its branch.', 400, 'repo_required')
+  if (!p.branch) return { repo: repo || null, branch: null, branch_sha: null } // legacy CLI/Termux call without a branch: documented default-branch scan
   if (!repo || !ctx.cfg.githubToken) throw new AgentError('A branch is selected but no GitHub repository/token is configured for Agent 3', 400, 'branch_unavailable')
   const gh = new GitHub(ctx.cfg, ctx.calls)
   const rp = validRepo(repo)
@@ -404,7 +413,7 @@ async function securityScan(ctx: Ctx, p: any): Promise<Out> {
   const repo = p.repo ? String(p.repo) : ctx.cfg.githubRepos[0]
   const bc = await resolveBranchCtx(ctx, p, repo)
   return withTask(ctx, 'security_scan', 'Security scan ' + origin, { target: origin, repo: p.repo || null, branch: bc.branch, branch_sha: bc.branch_sha }, async () => {
-    const { f, ev } = await securityChecks(ctx, origin, repo, bc.branch || undefined, bc.branch_sha || undefined)
+    const { f, ev } = await securityChecks(ctx, origin, repo, bc.branch || undefined, bc.branch_sha || undefined, Boolean(p.branch_context_required))
     return { result: report('Security: secrets, auth bypass, headers, input validation, dependencies', f, ev, { target: origin, repo: bc.repo, branch: bc.branch, branch_sha: bc.branch_sha }) }
   })
 }
@@ -417,14 +426,17 @@ async function fullReport(ctx: Ctx, p: any): Promise<Out> {
   return withTask(ctx, 'full_report', 'Full QA & security report ' + origin, { target: origin, repo: repo || null, branch: bc.branch, branch_sha: bc.branch_sha }, async () => {
     const parts: { name: string; f: Finding[]; ev: Ev[] }[] = []
     const guarded = async (name: string, fn: () => Promise<{ f: Finding[]; ev: Ev[] }>) => {
-      try { parts.push({ name, ...(await fn()) }) } catch (e) { parts.push({ name, f: [], ev: [{ check: name, ok: false, detail: 'FAILED TO RUN: ' + errMsg(e).slice(0, 160) }] }) }
+      try { parts.push({ name, ...(await fn()) }) } catch (e) {
+        // A moved / deleted / missing branch fails the whole report loudly; it is never turned into a "section failed" note.
+        if (e instanceof AgentError && ['base_changed', 'branch_not_found', 'branch_required'].includes(String(e.code))) throw e
+        parts.push({ name, f: [], ev: [{ check: name, ok: false, detail: 'FAILED TO RUN: ' + errMsg(e).slice(0, 160) }] }) }
     }
     await Promise.all([
       guarded('website', async () => { const r = await websiteChecks(ctx, origin); return { f: r.f, ev: r.ev } }),
       guarded('auth', () => authChecks(ctx, origin)),
       guarded('api', () => apiChecks(ctx, origin)),
       guarded('database', () => dbChecks(ctx)),
-      guarded('security', () => securityChecks(ctx, origin, repo, bc.branch || undefined, bc.branch_sha || undefined))
+      guarded('security', () => securityChecks(ctx, origin, repo, bc.branch || undefined, bc.branch_sha || undefined, Boolean(p.branch_context_required)))
     ])
     const ORDER = ['website', 'auth', 'api', 'database', 'security']
     parts.sort((a, b) => ORDER.indexOf(a.name) - ORDER.indexOf(b.name))
@@ -439,6 +451,8 @@ async function fullReport(ctx: Ctx, p: any): Promise<Out> {
 }
 
 // ---------------------------------------------------------------- retest (re-run an earlier test, diff the findings)
+// Tests that read the GitHub repository (tree/files) and therefore need the owner's branch.
+export const GITHUB_TASKS = ['security_scan', 'full_report']
 const RETESTABLE = ['website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report']
 async function retest(ctx: Ctx, p: any): Promise<any> {
   const old = await ctx.store.getTask(String(p.task_id || ''))
@@ -446,6 +460,8 @@ async function retest(ctx: Ctx, p: any): Promise<any> {
   if (!old || !pl || !RETESTABLE.includes(pl.action)) throw new AgentError('Task cannot be retested', 404, 'not_found')
   const key = (f: Finding) => f.id + '|' + (f.target || '')
   const before = new Map<string, Finding>(((old.result && old.result.findings) || []).map((f: Finding) => [key(f), f]))
+  // Repo scans are re-run on the SAME recorded branch. An old run without a recorded branch cannot be retested (no silent default-branch scan).
+  if (GITHUB_TASKS.includes(pl.action) && !pl.branch) throw new AgentError('The original run has no recorded branch. Select a branch and run a new scan instead of a retest.', 400, 'branch_required')
   const fresh: any = await runAction(ctx, pl.action, { target: pl.target, repo: pl.repo || undefined, ...(pl.branch ? { branch: pl.branch, branch_context_required: true } : {}) })
   const after = new Map<string, Finding>(((fresh.result && fresh.result.findings) || []).map((f: Finding) => [key(f), f]))
   const fixed = [...before.keys()].filter(k => !after.has(k)).map(k => before.get(k)!)
@@ -470,7 +486,11 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   if (!['website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report'].includes(intent))
     return { task_id: null, status: 'succeeded', understood, result: { unsupported: true, message: understood.explanation || 'Not supported. Agent 3 only runs read-only tests.' } }
   const target = plan.target && ctx.cfg.targets.includes(String(plan.target)) ? String(plan.target) : undefined
-  const out: any = await runAction(ctx, intent, { target })
+  // The model only picks WHICH test to run. Repo/branch/SHA always come from the owner's dropdown selection (sent by the dashboard).
+  // Repo-scanning tests without a selection are refused: they never run on a default branch.
+  const scope = p.branch ? { repo: p.repo, branch: p.branch, branch_sha: p.branch_sha, branch_context_required: true } : {}
+  if (GITHUB_TASKS.includes(intent) && !p.branch) throw new AgentError('Select a GitHub repository and branch in the selector first; default fallback is disabled.', 400, 'branch_required')
+  const out: any = await runAction(ctx, intent, { ...(GITHUB_TASKS.includes(intent) ? scope : {}), target })
   return { ...out, understood }
 }
 
@@ -482,8 +502,10 @@ async function queueTask(ctx: Ctx, p: any): Promise<any> {
   const target = pickTarget(ctx, p)
   const repo = p.repo ? validRepo(String(p.repo)) : null
   if (repo && !ctx.cfg.githubRepos.some(r => r.toLowerCase() === repo.toLowerCase())) throw new AgentError('Repo not in AGENT3_GITHUB_REPOS', 403, 'repo_not_allowed')
+  // Repo-scanning tasks carry the owner's branch + SHA into the queue (verified now, pinned again when the phone runs it).
+  const bc = GITHUB_TASKS.includes(task) ? await resolveBranchCtx(ctx, p, repo || undefined) : { repo, branch: null, branch_sha: null }
   await ctx.store.ensureAgent()
-  const t = await ctx.store.createTask({ title: 'Termux queue: ' + task + ' ' + target, description: 'Agent 3 - queued for Termux', status: 'queued', payload: { action: task, target, repo, runner: 'termux' }, created_by: ctx.actor.id })
+  const t = await ctx.store.createTask({ title: 'Termux queue: ' + task + ' ' + target, description: 'Agent 3 - queued for Termux', status: 'queued', payload: { action: task, target, repo, ...(bc.branch ? { branch: bc.branch, branch_sha: bc.branch_sha, branch_context_required: true } : {}), runner: 'termux' }, created_by: ctx.actor.id })
   await ctx.store.log('info', 'agent3_task_queued', task, {}, t.id, ctx.actor.id)
   return { task_id: t.id, status: 'queued', result: { title: 'Queued for Termux', next: 'Termux me chalao: npm run agent3 -- worker --once   (live rakhna ho to --once hata do)' } }
 }
@@ -556,7 +578,7 @@ async function heartbeat(ctx: Ctx): Promise<any> {
 }
 
 export async function runAction(ctx: Ctx, action: string, params: any = {}): Promise<any> {
-  if (params.branch_context_required && ['security_scan', 'full_report'].includes(action) && !params.branch) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
+  if (params.branch_context_required && (['security_scan', 'full_report'].includes(action) || (action === 'queue_task' && GITHUB_TASKS.includes(String(params.task)))) && !params.branch) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
   switch (action as Action) {
     case 'heartbeat': return heartbeat(ctx)
     case 'github_branches': { const gh = new GitHub(ctx.cfg, ctx.calls); const repo = validRepo(String(params.repo || ctx.cfg.githubRepos[0] || '')); if (!gh.repoAllowed(repo)) throw new AgentError('Repo not in AGENT3_GITHUB_REPOS', 403, 'repo_not_allowed'); return { result: { repo, branches: await gh.branches(repo) } } }

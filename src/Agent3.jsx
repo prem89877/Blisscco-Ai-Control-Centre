@@ -1,4 +1,4 @@
-import { BranchSelector } from './BranchSelector.jsx'
+import { BranchSelector, SelectedLine, selectedRepo } from './BranchSelector.jsx'
 import { scopeParams } from './branchContext.js'
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
@@ -46,7 +46,7 @@ function Report({ res, onRetest }) {
   return (
     <div className="card">
       <div className="row"><b>{r.title || 'Result'}</b><Badge s={res.status === 'queued' ? 'queued' : waiting ? 'awaiting_approval' : r.verdict === 'fail' ? 'failed' : r.verdict === 'attention' ? 'degraded' : 'ok'} /></div>
-      {(r.repo || r.branch) && <CodeBlock label="GitHub branch context" tone="info" text={[r.repo && 'Repository: ' + r.repo, r.branch && 'Branch: ' + r.branch, r.branch_sha && 'Commit: ' + String(r.branch_sha).slice(0, 7)].filter(Boolean).join('\\n')} wrap={false} />}
+      {(r.repo || r.branch) && <CodeBlock label="GitHub branch context" tone="info" text={[r.repo && 'Repository: ' + r.repo, r.branch && 'Branch (selected): ' + r.branch, r.branch_sha && 'Commit: ' + String(r.branch_sha).slice(0, 7), (r.repo && r.branch && r.branch_sha) ? 'Used: ' + r.repo + ' @ ' + r.branch + ' @ ' + String(r.branch_sha).slice(0, 7) : null].filter(Boolean).join('\\n')} wrap={false} />}
       {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
       {r.unsupported && <CodeBlock label="not done" tone="warn" text={r.message} />}
       {r.verdict && <div className="sub" style={{ margin: '6px 0' }}>Verdict: <b>{r.verdict.toUpperCase()}</b> | {r.tests_passed}/{r.tests_run} checks ok | critical {c.critical} | high {c.high} | medium {c.medium} | low {c.low}</div>}
@@ -165,7 +165,6 @@ export default function Agent3Panel() {
   const [res, setRes] = useState(null)
   const [err, setErr] = useState('')
   const [target, setTarget] = useState('')
-  const [repo, setRepo] = useState('')
   const [busy, setBusy] = useState('')
   const [text, setText] = useState('')
   const [ratePath, setRatePath] = useState('')
@@ -198,7 +197,7 @@ export default function Agent3Panel() {
   async function run(action, params = {}) {
     setBusy(action); setErr('')
     try {
-      const base = { target: target || targets[0], repo: repo || repos[0] }
+      const base = { target: target || targets[0], repo: selectedRepo('agent3', repos) || undefined } // repo comes from the BranchSelector only
       if (where === 'termux' && QUEUEABLE.includes(action)) {
         const r = await callAgent3('queue_task', { task: action, ...base })
         setRes(r); setQueuedId(r.task_id)
@@ -229,7 +228,8 @@ export default function Agent3Panel() {
         </div>
         {where === 'termux' && <div className="sub">Termux me chalao: <code>npm run agent3 -- worker</code>. Result yahin aa jayega{queuedId ? ' (wait kar raha hoon...)' : ''}.</div>}
         <Pick options={targets} value={target || targets[0] || ''} set={setTarget} empty="Set AGENT3_TARGETS" />
-        <Pick options={repos} value={repo || repos[0] || ''} set={setRepo} empty="No repo (secret/dependency scan skipped)" />
+        <SelectedLine agent="agent3" label="Repo scans (secrets, dependencies) read" />
+        <div className="sub">Live website / API / DB checks always run against the live target, not a branch.</div>
         <div className="actions" style={{ flexWrap: 'wrap' }}>
           {TESTS.map(([a, l]) => <button key={a} className={'btn' + (a === 'full_report' ? '' : ' ghost')} disabled={!!busy || !targets.length} onClick={() => run(a)}>{busy === a ? 'Testing...' : l}</button>)}
         </div>

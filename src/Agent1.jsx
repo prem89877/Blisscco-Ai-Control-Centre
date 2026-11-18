@@ -1,4 +1,4 @@
-import { BranchSelector } from './BranchSelector.jsx'
+import { BranchSelector, SelectedLine } from './BranchSelector.jsx'
 import { scopeParams } from './branchContext.js'
 import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient'
@@ -48,7 +48,7 @@ function Report({ res }) {
   }
   const tone = r.overall === 'critical' ? 'bad' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'info' : 'good'
   const badge = r.overall === 'critical' ? 'error' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'awaiting_approval' : 'ok'
-  const branchInfo = (r.repos || []).map(x => x.repo + ' @ ' + (x.branch || x.defaultBranch || '-') + (x.branchSha ? ' (' + x.branchSha.slice(0, 7) + ')' : '')).join('\\n')
+  const branchInfo = (r.repos || []).map(x => 'Used: ' + x.repo + ' @ ' + (x.branch || '-') + (x.branchSha ? ' @ ' + x.branchSha.slice(0, 7) : '') + (x.defaultBranch && x.branch && x.branch !== x.defaultBranch ? '   (repo default is ' + x.defaultBranch + ', not used)' : '')).join('\\n')
   const issues = (r.issues || []).map(i => '[' + String(i.severity).toUpperCase() + '] ' + (i.target ? i.target + ': ' : '') + i.message).join('\n')
   return (
     <div className="card">
@@ -65,7 +65,7 @@ function Report({ res }) {
           text={(d.log_tail || []).join('\n') || 'No log lines.'} />
       ))}
       {(r.repos || []).map((g, n) => {
-        const lines = [g.found ? 'branch: ' + g.defaultBranch : 'not found']
+        const lines = [g.found ? 'branch: ' + (g.branch || g.defaultBranch) + (g.branchSha ? ' @ ' + g.branchSha.slice(0, 7) : '') : 'not found']
         ;(g.lastCommits || []).forEach(c => lines.push('commit ' + c.sha + ' ' + c.message))
         ;(g.runs || []).forEach(x => lines.push('run ' + x.name + ': ' + x.status + '/' + (x.conclusion || '-') + ' (' + x.branch + ')'))
         return <CodeBlock key={n} label={'github - ' + g.repo} tone={g.found ? 'good' : 'bad'} text={lines.join('\n')} />
@@ -297,6 +297,8 @@ export default function Agent1Panel() {
       )}
       <BranchSelector agent="agent1" repos={(hb && hb.repos) || []} initialRepo={(hb && hb.repos && hb.repos[0]) || ''} call={callAgent1} />
       <div className="sec-title">Run a check</div>
+      <SelectedLine agent="agent1" label="GitHub parts (status, health) read" />
+      <div className="sub" style={{ marginBottom: 6 }}>Vercel and Supabase parts are live and not branch-filtered.</div>
       <div className="actions" style={{ marginBottom: 10 }}>
         {RUNS.map(([a, l]) => <button key={a} className="btn ghost" disabled={!!busy} onClick={() => run(a)}>{busy === a ? 'Running...' : l}</button>)}
       </div>

@@ -461,3 +461,32 @@ test('Agent 1 still works without a selection (legacy default-branch report) whe
   const r: any = await post({ action: 'github_status' })
   assert.equal(r.status, 200); assert.equal(r.body.result.repos[0].found, true)
 })
+
+// ================================================================ STRICT branch selection (Agent 1: GitHub parts are branch-strict)
+test('STRICT: dashboard health_report / github_status without branch or without repo are rejected (no default branch, no blind multi-repo scan)', async () => {
+  reset()
+  for (const a of ['health_report', 'github_status']) {
+    const noBranch: any = await post({ action: a, params: { repo: REPO1, branch_context_required: true } })
+    assert.equal(noBranch.status, 400, JSON.stringify(noBranch.body)); assert.equal(noBranch.body.code, 'branch_required')
+    const noRepo: any = await post({ action: a, params: { branch: 'release/1.0', branch_sha: 'b'.repeat(40), branch_context_required: true } })
+    assert.equal(noRepo.status, 400, JSON.stringify(noRepo.body)); assert.equal(noRepo.body.code, 'repo_required')
+    const legacyBranchNoRepo: any = await post({ action: a, params: { branch: 'release/1.0' } }) // one branch name must not be applied to every repo
+    assert.equal(legacyBranchNoRepo.status, 400); assert.equal(legacyBranchNoRepo.body.code, 'repo_required')
+  }
+  assert.ok(!ghQueries.some(q => /\/git\/trees\//.test(q)), 'no repo tree was read: ' + ghQueries.join('|'))
+})
+test('STRICT: a selected repo is inspected alone, with the selected branch + SHA (no default branch, no other repo)', async () => {
+  reset()
+  const r: any = await post({ action: 'github_status', params: { repo: REPO1, branch: 'release/1.0', branch_sha: 'b'.repeat(40), branch_context_required: true } })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  assert.equal(r.body.result.repos.length, 1); assert.equal(r.body.result.repos[0].repo, REPO1)
+  assert.equal(r.body.result.repos[0].branch, 'release/1.0'); assert.equal(r.body.result.repos[0].branchSha, 'b'.repeat(40))
+  assert.ok(!ghQueries.some(q => /\/git\/trees\/main/.test(q) || /\/commits\?(per_page|sha=main)/.test(q)), ghQueries.join('|'))
+})
+test('STRICT: GitHub.inspect(strict) itself refuses a missing branch (defence in depth) while legacy keeps the default', async () => {
+  reset()
+  const { GitHub } = await import('./github.js')
+  const gh = new GitHub(loadConfig(ENV), {})
+  await assert.rejects(() => gh.inspect(REPO1, undefined, undefined, true), /default fallback is disabled/)
+  assert.equal((await gh.inspect(REPO1)).found, true) // documented legacy behaviour (CLI / heartbeat), no flag
+})

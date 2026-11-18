@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { scopeParams, reconcileSelection, saveSelection, loadSelection, clearSelection, setActiveRepo, getActiveRepo, GITHUB_ACTIONS } from './branchContext.js'
+import { selectionLabel, scopeParams, reconcileSelection, saveSelection, loadSelection, clearSelection, setActiveRepo, getActiveRepo, GITHUB_ACTIONS } from './branchContext.js'
 
 const mem = () => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) } }
 const SHA1 = 'a'.repeat(40), SHA2 = 'b'.repeat(40)
@@ -55,3 +55,34 @@ test('Agent 2: selected base is sent as base/ref, working branch is never defaul
   assert.equal(scopeParams('agent2', 'request_promote', { branch: '' }, s).branch, '') // stays empty -> server guard rejects, no silent main
 })
 test('GitHub action tables exist for all three agents', () => { for (const a of ['agent1', 'agent2', 'agent3']) assert.ok(GITHUB_ACTIONS[a].length) })
+
+test('Tools cannot override the dropdown: foreign branch/ref/base params are replaced by the selection', () => {
+  const s = mem(); setActiveRepo('agent2', 'o/r', s); saveSelection('agent2', 'o/r', 'develop', SHA2, s)
+  for (const a of ['repo_inspect', 'actions_status', 'propose_change', 'ai_fix']) {
+    const p = scopeParams('agent2', a, { branch: 'main', ref: 'main', base: 'main', branch_sha: SHA1, expected_base_sha: SHA1 }, s)
+    assert.equal(p.ref, 'develop'); assert.equal(p.base, 'develop'); assert.equal(p.expected_base_sha, SHA2); assert.equal(p.selected_branch, 'develop')
+    if (a === 'actions_status' || a === 'repo_inspect') { assert.equal(p.branch, 'develop'); assert.equal(p.branch_sha, SHA2) }
+  }
+  // explicit agent2/* working branch is the only allowed deviation
+  const w = scopeParams('agent2', 'actions_status', { branch: 'agent2/x' }, s)
+  assert.equal(w.branch, 'agent2/x'); assert.equal(w.base, 'develop')
+})
+test('every GitHub-touching agent2 action is scoped, incl. ai_command, rollback and apply_*', () => {
+  const s = mem(); setActiveRepo('agent2', 'o/r', s); saveSelection('agent2', 'o/r', 'develop', SHA2, s)
+  for (const a of ['ai_command', 'request_rollback', 'apply_change', 'apply_promote', 'apply_rollback', 'apply_workflow']) {
+    const p = scopeParams('agent2', a, { approval_id: 'x' }, s)
+    assert.equal(p.branch_context_required, true, a); assert.equal(p.selected_branch, 'develop'); assert.equal(p.selected_branch_sha, SHA2)
+  }
+  const s2 = mem(); setActiveRepo('agent2', 'o/r', s2)
+  assert.throws(() => scopeParams('agent2', 'ai_command', { text: 'x' }, s2), /Select a valid GitHub branch/)
+})
+test('agent3 queue_task is scoped only for repo scans; agent1/agent3 ai_command attach a selection softly', () => {
+  const s = mem(); setActiveRepo('agent3', 'o/r', s)
+  assert.deepEqual(scopeParams('agent3', 'queue_task', { task: 'website_smoke' }, s), { task: 'website_smoke' })
+  assert.throws(() => scopeParams('agent3', 'queue_task', { task: 'security_scan' }, s), /Select a valid GitHub branch/)
+  assert.deepEqual(scopeParams('agent3', 'ai_command', { text: 'x' }, s), { text: 'x' }) // no selection: server refuses GitHub intents
+  saveSelection('agent3', 'o/r', 'dev', SHA2, s)
+  assert.equal(scopeParams('agent3', 'ai_command', { text: 'x' }, s).branch, 'dev')
+  assert.equal(scopeParams('agent3', 'queue_task', { task: 'full_report' }, s).branch_sha, SHA2)
+  assert.equal(selectionLabel('agent3', 'o/r', s).text, 'o/r @ dev @ ' + SHA2.slice(0, 7))
+})

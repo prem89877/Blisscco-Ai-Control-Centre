@@ -95,14 +95,14 @@ async function collectRls(ctx: Ctx, ref?: string): Promise<Part<any>> {
   return { available: true, data: { by_schema: by, anon_probe: probe }, issues }
 }
 
-async function collectGithub(ctx: Ctx, selectedRepo?: string, selectedBranch?: string, expectedSha?: string): Promise<Part<RepoReport[]>> {
+async function collectGithub(ctx: Ctx, selectedRepo?: string, selectedBranch?: string, expectedSha?: string, strict = false): Promise<Part<RepoReport[]>> {
   if (!ctx.cfg.githubToken || !ctx.cfg.githubRepos.length) return { available: false, reason: 'AGENT1_GITHUB_TOKEN / AGENT1_GITHUB_REPOS not set', issues: [{ severity: 'info', area: 'config', message: 'GitHub checks not configured' }] }
   const g = new GitHub(ctx.cfg, ctx.calls)
   const issues: Issue[] = []
   const repos: RepoReport[] = []
   for (const r of (selectedRepo ? [selectedRepo] : ctx.cfg.githubRepos)) {
     if (!ctx.cfg.githubRepos.some(x => x.toLowerCase() === r.toLowerCase())) throw new AgentError('Repo not allowed', 403, 'repo_not_allowed')
-    const rep = await g.inspect(r, selectedBranch, expectedSha)
+    const rep = await g.inspect(r, selectedBranch, expectedSha, strict)
     repos.push(rep)
     if (!rep.found) { issues.push({ severity: 'error', area: 'github', message: 'Repo not found or no access', target: r }); continue }
     for (const f of rep.committedEnvFiles || []) issues.push({ severity: 'critical', area: 'github', message: 'Env file committed to repo: ' + f, target: r })
@@ -121,7 +121,7 @@ async function healthReport(ctx: Ctx, params: any = {}): Promise<Out> {
   const [vercel, rls, gh] = await Promise.all([
     safe('Vercel', 'vercel', collectVercel(ctx, { deployments: true, env: true })),
     safe('Supabase', 'supabase', collectRls(ctx)),
-    safe('GitHub', 'github', collectGithub(ctx, params.repo ? String(params.repo) : undefined, params.branch ? String(params.branch) : undefined, params.branch_sha ? String(params.branch_sha) : undefined))
+    safe('GitHub', 'github', collectGithub(ctx, params.repo ? String(params.repo) : undefined, params.branch ? String(params.branch) : undefined, params.branch_sha ? String(params.branch_sha) : undefined, Boolean(params.branch_context_required)))
   ])
   const issues = sortIssues([...vercel.issues, ...rls.issues, ...gh.issues])
   const comp = (name: string, p: Part<unknown>) => ({ component: 'agent1_' + name, status: (!p.available ? 'degraded' : p.issues.some(i => i.severity === 'critical' || i.severity === 'error') ? 'degraded' : 'ok') as 'ok' | 'degraded', details: { reason: p.reason || null } })
@@ -255,7 +255,7 @@ async function applyDbChange(ctx: Ctx, p: any): Promise<Out> {
 }
 
 async function githubStatus(ctx: Ctx, p: any = {}): Promise<Out> {
-  const g = await collectGithub(ctx, p.repo ? String(p.repo) : undefined, p.branch ? String(p.branch) : undefined, p.branch_sha ? String(p.branch_sha) : undefined)
+  const g = await collectGithub(ctx, p.repo ? String(p.repo) : undefined, p.branch ? String(p.branch) : undefined, p.branch_sha ? String(p.branch_sha) : undefined, Boolean(p.branch_context_required))
   if (!g.available && g.reason) throw new AgentError(g.reason, 503, 'not_configured')
   return { result: { generated_at: now(), overall: overall(g.issues), counts: countIssues(g.issues), issues: sortIssues(g.issues), repos: g.data } }
 }
@@ -365,9 +365,14 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   const sp = pickedS || sList.find(x => typeof plan.supabase_project === 'string' && x.label.toLowerCase() === plan.supabase_project.toLowerCase()) || null
   const spLabel = sp ? ' [' + sp.label + ']' : ''
   const asked = { via: 'ask_agent' }
+  // GitHub-touching intents run ONLY on the owner's selected repo + branch + SHA (sent by the dashboard); never on a default branch.
+  const ghScope = () => {
+    if (!p.repo || !p.branch) throw new AgentError('Select a GitHub repository and branch in the selector first; default fallback is disabled.', 400, 'branch_required')
+    return { repo: String(p.repo), branch: String(p.branch), branch_sha: p.branch_sha ? String(p.branch_sha) : undefined, branch_context_required: true }
+  }
   let out: any
   switch (intent) {
-    case 'health_report': out = await withTask(ctx, 'health_report', 'Infrastructure health report', asked, () => healthReport(ctx)); break
+    case 'health_report': { const sc = ghScope(); out = await withTask(ctx, 'health_report', 'Infrastructure health report', { ...asked, repo: sc.repo, branch: sc.branch }, () => healthReport(ctx, sc)); break }
     case 'vercel_status': out = await withTask(ctx, 'vercel_status', 'Vercel status' + (vp ? ': ' + vp : ''), { ...asked, project: vp || null }, async () => partReport(ctx, await collectVercel(ctx, { deployments: true, env: false }, vp || undefined))); break
     case 'env_audit': out = await withTask(ctx, 'env_audit', 'Environment variable audit' + (vp ? ': ' + vp : ''), { ...asked, project: vp || null }, async () => partReport(ctx, await collectVercel(ctx, { deployments: false, env: true }, vp || undefined))); break
     case 'deploy_logs': out = await withTask(ctx, 'deploy_logs', 'Vercel deployment error logs' + (vp ? ': ' + vp : ''), { ...asked, project: vp || null }, () => deployLogs(ctx, { project: vp })); break
@@ -381,7 +386,7 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
       out = await withTask(ctx, 'supabase_schema', 'Supabase schema inspection' + spLabel, { ...asked, schema, project_ref: sp ? sp.ref : null }, () => schemaReport(ctx, { schema, project_ref: sp ? sp.ref : undefined })); break
     }
     case 'rls_check': out = await withTask(ctx, 'rls_check', 'RLS & permissions verification' + spLabel, { ...asked, project_ref: sp ? sp.ref : null }, async () => partReport(ctx, await collectRls(ctx, sp ? sp.ref : undefined))); break
-    case 'github_status': out = await withTask(ctx, 'github_status', 'GitHub repository status (read-only)', asked, () => githubStatus(ctx)); break
+    case 'github_status': { const sc = ghScope(); out = await withTask(ctx, 'github_status', 'GitHub repository status (read-only)', { ...asked, repo: sc.repo, branch: sc.branch }, () => githubStatus(ctx, sc)); break }
     default:
       await ctx.store.log('warn', 'agent1_command_unsupported', understood.explanation || 'unsupported request', {}, null, ctx.actor.id)
       return { status: 'succeeded', result: { unsupported: true, message: understood.explanation || 'This request is not something Agent 1 can do safely from the Ask box. Use the forms below for env or database changes.' }, understood }
@@ -389,9 +394,20 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   return { ...out, understood }
 }
 
+// Strict GitHub scope for dashboard calls (branch_context_required) AND for any caller that names a branch.
+//  - dashboard call without a branch      -> 400 branch_required (never the repo default branch)
+//  - a branch without a repo              -> 400 repo_required (one branch name must never be applied blindly to unrelated repos)
+//  - dashboard call without any repo      -> 400 repo_required (no "inspect every repo on its default branch")
+export function assertGithubScope(action: string, params: any) {
+  if (!['health_report', 'github_status'].includes(action)) return
+  const needs = Boolean(params.branch_context_required)
+  if (needs && !params.branch) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
+  if ((needs || params.branch) && !params.repo) throw new AgentError('Select a GitHub repository together with its branch.', 400, 'repo_required')
+}
+
 export async function runAction(ctx: Ctx, action: string, params: any = {}): Promise<any> {
   if (!(ACTIONS as readonly string[]).includes(action)) throw new AgentError('Unknown action', 400, 'unknown_action')
-  if (params.branch_context_required && ['health_report', 'github_status'].includes(action) && !params.branch) throw new AgentError('Select a GitHub branch; default fallback is disabled.', 400, 'branch_required')
+  assertGithubScope(action, params)
   switch (action as Action) {
     case 'heartbeat': {
       const agent = await ctx.store.heartbeat()

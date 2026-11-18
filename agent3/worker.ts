@@ -17,7 +17,7 @@ export async function workOnce(cfg: Config, actor: Actor = { type: 'system', id:
     log(`running ${pl.action} (${t.id})`)
     const ctx = makeCtx(cfg, actor)
     ctx.adopt = t.id; ctx.worker = true; ctx.exec = exec
-    const params = pl.action === 'local_check' ? { presets: pl.presets } : pl.action === 'local_command' ? { approval_id: pl.approval_id } : { target: pl.target, repo: pl.repo || undefined }
+    const params = pl.action === 'local_check' ? { presets: pl.presets } : pl.action === 'local_command' ? { approval_id: pl.approval_id } : { target: pl.target, repo: pl.repo || undefined, ...(pl.branch ? { branch: pl.branch, branch_sha: pl.branch_sha || undefined, branch_context_required: true } : {}) }
     try { await runAction(ctx, pl.action, params) }
     catch (e) {
       const cur = await store.getTask(t.id)

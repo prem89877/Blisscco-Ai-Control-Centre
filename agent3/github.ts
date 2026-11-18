@@ -29,14 +29,22 @@ export class GitHub {
     const b = await this.get(`/repos/${repo}/git/ref/heads/${branch.split('/').map(encodeURIComponent).join('/')}`)
     return b?.object?.sha ? String(b.object.sha) : null
   }
-  async tree(repo: string, branch?: string): Promise<{ path: string; type: string; size?: number; sha: string }[]> {
+  // The repository default branch is only ever read through this explicit call, by LEGACY (non-dashboard) callers.
+  async defaultBranch(repo: string): Promise<string> {
     const info = await this.get(`/repos/${repo}`)
     if (!info) throw new AgentError('Repo not found', 404, 'not_found')
-    const t = await this.get(`/repos/${repo}/git/trees/${encodeURIComponent(branch || info.default_branch)}?recursive=1`)
-    return (t && t.tree) || []
+    return String(info.default_branch)
   }
-  async file(repo: string, path: string, max = 400_000, branch?: string): Promise<string | null> {
-    const f = await this.get(`/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(branch || (await this.get(`/repos/${repo}`)).default_branch)}`)
+  // `ref` is mandatory (branch name or commit SHA): tree() / file() never choose a branch themselves.
+  async tree(repo: string, ref: string): Promise<{ path: string; type: string; size?: number; sha: string }[]> {
+    if (!ref) throw new AgentError('A branch or commit is required; default-branch fallback is disabled.', 400, 'branch_required')
+    const t = await this.get(`/repos/${repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`)
+    if (!t) throw new AgentError('Branch or repository not found: ' + ref, 404, 'branch_not_found')
+    return t.tree || []
+  }
+  async file(repo: string, path: string, max = 400_000, ref = ''): Promise<string | null> {
+    if (!ref) throw new AgentError('A branch or commit is required; default-branch fallback is disabled.', 400, 'branch_required')
+    const f = await this.get(`/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`)
     if (!f || Array.isArray(f) || !f.content) return null
     if (f.size > max) return null
     return Buffer.from(String(f.content).replace(/\n/g, ''), 'base64').toString('utf8')

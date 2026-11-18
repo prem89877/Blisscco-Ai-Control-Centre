@@ -562,3 +562,55 @@ test('regression retest re-runs against the SAME branch (never the default) and 
   assert.equal(rt.result.retest.branch, 'release/1.0'); assert.equal(rt.result.retest.previous_branch_sha, RELSHA); assert.equal(rt.result.retest.branch_sha, 'f'.repeat(40))
   assert.ok(a3Queries.some(q => q.includes('/git/trees/' + 'f'.repeat(40))) && !a3Queries.some(q => q.includes('/git/trees/main')))
 })
+
+
+// ================================================================ STRICT branch selection (Agent 3: repo tree/file scans never use the default branch)
+test('STRICT: tree()/file() of the GitHub client never choose a branch themselves', async () => {
+  const { GitHub } = await import('./github.js')
+  const gh = new GitHub(loadConfig(ENV), {})
+  await assert.rejects(() => gh.tree('me/site', ''), (e: any) => e.status === 400 && e.code === 'branch_required')
+  await assert.rejects(() => gh.file('me/site', 'package.json'), (e: any) => e.status === 400 && e.code === 'branch_required')
+})
+test('STRICT: dashboard scans need repo AND branch; a scan without them never reads the default branch', async () => {
+  await assert.rejects(() => runAction(ctx(), 'security_scan', { repo: 'me/site', branch_context_required: true }), (e: any) => e.code === 'branch_required')
+  await assert.rejects(() => runAction(ctx(), 'full_report', { branch: 'release/1.0', branch_sha: RELSHA, branch_context_required: true }), (e: any) => e.status === 400 && e.code === 'repo_required')
+  assert.ok(!a3Queries.some(q => q.includes('/git/trees/')), a3Queries.join('|'))
+})
+test('STRICT: ai_command runs a repo scan ONLY on the owner\'s selected branch; without a selection it is refused (no default-branch scan)', async () => {
+  filesBySha[RELSHA] = { 'package.json': '{"name":"x"}', 'src/a.js': 'export const ok = 1' }
+  planReply = JSON.stringify({ intent: 'security_scan', explanation: 'scan' })
+  await assert.rejects(() => runAction(ctx(), 'ai_command', { text: 'security check chalao' }), (e: any) => e.status === 400 && e.code === 'branch_required')
+  assert.ok(!a3Queries.some(q => q.includes('/git/trees/')))
+  const r: any = await runAction(ctx(), 'ai_command', { text: 'security check chalao', ...sel() })
+  assert.equal(r.result.branch, 'release/1.0'); assert.equal(r.result.branch_sha, RELSHA)
+  assert.ok(a3Queries.some(q => q.includes('/git/trees/' + RELSHA)) && !a3Queries.some(q => q.includes('/git/trees/main')))
+  // a purely live-site test never needs a branch
+  planReply = JSON.stringify({ intent: 'website_smoke', explanation: 'site' })
+  assert.ok((await runAction(ctx(), 'ai_command', { text: 'site check karo' })).result)
+})
+test('STRICT: Termux queue carries branch + SHA for repo scans; the phone re-pins it; a moved branch fails the queued task instead of scanning another one', async () => {
+  filesBySha[RELSHA] = { 'package.json': '{"name":"x"}', 'src/a.js': 'export const ok = 1' }
+  await assert.rejects(() => runAction(ctx(), 'queue_task', { task: 'security_scan', repo: 'me/site', branch_context_required: true }), (e: any) => e.code === 'branch_required')
+  assert.equal((db.tasks || []).length, 0)
+  const q: any = await runAction(ctx(), 'queue_task', { task: 'security_scan', ...sel() })
+  assert.equal(q.status, 'queued')
+  const row = db.tasks.find((x: any) => x.payload.runner === 'termux')!
+  assert.equal(row.payload.branch, 'release/1.0'); assert.equal(row.payload.branch_sha, RELSHA); assert.equal(row.payload.branch_context_required, true)
+  a3Queries = []; assert.equal(await workOnce(loadConfig(ENV)), 1)
+  assert.equal(row.status, 'succeeded'); assert.equal(row.result.branch, 'release/1.0')
+  assert.ok(a3Queries.some(q2 => q2.includes('/git/trees/' + RELSHA)) && !a3Queries.some(q2 => q2.includes('/git/trees/main')))
+  // queued, then the branch moves before the phone runs it
+  const q2: any = await runAction(ctx(), 'queue_task', { task: 'full_report', ...sel() })
+  a3Refs['release/1.0'] = 'd'.repeat(40); a3Queries = []
+  await workOnce(loadConfig(ENV))
+  const row2 = db.tasks.find((x: any) => x.id === q2.task_id)!
+  assert.equal(row2.status, 'failed'); assert.match(String(row2.error_message), /moved/i)
+  assert.ok(!a3Queries.some(q3 => q3.includes('/git/trees/')))
+})
+test('STRICT: retest of a repo scan that has no recorded branch is refused instead of scanning the default branch', async () => {
+  await runAction(ctx(), 'security_scan', {}) // legacy scan, no branch recorded
+  const t = db.tasks.find((x: any) => x.payload.action === 'security_scan')!
+  a3Queries = []
+  await assert.rejects(() => runAction(ctx(), 'retest', { task_id: t.id }), (e: any) => e.status === 400 && e.code === 'branch_required')
+  assert.ok(!a3Queries.some(q => q.includes('/git/trees/')))
+})
