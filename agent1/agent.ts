@@ -1,15 +1,15 @@
-import { loadConfig, readiness, secretValues, resolveProject as resolveSupaProject, type Config } from './config.js'
+import { loadConfig, readiness, secretValues, projectList, resolveProject as resolveSupaProject, type Config } from './config.js'
 import { AgentError, clip, errMsg, fingerprint, redact } from './util.js'
 import { Store } from './store.js'
 import { Vercel, type VProject } from './vercel.js'
 import { GitHub, type RepoReport } from './github.js'
 import { Q, SCHEMA_ALLOW, SupaMgmt, probeAnon } from './supa.js'
-import { summarize } from './gemini.js'
+import { summarize, planCommand } from './gemini.js'
 import { analyzeProject, analyzeRls, classifyDbChange, classifyExecutableSql, countIssues, overall, sortIssues, PUBLIC_PREFIX, type DeployItem, type EnvItem, type Issue } from './checks.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
-export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'deploy_logs', 'request_redeploy', 'apply_redeploy', 'vercel_options'] as const
+export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'deploy_logs', 'request_redeploy', 'apply_redeploy', 'vercel_options', 'project_options', 'ai_command'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -51,10 +51,10 @@ async function withTask(ctx: Ctx, action: string, title: string, payload: Record
 // ---------- collectors (read-only) ----------
 interface Part<T> { available: boolean; reason?: string; data?: T; issues: Issue[] }
 
-async function collectVercel(ctx: Ctx, o: { deployments: boolean; env: boolean }): Promise<Part<any>> {
+async function collectVercel(ctx: Ctx, o: { deployments: boolean; env: boolean }, only?: string): Promise<Part<any>> {
   if (!ctx.cfg.vercelToken) return { available: false, reason: 'AGENT1_VERCEL_TOKEN not set', issues: [{ severity: 'warn', area: 'config', message: 'Vercel monitoring not configured (AGENT1_VERCEL_TOKEN)' }] }
   const v = new Vercel(ctx.cfg, ctx.calls)
-  const projects = await v.listProjects()
+  const projects = (await v.listProjects()).filter(p => !only || p.name === only)
   const issues: Issue[] = []
   const per = await Promise.all(projects.map(async p => {
     try {
@@ -79,14 +79,16 @@ async function collectVercel(ctx: Ctx, o: { deployments: boolean; env: boolean }
   return { available: true, data: { projects: data }, issues }
 }
 
-async function collectRls(ctx: Ctx): Promise<Part<any>> {
+async function collectRls(ctx: Ctx, ref?: string): Promise<Part<any>> {
   if (!ctx.cfg.supaToken) return { available: false, reason: 'AGENT1_SUPABASE_ACCESS_TOKEN not set', issues: [{ severity: 'warn', area: 'config', message: 'Supabase inspection not configured (AGENT1_SUPABASE_ACCESS_TOKEN)' }] }
-  const s = new SupaMgmt(ctx.cfg, ctx.calls)
+  const s = new SupaMgmt(ctx.cfg, ctx.calls, ref)
   const [tables, policies] = await Promise.all([s.tables(), s.policies()])
   const issues = analyzeRls(tables, policies)
-  const probe = await probeAnon(ctx.cfg, ctx.calls, AI_TABLES)
+  const other = Boolean(ref && ref !== ctx.cfg.supabaseRef) // the anon probe only knows the default project's URL
+  const probe = other ? [] : await probeAnon(ctx.cfg, ctx.calls, AI_TABLES)
+  if (other) issues.push({ severity: 'info', area: 'config', message: 'Anon probe skipped (only runs for the default Supabase project)' })
   for (const p of probe) if (p.verdict === 'LEAK') issues.push({ severity: 'critical', area: 'supabase', message: 'anon key can read rows', target: 'ai_control.' + p.table })
-  if (!ctx.cfg.anonKey) issues.push({ severity: 'info', area: 'config', message: 'Anon probe skipped (VITE_SUPABASE_ANON_KEY not visible to server)' })
+  if (!other && !ctx.cfg.anonKey) issues.push({ severity: 'info', area: 'config', message: 'Anon probe skipped (VITE_SUPABASE_ANON_KEY not visible to server)' })
   const by: Record<string, { tables: number; rls_on: number; policies: number }> = {}
   for (const t of tables) { const b = (by[t.schema] ||= { tables: 0, rls_on: 0, policies: 0 }); b.tables++; if (t.rls) b.rls_on++ }
   for (const p of policies) { const b = (by[p.schema] ||= { tables: 0, rls_on: 0, policies: 0 }); b.policies++ }
@@ -139,7 +141,7 @@ async function partReport(ctx: Ctx, p: Part<any>): Promise<Out> {
 async function schemaReport(ctx: Ctx, params: any): Promise<Out> {
   const schema = String(params.schema || 'ai_control')
   if (!SCHEMA_ALLOW.includes(schema)) throw new AgentError('schema must be one of ' + SCHEMA_ALLOW.join(', '), 400)
-  const s = new SupaMgmt(ctx.cfg, ctx.calls)
+  const s = new SupaMgmt(ctx.cfg, ctx.calls, params.project_ref ? resolveSupaProject(ctx.cfg, String(params.project_ref)).ref : undefined) // allow-list only; empty = default project
   const [counts, functions, tables, columns] = await Promise.all([s.roQuery(Q.counts), s.roQuery(Q.functions), s.tables(), s.roQuery(Q.columns(schema))])
   const cols: Record<string, string[]> = {}
   for (const c of columns) (cols[c.table_name] ||= []).push(`${c.column_name} ${c.data_type}${c.is_nullable === 'NO' ? ' not null' : ''}`)
@@ -332,6 +334,60 @@ async function applyRedeploy(ctx: Ctx, p: any): Promise<Out> {
   })
 }
 
+// READ-ONLY lookup for the Ask box dropdowns (Vercel project names + allow-listed Supabase projects). Not logged as a task.
+async function projectOptions(ctx: Ctx): Promise<Out> {
+  let vercel: string[] = []
+  if (ctx.cfg.vercelToken) { try { vercel = (await new Vercel(ctx.cfg, ctx.calls).listProjects()).map(x => x.name) } catch { /* dropdown stays empty; the error shows when a Vercel action runs */ } }
+  return { result: { vercel, supabase: projectList(ctx.cfg).map(x => ({ ref: x.ref, label: x.label })) } }
+}
+
+// ---------- free-text command (AI picks ONE allowed action; code validates everything) ----------
+// Only read-only checks and a redeploy REQUEST (which still needs approval) can be picked. Env values and SQL are never reachable from here.
+async function aiCommand(ctx: Ctx, p: any): Promise<any> {
+  const text = String(p.text || '').trim().slice(0, 1000)
+  if (!text) throw new AgentError('Write what you want Agent 1 to do', 400)
+  const vNames: string[] = ctx.cfg.vercelToken ? (await new Vercel(ctx.cfg, ctx.calls).listProjects()).map(x => x.name) : []
+  const sList = projectList(ctx.cfg)
+  const pickedV = p.vercel_project ? String(p.vercel_project) : ''
+  if (pickedV && !vNames.includes(pickedV)) throw new AgentError('Vercel project not found (or not in AGENT1_VERCEL_PROJECTS): ' + pickedV, 404)
+  const pickedS = p.supabase_ref ? resolveSupaProject(ctx.cfg, String(p.supabase_ref)) : null // allow-list only
+  const r = await planCommand(ctx.cfg, { request: text, selected_vercel_project: pickedV || null, selected_supabase_project: pickedS ? pickedS.label : null, vercel_projects: vNames.slice(0, 50), supabase_projects: sList.map(x => x.label) })
+  await ctx.store.usage({ provider: 'gemini', model: r.model, endpoint: 'ai_command', tokens_in: r.tokensIn, tokens_out: r.tokensOut, status_code: r.status || null, cost_estimate: (r.tokensIn * ctx.cfg.priceIn + r.tokensOut * ctx.cfg.priceOut) / 1e6 })
+  if (!r.text) throw new AgentError('Gemini could not read the request: ' + (r.error || 'no answer'), 502, 'ai_unavailable')
+  let plan: any
+  try { const a = r.text.indexOf('{'), b = r.text.lastIndexOf('}'); plan = JSON.parse(r.text.slice(a, b + 1)) } catch { throw new AgentError('Gemini answer was not valid JSON. Try again in simpler words.', 502, 'ai_bad_output') }
+  const INTENTS = ['health_report', 'vercel_status', 'env_audit', 'deploy_logs', 'request_redeploy', 'supabase_schema', 'rls_check', 'github_status']
+  const intent = INTENTS.includes(String(plan && plan.intent)) ? String(plan.intent) : 'unsupported'
+  const understood = { intent, explanation: String((plan && plan.explanation) || '').slice(0, 300) }
+  // A dropdown choice always wins; otherwise the AI's pick is used only if it is exactly a known project.
+  const vp = pickedV || (typeof plan.vercel_project === 'string' && vNames.includes(plan.vercel_project) ? plan.vercel_project : '')
+  const sp = pickedS || sList.find(x => typeof plan.supabase_project === 'string' && x.label.toLowerCase() === plan.supabase_project.toLowerCase()) || null
+  const spLabel = sp ? ' [' + sp.label + ']' : ''
+  const asked = { via: 'ask_agent' }
+  let out: any
+  switch (intent) {
+    case 'health_report': out = await withTask(ctx, 'health_report', 'Infrastructure health report', asked, () => healthReport(ctx)); break
+    case 'vercel_status': out = await withTask(ctx, 'vercel_status', 'Vercel status' + (vp ? ': ' + vp : ''), { ...asked, project: vp || null }, async () => partReport(ctx, await collectVercel(ctx, { deployments: true, env: false }, vp || undefined))); break
+    case 'env_audit': out = await withTask(ctx, 'env_audit', 'Environment variable audit' + (vp ? ': ' + vp : ''), { ...asked, project: vp || null }, async () => partReport(ctx, await collectVercel(ctx, { deployments: false, env: true }, vp || undefined))); break
+    case 'deploy_logs': out = await withTask(ctx, 'deploy_logs', 'Vercel deployment error logs' + (vp ? ': ' + vp : ''), { ...asked, project: vp || null }, () => deployLogs(ctx, { project: vp })); break
+    case 'request_redeploy': {
+      if (!vp) throw new AgentError('Pick the Vercel project to redeploy from the dropdown, then ask again', 400, 'project_required')
+      const target = plan.target === 'preview' || plan.target === 'production' ? plan.target : undefined
+      out = await requestRedeploy(ctx, { project: vp, target }); break
+    }
+    case 'supabase_schema': {
+      const schema = SCHEMA_ALLOW.includes(String(plan.schema)) ? String(plan.schema) : 'ai_control'
+      out = await withTask(ctx, 'supabase_schema', 'Supabase schema inspection' + spLabel, { ...asked, schema, project_ref: sp ? sp.ref : null }, () => schemaReport(ctx, { schema, project_ref: sp ? sp.ref : undefined })); break
+    }
+    case 'rls_check': out = await withTask(ctx, 'rls_check', 'RLS & permissions verification' + spLabel, { ...asked, project_ref: sp ? sp.ref : null }, async () => partReport(ctx, await collectRls(ctx, sp ? sp.ref : undefined))); break
+    case 'github_status': out = await withTask(ctx, 'github_status', 'GitHub repository status (read-only)', asked, () => githubStatus(ctx)); break
+    default:
+      await ctx.store.log('warn', 'agent1_command_unsupported', understood.explanation || 'unsupported request', {}, null, ctx.actor.id)
+      return { status: 'succeeded', result: { unsupported: true, message: understood.explanation || 'This request is not something Agent 1 can do safely from the Ask box. Use the forms below for env or database changes.' }, understood }
+  }
+  return { ...out, understood }
+}
+
 export async function runAction(ctx: Ctx, action: string, params: any = {}): Promise<any> {
   if (!(ACTIONS as readonly string[]).includes(action)) throw new AgentError('Unknown action', 400, 'unknown_action')
   switch (action as Action) {
@@ -352,6 +408,8 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'deploy_logs': return withTask(ctx, action, 'Vercel deployment error logs', { project: params.project || null }, () => deployLogs(ctx, params))
     case 'vercel_options': return vercelOptions(ctx)
     case 'request_redeploy': return requestRedeploy(ctx, params)
+    case 'project_options': return projectOptions(ctx)
+    case 'ai_command': return aiCommand(ctx, params)
     case 'apply_redeploy': return applyRedeploy(ctx, params)
   }
 }

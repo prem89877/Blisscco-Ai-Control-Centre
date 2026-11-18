@@ -36,12 +36,21 @@ export function useAgent1Heartbeat(enabled) {
 
 function Report({ res }) {
   const r = res.result || {}
+  if (r.unsupported) {
+    return (
+      <div className="card">
+        {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
+        <CodeBlock label="not possible" tone="warn" text={r.message} />
+      </div>
+    )
+  }
   const tone = r.overall === 'critical' ? 'bad' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'info' : 'good'
   const badge = r.overall === 'critical' ? 'error' : r.overall === 'attention' ? 'warn' : res.status === 'awaiting_approval' ? 'awaiting_approval' : 'ok'
   const issues = (r.issues || []).map(i => '[' + String(i.severity).toUpperCase() + '] ' + (i.target ? i.target + ': ' : '') + i.message).join('\n')
   return (
     <div className="card">
       <div className="row"><b>Result</b><Badge s={badge} /></div>
+      {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
       {r.ai_summary && <CodeBlock label="summary" tone={tone} text={r.ai_summary} />}
       {r.ai_note && <CodeBlock label="ai note" tone="warn" text={'AI summary unavailable: ' + r.ai_note} />}
       {res.status === 'awaiting_approval' && r.next && <CodeBlock label="next step" tone="info" text={r.next} />}
@@ -205,6 +214,36 @@ function ApplyRedeploy({ a, onDone, setErr }) {
   )
 }
 
+function AskBox({ onResult, setErr }) {
+  const [opts, setOpts] = useState(null)
+  const [vp, setVp] = useState('')
+  const [sp, setSp] = useState('')
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => { callAgent1('project_options').then(r => setOpts(r.result || { vercel: [], supabase: [] })).catch(e => setErr(e.message)) }, [])
+  async function go() {
+    setBusy(true); setErr('')
+    try { onResult(await callAgent1('ai_command', { text, vercel_project: vp || undefined, supabase_ref: sp || undefined })); setText('') } catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  const supa = ((opts && opts.supabase) || []).filter(x => x.label !== 'default')
+  return (
+    <div className="card">
+      <b>Ask Agent 1</b> <span className="sub">(write anything; AI picks ONE safe check. Redeploy still needs approval)</span>
+      <select value={vp} onChange={e => setVp(e.target.value)} disabled={!opts} style={{ marginTop: 8 }}>
+        <option value="">{opts ? (opts.vercel.length ? 'All Vercel projects' : 'No Vercel projects') : 'Loading Vercel projects...'}</option>
+        {((opts && opts.vercel) || []).map(n => <option key={n} value={n}>{n}</option>)}
+      </select>
+      <select value={sp} onChange={e => setSp(e.target.value)} disabled={!opts}>
+        <option value="">{opts ? 'Default Supabase project' : 'Loading Supabase projects...'}</option>
+        {supa.map(x => <option key={x.ref} value={x.ref}>{x.label}</option>)}
+      </select>
+      <textarea rows={3} placeholder="e.g. vercel ka status batao / last failed deploy ka log dikhao / rls check karo / is project ko redeploy karo" value={text} onChange={e => setText(e.target.value)} />
+      <button className="btn" disabled={busy || !text.trim()} onClick={go}>{busy ? 'Thinking...' : 'Do it'}</button>
+    </div>
+  )
+}
+
 function DbProposal({ onResult, setErr }) {
   const [title, setTitle] = useState('')
   const [sql, setSql] = useState('')
@@ -259,6 +298,7 @@ export default function Agent1Panel() {
       {res && <Report res={res} />}
       <PendingInline kinds={['env_change', 'db_change', 'redeploy']} onDone={reload} />
       {applicable.length > 0 && <><div className="sec-title">Approved - ready to apply</div>{applicable.map(a => a.details.kind === 'db_change' ? <ApplyDb key={a.id} a={a} onDone={reload} setErr={setErr} /> : a.details.kind === 'redeploy' ? <ApplyRedeploy key={a.id} a={a} onDone={reload} setErr={setErr} /> : <Apply key={a.id} a={a} onDone={reload} setErr={setErr} />)}</>}
+      <AskBox onResult={setRes} setErr={setErr} />
       <EnvRequest onResult={setRes} setErr={setErr} />
       <RedeployRequest onResult={setRes} setErr={setErr} />
       <DbProposal onResult={setRes} setErr={setErr} />

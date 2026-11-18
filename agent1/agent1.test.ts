@@ -29,10 +29,11 @@ let sqlExec: string[]
 let vercelWrites: { method: string; url: string; body: any }[]
 let envs: Row[]
 let seq = 0
+let geminiText: string | null = null // when set, the fake Gemini answers with this text (planner tests)
 const uuid = () => '00000000-0000-4000-8000-' + String(++seq).padStart(12, '0')
 
 function reset() {
-  seq = 0; ext = []; dbWrites = []; sqlExec = []; vercelWrites = []
+  seq = 0; geminiText = null; ext = []; dbWrites = []; sqlExec = []; vercelWrites = []
   db = { agents: [1, 2, 3].map(s => ({ id: uuid(), slot: s, name: 'Agent ' + s, description: 'Placeholder - not built yet', status: 'offline', last_heartbeat_at: null, updated_at: new Date().toISOString(), config: {} })), tasks: [], approvals: [], activity_logs: [], api_usage: [], system_health: [], owners: [{ user_id: 'user-owner', role: 'owner' }] }
   envs = [
     { id: 'e1', key: 'VITE_SUPABASE_URL', type: 'plain', target: ['production', 'preview'] },
@@ -87,7 +88,7 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   }
   if (url.host === 'generativelanguage.googleapis.com') {
     ext.push({ method, url: url.host + url.pathname })
-    return json({ candidates: [{ content: { parts: [{ text: '- Fix failing production build.' }] } }], usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 30 } })
+    return json({ candidates: [{ content: { parts: [{ text: geminiText ?? '- Fix failing production build.' }] } }], usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 30 } })
   }
   if (url.host === `${REF}.supabase.co`) {
     if (url.pathname === '/auth/v1/user') {
@@ -347,4 +348,53 @@ test('vercel_options lists projects+deployments read-only; redeploy honours targ
   assert.equal(bad.status, 400)
   assert.equal((await post({ action: 'request_redeploy', params: { project: 'ai-control-center', target: 'staging' } }) as any).status, 400)
   assert.equal(vercelWrites.length, 0)
+})
+
+// ---------- Ask Agent 1 (free-text command) ----------
+const plan = (o: Record<string, unknown>) => { geminiText = JSON.stringify(o) }
+test('project_options lists Vercel projects and the Supabase allow-list, read-only', async () => {
+  reset()
+  const r: any = await post({ action: 'project_options' }, 'tok-owner', { ...ENV, AGENT1_SUPABASE_PROJECTS: 'test=testref12345,prod=prodref12345' })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  assert.deepEqual(r.body.result.vercel, ['ai-control-center'])
+  assert.deepEqual(r.body.result.supabase.map((x: any) => x.label), ['default', 'test', 'prod'])
+  assert.equal(vercelWrites.length, 0); assert.equal(db.tasks.length, 0)
+})
+test('ai_command: AI picks a read-only check, task is logged, nothing is written', async () => {
+  reset(); plan({ intent: 'vercel_status', explanation: 'Vercel status dekh raha hoon', vercel_project: 'ai-control-center' })
+  const r: any = await post({ action: 'ai_command', params: { text: 'vercel ka status batao' } })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  assert.equal(r.body.understood.intent, 'vercel_status'); assert.equal(r.body.status, 'succeeded')
+  assert.equal(db.tasks.length, 1); assert.equal(db.tasks[0].payload.via, 'ask_agent')
+  assert.ok(db.api_usage.some(u => u.endpoint === 'ai_command'))
+  assert.equal(vercelWrites.length, 0)
+})
+test('ai_command: redeploy only creates an approval, and needs a chosen Vercel project', async () => {
+  reset(); plan({ intent: 'request_redeploy', explanation: 'redeploy', target: 'preview' })
+  const none: any = await post({ action: 'ai_command', params: { text: 'redeploy karo' } })
+  assert.equal(none.status, 400)
+  const r: any = await post({ action: 'ai_command', params: { text: 'redeploy karo', vercel_project: 'ai-control-center' } })
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  assert.equal(r.body.status, 'awaiting_approval'); assert.equal(r.body.understood.intent, 'request_redeploy')
+  assert.equal(db.approvals.length, 1); assert.equal(vercelWrites.length, 0)
+})
+test('ai_command: dangerous or unknown intents are unsupported; unknown dropdown projects are refused', async () => {
+  reset(); plan({ intent: 'apply_db_change', explanation: 'run sql' })
+  const u: any = await post({ action: 'ai_command', params: { text: 'drop table agents' } })
+  assert.equal(u.status, 200); assert.equal(u.body.result.unsupported, true); assert.equal(u.body.understood.intent, 'unsupported')
+  assert.equal(sqlExec.length, 0); assert.equal(db.tasks.length, 0)
+  const badV: any = await post({ action: 'ai_command', params: { text: 'status', vercel_project: 'not-mine' } })
+  assert.equal(badV.status, 404)
+  const badS: any = await post({ action: 'ai_command', params: { text: 'schema', supabase_ref: 'unknownref99' } })
+  assert.equal(badS.status, 403)
+  assert.equal((await post({ action: 'ai_command', params: { text: '  ' } }) as any).status, 400)
+})
+test('ai_command: Supabase dropdown project is used for schema checks (allow-list only)', async () => {
+  reset(); plan({ intent: 'supabase_schema', explanation: 'schema', schema: 'public' })
+  const env = { ...ENV, AGENT1_SUPABASE_PROJECTS: 'test=testref12345' }
+  const r: any = await post({ action: 'ai_command', params: { text: 'tables dikhao', supabase_ref: 'testref12345' } }, 'tok-owner', env)
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  assert.ok(ext.some(c => c.url === 'api.supabase.com/v1/projects/testref12345/database/query/read-only'))
+  assert.ok(!ext.some(c => c.url.includes('/projects/' + REF + '/')))
+  assert.equal(sqlExec.length, 0)
 })
