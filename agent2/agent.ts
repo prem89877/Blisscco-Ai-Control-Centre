@@ -80,6 +80,17 @@ const READ_LIMIT = 60_000
 export interface BaseScope { strict: boolean; branch: string; pins: string[]; working: boolean }
 export const isStrict = (p: any) => Boolean(p && (p.branch_context_required || p.selected_branch))
 export const isWorkingBranch = (b: unknown) => typeof b === 'string' && b.startsWith('agent2/')
+// CONTINUE-ON-EXISTING-BRANCH: by default every proposal creates a NEW agent2/* branch from the selected base. When the owner's request names
+// an existing agent2/* branch AND says to keep using it ("existing", "naya mat banao", "isi branch"...), the change is appended as ONE more
+// commit on that branch instead. Never silent: an unknown or ambiguous branch name is an error, not a quiet fallback to a new branch.
+const CONTINUE_WORDS = /(existing|continue|same branch|naya mat|nayi? branch mat|new branch mat|do not create|don'?t create|isi branch|usi branch|working branch)/i
+export function namedWorkingBranch(text: string, existing: string[]): string | undefined {
+  const named = [...new Set((String(text).match(/agent2\/[A-Za-z0-9][A-Za-z0-9._\/-]*/g) || []).map(t => t.replace(/[.\/-]+$/, '')))]
+  if (!named.length || !CONTINUE_WORDS.test(text)) return undefined
+  if (named.length > 1) throw new AgentError('The request names more than one agent2/* branch (' + named.slice(0, 4).join(', ') + '). Name exactly one branch to continue on.', 400, 'branch_ambiguous')
+  if (!existing.includes(named[0])) throw new AgentError('Branch to continue on does not exist: ' + named[0] + '. Nothing was proposed (no new branch is created silently).', 404, 'branch_not_found')
+  return named[0]
+}
 export function scopeOf(p: any, key: 'ref' | 'base' | 'branch', opts: { allowWorking?: boolean } = {}): BaseScope {
   const strict = isStrict(p)
   const sel = p.selected_branch ? String(p.selected_branch) : ''
@@ -186,6 +197,8 @@ export async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: strin
   const description = String(p.description || '').slice(0, 1000)
   const files: FileIn[] = validateFiles(p.files, { ...LIMITS, maxFiles: Math.max(LIMITS.maxFiles, devLimits().maxChangeFiles) })
   scopeOf(p, 'base') // strict requests without a base fail BEFORE any task is created
+  const cont = p.continue_branch ? String(p.continue_branch) : '' // optional: append one commit to this EXISTING agent2/* branch instead of creating a new one
+  if (cont) assertAgentBranch(cont, ctx.cfg.protectedBranches)
   return withTask(ctx, 'propose_change', 'Propose: ' + title, { repo, files }, async taskId => {
     const sc = scopeOf(p, 'base')
     const info = await gh.info(repo)
@@ -196,7 +209,15 @@ export async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: strin
     // Optional owner/Orchestrator pin (ZIP deployments): refuse to build a proposal against a base that has moved.
     if (p.expected_base_sha !== undefined && (!/^[a-f0-9]{40}$/i.test(String(p.expected_base_sha)) || String(p.expected_base_sha).toLowerCase() !== baseSha.toLowerCase()))
       throw new AgentError(`Base branch ${base} moved since the ZIP was checked (now ${baseSha.slice(0, 7)}). Nothing was proposed; upload again.`, 409, 'base_changed')
-    const tree = await gh.tree(repo, await gh.commitTreeSha(repo, baseSha))
+    // Append mode: the diff is computed against the CURRENT tip of the branch being continued, and that tip is pinned in the approval.
+    let contSha: string | null = null
+    if (cont) {
+      contSha = await gh.branchSha(repo, cont)
+      if (!contSha) throw new AgentError('Branch to continue on not found: ' + cont + '. Nothing was proposed.', 404, 'branch_not_found')
+      if (p.expected_continue_sha !== undefined && String(p.expected_continue_sha).toLowerCase() !== contSha.toLowerCase())
+        throw new AgentError(`Branch ${cont} moved since it was analysed (now ${contSha.slice(0, 7)}). Nothing was proposed; run the request again.`, 409, 'base_changed')
+    }
+    const tree = await gh.tree(repo, await gh.commitTreeSha(repo, contSha || baseSha))
     const byPath = new Map(tree.map(e => [e.path, e]))
     const entries: any[] = []
     const warnings: string[] = []
@@ -205,7 +226,7 @@ export async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: strin
       const ex = byPath.get(f.path)
       if (ex && ex.mode !== '100644' && ex.mode !== '100755') throw new AgentError('Not a regular file: ' + f.path, 400, 'bad_path')
       if (f.op === 'create' && ex) throw new AgentError(`${f.path} already exists. Use op "update" so nothing is overwritten by accident.`, 409, 'exists')
-      if (f.op !== 'create' && !ex) throw new AgentError(`${f.path} does not exist in ${base}`, 404, 'not_found')
+      if (f.op !== 'create' && !ex) throw new AgentError(`${f.path} does not exist in ${cont || base}`, 404, 'not_found')
       const old = ex ? await gh.blobText(repo, ex.sha) : null
       if (f.op === 'update' && old === f.content) throw new AgentError('No change in ' + f.path, 400, 'no_change')
       const st = diffStats(old, f.op === 'delete' ? null : (f.content as string))
@@ -237,14 +258,15 @@ export async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: strin
     })
     if (ai.error && ai.text) warnings.push(ai.error)
     await recordAi(ctx, 'propose_change_review', ai)
-    const branch = branchFor(title)
+    const branch = cont || branchFor(title)
     assertAgentBranch(branch, ctx.cfg.protectedBranches)
+    const append = Boolean(cont)
     const ap = await ctx.store.createApproval({
       task_id: taskId, title: `Code change: ${title}`,
-      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, selected_branch: sc.strict ? base : null, branch, working_branch: branch, commit_destination: branch, ci_target_branch: branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, dev_report: fix ? fix.dev_report : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
+      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, selected_branch: sc.strict ? base : null, branch, working_branch: branch, commit_destination: branch, ci_target_branch: branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, dev_report: fix ? fix.dev_report : undefined, production: false, mode: append ? 'append' : 'new_branch', parent_sha: contSha, note: append ? `Adds ONE commit to the existing branch ${branch} (tip ${String(contSha).slice(0, 7)}). No new branch is created. ${base} is not touched.` : `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
     })
     await ctx.store.log('warn', 'agent2_approval_requested', 'Code change: ' + title, { approval_id: ap.id }, taskId, ctx.actor.id)
-    return { status: 'awaiting_approval', result: { approval_id: ap.id, repo, branch, working_branch: branch, commit_destination: branch, ci_target_branch: branch, base_branch: base, base: `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null, estimated_cost_usd: Number(((ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1_000_000).toFixed(6)) }, base_sha: baseSha, next: 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.' + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, repo, branch, working_branch: branch, commit_destination: branch, ci_target_branch: branch, base_branch: base, mode: append ? 'append' : 'new_branch', parent_sha: contSha, base: append ? `${branch}@${String(contSha).slice(0, 7)} (existing branch; selected base ${base}@${baseSha.slice(0, 7)})` : `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null, estimated_cost_usd: Number(((ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1_000_000).toFixed(6)) }, base_sha: baseSha, next: (append ? 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console. It adds ONE commit to the existing branch ' + branch + ' (no new branch).' : 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.') + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
   })
 }
 
@@ -298,19 +320,26 @@ async function applyChange(ctx: Ctx, p: any): Promise<any> {
   return withTask(ctx, 'apply_change', 'Apply: ' + ap.title, { approval_id: ap.id, branch: d.branch }, async () => {
     const gh = new GitHub(ctx.cfg, ctx.calls)
     // Approval is bound to repo + base branch + base SHA. If the base moved or vanished, nothing is claimed or written.
-    const currentBaseSha = await gh.branchSha(d.repo, d.base_branch)
-    if (!currentBaseSha || currentBaseSha.toLowerCase() !== String(d.base_sha).toLowerCase()) throw new AgentError('Base branch changed or was deleted after approval. Request a fresh analysis and approval.', 409, 'base_changed')
+    // Append mode (continue on an existing agent2/* branch): the pinned thing is that branch's tip, and it must still be exactly what was analysed.
+    const append = d.mode === 'append'
+    const parentSha: string = append ? String(d.parent_sha || '') : String(d.base_sha)
+    if (append) {
+      const tip = await gh.branchSha(d.repo, d.branch)
+      if (!parentSha || !tip || tip.toLowerCase() !== parentSha.toLowerCase()) throw new AgentError(`Branch ${d.branch} changed or was deleted after approval. Nothing was written. Request a fresh analysis and approval.`, 409, 'base_changed')
+    } else {
+      const currentBaseSha = await gh.branchSha(d.repo, d.base_branch)
+      if (!currentBaseSha || currentBaseSha.toLowerCase() !== String(d.base_sha).toLowerCase()) throw new AgentError('Base branch changed or was deleted after approval. Request a fresh analysis and approval.', 409, 'base_changed')
+    }
     await claim(ctx, ap, d)
     let created = false
     try {
-      await gh.createBranch(d.repo, d.branch, d.base_sha)
-      created = true
-      const commitSha = await gh.commit(d.repo, d.branch, d.base_sha, `${d.title}\n\nAgent 2 change ${ap.id}`, files)
+      if (!append) { await gh.createBranch(d.repo, d.branch, d.base_sha); created = true } // append never creates or deletes a branch: commit() is a fast-forward only
+      const commitSha = await gh.commit(d.repo, d.branch, parentSha, `${d.title}\n\nAgent 2 change ${ap.id}`, files)
       await ctx.store.patchApproval(ap.id, { details: { ...d, executed_at: now(), executed_by: ctx.actor.id, commit_sha: commitSha } })
       if (ap.task_id) await ctx.store.updateTask(ap.task_id, { status: 'succeeded', finished_at: now(), result: { applied: true, branch: d.branch, commit_sha: commitSha } })
       await ctx.store.log('success', 'agent2_branch_pushed', `${d.repo} ${d.branch}`, { approval_id: ap.id, commit: commitSha }, null, ctx.actor.id)
       const mon = await monitor(ctx, d.repo, d.branch).catch(() => null)
-      return { result: { applied: true, repo: d.repo, branch: d.branch, working_branch: d.branch, ci_target_branch: d.branch, commit_destination: d.branch, base_branch: d.base_branch, base_sha: d.base_sha, commit_sha: commitSha, base: `${d.base_branch}@${String(d.base_sha).slice(0, 7)}`, changed_files: d.files.map((e: any) => ({ path: e.path, op: e.op, added: e.added, removed: e.removed })), compare_url: `https://github.com/${d.repo}/compare/${d.base_branch}...${d.branch}`, ci_runs: mon ? mon.runs : [], deployments: mon ? mon.deployments : [], deployment_trigger: mon && (mon.runs.length || mon.deployments.length) ? 'triggered (see ci_runs / deployments)' : 'not seen yet; open Monitor in about a minute', production_touched: false, rollback: 'Request rollback deletes this branch; ' + d.base_branch + ' was never touched.' } }
+      return { result: { applied: true, repo: d.repo, branch: d.branch, working_branch: d.branch, ci_target_branch: d.branch, commit_destination: d.branch, base_branch: d.base_branch, base_sha: d.base_sha, mode: append ? 'append' : 'new_branch', parent_sha: parentSha, commit_sha: commitSha, base: append ? `${d.branch}@${parentSha.slice(0, 7)} (existing branch continued)` : `${d.base_branch}@${String(d.base_sha).slice(0, 7)}`, changed_files: d.files.map((e: any) => ({ path: e.path, op: e.op, added: e.added, removed: e.removed })), compare_url: `https://github.com/${d.repo}/compare/${d.base_branch}...${d.branch}`, ci_runs: mon ? mon.runs : [], deployments: mon ? mon.deployments : [], deployment_trigger: mon && (mon.runs.length || mon.deployments.length) ? 'triggered (see ci_runs / deployments)' : 'not seen yet; open Monitor in about a minute', production_touched: false, rollback: append ? 'This commit was added to an existing branch. Request rollback would delete the WHOLE branch (including earlier commits); to undo only this commit use GitHub revert. ' + d.base_branch + ' was never touched.' : 'Request rollback deletes this branch; ' + d.base_branch + ' was never touched.' } }
     } catch (e) {
       if (created) await gh.deleteBranch(d.repo, d.branch).catch(() => {}) // leave nothing half-done so a retry is clean
       await release(ctx, ap, d, e)

@@ -230,6 +230,7 @@ function Apply({ a, onDone, onResult, setErr }) {
     <div className="card">
       <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
       {d.kind === 'code_change' && <div className="sub">{d.repo} | base: {d.base_branch}@{String(d.base_sha || '').slice(0, 7)} | working: {d.working_branch || d.branch} | commit: {d.commit_destination || d.branch} | CI: {d.ci_target_branch || d.branch} | {d.files.length} file(s)</div>}
+      {d.kind === 'code_change' && d.mode === 'append' && <div className="sub">Adds ONE commit to the existing branch {d.branch}@{String(d.parent_sha || '').slice(0, 7)} (no new branch).</div>}
       {d.kind !== 'code_change' && <div className="sub">{d.repo} | base: {d.base_branch || d.ref || '-'}{d.base_sha ? '@' + String(d.base_sha).slice(0, 7) : ''}{d.branch ? ' | working: ' + d.branch : ''}{d.ref && d.ref.startsWith('agent2/') ? ' | working: ' + d.ref : ''}</div>}
       <SelectedLine agent="agent2" label="Selector" />
       {needAck && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> {k.ackText}</label>}
@@ -302,10 +303,11 @@ function ProposalForm({ title, hint, defaultKind, fixedKind, placeholder, initia
   const [kind, setKind] = useState(defaultKind || 'feature')
   const [request, setRequest] = useState(initialText || '')
   const [paths, setPaths] = useState('')
+  const [contBranch, setContBranch] = useState('')
   const [busy, setBusy] = useState(false)
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent2('dev_proposal', { repo: selectedRepo('agent2', repos), kind: fixedKind || kind, request, paths: paths.split(',').map(x => x.trim()).filter(Boolean) })); setRequest('') }
+    try { onResult(await callAgent2('dev_proposal', { repo: selectedRepo('agent2', repos), kind: fixedKind || kind, request, paths: paths.split(',').map(x => x.trim()).filter(Boolean), ...(contBranch.trim() ? { continue_branch: contBranch.trim() } : {}) })); setRequest('') }
     catch (e) { setErr(e.message) }
     setBusy(false)
   }
@@ -316,6 +318,7 @@ function ProposalForm({ title, hint, defaultKind, fixedKind, placeholder, initia
       {!fixedKind && <select value={kind} onChange={e => setKind(e.target.value)}>{KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>}
       <textarea rows={4} placeholder={placeholder} value={request} onChange={e => setRequest(e.target.value)} />
       <input placeholder="Files to look at (optional, comma separated)" value={paths} onChange={e => setPaths(e.target.value)} autoCapitalize="none" />
+      <input placeholder="Continue on existing agent2/* branch (optional; empty = new branch)" value={contBranch} onChange={e => setContBranch(e.target.value)} autoCapitalize="none" />
       <button className="btn" disabled={busy || !request.trim() || !repos.length} onClick={go}>{busy ? 'Working (plan, code, review)... may take a minute' : 'Create proposal'}</button>
     </div>
   )

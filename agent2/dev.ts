@@ -3,7 +3,7 @@ import { AgentError, redactString } from './util.js'
 import { GitHub } from './github.js'
 import { assist, chatAi, codegen, devReview, planDev, type AiResult } from './gemini.js'
 import { LIMITS, scanSecrets, validateFiles, validatePath, validRepo, type FileIn } from './guard.js'
-import { proposeChange, recordAi, monitor, withTask, scopeOf, assertPins, isStrict, type Ctx, type Out } from './agent.js'
+import { proposeChange, recordAi, monitor, withTask, scopeOf, assertPins, isStrict, isWorkingBranch, namedWorkingBranch, type Ctx, type Out } from './agent.js'
 
 // Professional developer layer. Everything here only READS GitHub and ASKS the model; the only write path is the existing
 // propose_change -> Approvals -> apply_change pipeline, so every security guard (protected branches, secret scan, content hash,
@@ -166,10 +166,25 @@ async function devProposal(ctx: Ctx, p: any): Promise<any> {
     await progress('inspect', 'reading repository')
     // Strict (dashboard): base = ref = the owner's selected branch pinned by SHA. Legacy callers keep their explicit ref/base.
     const sc = isStrict(p) ? scopeOf(p, 'base') : null
-    const rc = await gather(ctx, repo, sc ? sc.branch : (p.ref ? String(p.ref) : undefined), request, (Array.isArray(p.paths) ? p.paths : []).map(String), sc ? undefined : (p.branch_sha ? String(p.branch_sha) : undefined), Boolean(sc))
-    if (sc) assertPins(rc.sha, sc.pins, 'Selected base branch')
-    else if (p.branch_sha && String(p.branch_sha).toLowerCase() !== rc.sha.toLowerCase()) throw new AgentError('Selected base branch moved since selection. Refresh the branch and run a fresh analysis.', 409, 'base_changed')
+    // CONTINUE ON AN EXISTING agent2/* BRANCH (instead of creating a new one): explicit `continue_branch`, or an existing agent2/* branch named in the
+    // request together with words like "existing" / "naya mat banao" / "isi branch". Unknown or ambiguous names are errors (never a silent new branch).
+    const ghb = new GitHub(ctx.cfg, ctx.calls)
+    let cont = p.continue_branch ? String(p.continue_branch) : ''
+    if (cont) {
+      if (!isWorkingBranch(cont)) throw new AgentError('continue_branch must be an existing agent2/* branch: ' + cont.slice(0, 80), 400, 'bad_continue_branch')
+      if (!(await ghb.agentBranches(repo)).includes(cont)) throw new AgentError('Branch to continue on does not exist: ' + cont.slice(0, 100), 404, 'branch_not_found')
+    } else if (/agent2\//.test(request)) cont = namedWorkingBranch(request, await ghb.agentBranches(repo)) || ''
+    const rc = await gather(ctx, repo, cont || (sc ? sc.branch : (p.ref ? String(p.ref) : undefined)), request, (Array.isArray(p.paths) ? p.paths : []).map(String), sc || cont ? undefined : (p.branch_sha ? String(p.branch_sha) : undefined), Boolean(sc))
     const base = sc ? sc.branch : (String(p.base || p.ref || '') || undefined)
+    let selSha = rc.sha // SHA of the owner's selected base (pinned in the approval); in continue mode the branch tip is pinned separately
+    if (cont) {
+      const baseName = base || (await rc.gh.info(repo)).default_branch // legacy callers only; the dashboard always carries the selection
+      const bsha = await rc.gh.branchSha(repo, baseName)
+      if (!bsha) throw new AgentError('Base branch not found: ' + baseName, 404, sc ? 'branch_not_found' : 'not_found')
+      if (sc) assertPins(bsha, sc.pins, 'Selected base branch')
+      selSha = bsha
+    } else if (sc) assertPins(rc.sha, sc.pins, 'Selected base branch')
+    else if (p.branch_sha && String(p.branch_sha).toLowerCase() !== rc.sha.toLowerCase()) throw new AgentError('Selected base branch moved since selection. Refresh the branch and run a fresh analysis.', 409, 'base_changed')
     // 3-4. analyse + plan (pass 1 may ask to read more files, pass 2 sees them)
     await progress('plan', 'analysing existing code and planning')
     let plan = await planOnce(ctx, request, kind, rc, hist(p.history, lim.historyTurns))
@@ -230,7 +245,7 @@ async function devProposal(ctx: Ctx, p: any): Promise<any> {
     }
     // 10. submit for owner approval via the existing guarded pipeline (branch name, base pin, content hash, secret scan, sensitive ack)
     await progress('submit', 'creating approval')
-    const out = await proposeChange(ctx, { ...(sc ? { branch_context_required: true, selected_branch: sc.branch, selected_branch_sha: rc.sha } : {}), repo, expected_base_sha: rc.sha, title: str(p.title || plan.summary || request, 100), description: str(plan.summary || request, 1000), base, files }, { explanation: str(report.review.what_changed || plan.summary, 500), dev_report: report })
+    const out = await proposeChange(ctx, { ...(sc ? { branch_context_required: true, selected_branch: sc.branch, selected_branch_sha: selSha } : {}), repo, expected_base_sha: selSha, title: str(p.title || plan.summary || request, 100), description: str(plan.summary || request, 1000), base, files, ...(cont ? { continue_branch: cont, expected_continue_sha: rc.sha } : {}) }, { explanation: str(report.review.what_changed || plan.summary, 500), dev_report: report })
     await progress('awaiting_approval')
     return { status: 'awaiting_approval', result: { ...out.result, dev_report: report, progress: stages } }
   })

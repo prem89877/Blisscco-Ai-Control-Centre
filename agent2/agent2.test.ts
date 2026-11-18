@@ -9,7 +9,7 @@ import { loadConfig } from './config.js'
 import { extractFailedLog, redact } from './util.js'
 import { assertAgentBranch, branchFor, classifyCommand, diffStats, gitBlobSha, isSensitivePath, scanSecrets, tokenize, validateFiles, validatePath } from './guard.js'
 import { handleRequest } from './server.js'
-import { makeCtx, runAction } from './agent.js'
+import { makeCtx, namedWorkingBranch, runAction } from './agent.js'
 import { parseGithubRepo, runLocal } from './local.js'
 import { GitHub } from './github.js'
 
@@ -1088,4 +1088,76 @@ test('STRICT 7b: promote / rollback from the dashboard need the selected base an
   const p = await ok('request_promote', UI(REL, sha, { branch: a.branch, branch_sha: undefined }))
   assert.equal(db.approvals.at(-1)!.details.base_branch, REL); assert.equal(p.result.scope.base_branch, REL); assert.equal(p.result.scope.working_branch, a.branch)
   await must('request_rollback', { repo: REPO, branch: a.branch, branch_context_required: true }, 400, 'branch_required')
+})
+
+// ================================================================ continue on an EXISTING agent2/* branch (no new branch per proposal)
+const firstBranch = async () => { const r = await ok('propose_change', CHANGE); approve(r.result.approval_id); return (await ok('apply_change', { approval_id: r.result.approval_id })).result }
+const SECOND = { title: 'Second change', files: [{ path: 'src/App.jsx', op: 'update', content: 'export const a = 1\nexport const b = 4\n' }] }
+
+test('CONTINUE 1: namedWorkingBranch needs an existing agent2/* name AND an explicit "keep this branch" word; never silent', () => {
+  const ex = ['agent2/fix-csp-2611180211', 'agent2/other-2611170000']
+  assert.equal(namedWorkingBranch('Working branch (existing, naya mat banao): agent2/fix-csp-2611180211. Sirf ek file.', ex), 'agent2/fix-csp-2611180211')
+  assert.equal(namedWorkingBranch('isi branch par commit karo: agent2/fix-csp-2611180211.', ex), 'agent2/fix-csp-2611180211') // trailing dot stripped
+  assert.equal(namedWorkingBranch('Update the test on agent2/fix-csp-2611180211', ex), undefined) // no continue word: normal new-branch flow
+  assert.equal(namedWorkingBranch('Works only on agent2/* branches, naya mat banao', ex), undefined) // "agent2/*" is not a branch name
+  assert.equal(namedWorkingBranch('existing branch please', ex), undefined) // no branch named
+  assert.throws(() => namedWorkingBranch('existing branch agent2/ghost-1', ex), (e: any) => e.status === 404 && e.code === 'branch_not_found')
+  assert.throws(() => namedWorkingBranch('existing: agent2/fix-csp-2611180211 and agent2/other-2611170000', ex), (e: any) => e.status === 400 && e.code === 'branch_ambiguous')
+})
+
+test('CONTINUE 2: continue_branch adds ONE commit to the existing agent2/* branch - no new branch, parent = pinned tip, main untouched', async () => {
+  const a1 = await firstBranch(); const mainSha = refs.get('main')!
+  const branchesBefore = [...refs.keys()].filter(k => k.startsWith('agent2/'))
+  const r = await ok('propose_change', UI('main', mainSha, { ...SECOND, continue_branch: a1.branch }))
+  assert.equal(r.result.branch, a1.branch); assert.equal(r.result.mode, 'append'); assert.equal(r.result.parent_sha, a1.commit_sha)
+  assert.equal(r.result.working_branch, a1.branch); assert.equal(r.result.commit_destination, a1.branch); assert.equal(r.result.ci_target_branch, a1.branch)
+  assert.equal(r.result.changed_files.length, 1); assert.match(r.result.next, /existing branch/)
+  const ap = db.approvals.find(x => x.id === r.result.approval_id)!; assert.equal(ap.details.mode, 'append'); assert.equal(ap.details.base_branch, 'main')
+  approve(r.result.approval_id)
+  const w0 = ghWrites.length
+  const a2 = (await ok('apply_change', UI('main', mainSha, { approval_id: r.result.approval_id }))).result
+  assert.equal(a2.applied, true); assert.equal(a2.mode, 'append'); assert.equal(a2.branch, a1.branch); assert.equal(a2.parent_sha, a1.commit_sha)
+  assert.deepEqual(commits.get(a2.commit_sha)!.parents, [a1.commit_sha]); assert.equal(refs.get(a1.branch), a2.commit_sha); assert.equal(refs.get('main'), mainSha)
+  assert.deepEqual([...refs.keys()].filter(k => k.startsWith('agent2/')), branchesBefore) // still exactly the same branches
+  const mine = ghWrites.slice(w0)
+  assert.ok(!mine.some(x => x.method === 'POST' && x.path === '/git/refs'), 'no branch created: ' + JSON.stringify(mine.map(x => x.method + ' ' + x.path)))
+  assert.equal(mine.filter(x => x.path.startsWith('/git/refs')).length, 1); assert.ok(mine.every(x => !x.path.includes('/git/refs/heads/main')))
+  const t = trees.get(commits.get(a2.commit_sha)!.tree)!
+  assert.equal(blobs.get(t.get('src/App.jsx')!.sha), 'export const a = 1\nexport const b = 4\n'); assert.equal(blobs.get(t.get('src/New.js')!.sha), 'export const n = 1\n') // first commit's work is kept
+  assert.match(a2.rollback, /WHOLE branch/)
+})
+
+test('CONTINUE 3: only existing agent2/* branches can be continued; main, unknown and moved branches are refused before any write', async () => {
+  const a1 = await firstBranch(); const mainSha = refs.get('main')!; const w0 = ghWrites.length
+  await must('propose_change', UI('main', mainSha, { ...SECOND, continue_branch: 'main' }), 403, 'branch_blocked')
+  await must('propose_change', UI('main', mainSha, { ...SECOND, continue_branch: 'release/1.0' }), 403, 'branch_blocked')
+  await must('propose_change', UI('main', mainSha, { ...SECOND, continue_branch: 'agent2/ghost-2611180000' }), 404, 'branch_not_found')
+  await must('propose_change', UI('main', mainSha, { ...SECOND, continue_branch: a1.branch, expected_continue_sha: 'a'.repeat(40) }), 409, 'base_changed')
+  assert.equal(ghWrites.length, w0)
+  // tip moves between approval and apply -> nothing written, approval not consumed
+  const r = await ok('propose_change', UI('main', mainSha, { ...SECOND, continue_branch: a1.branch })); approve(r.result.approval_id)
+  refs.set(a1.branch, putCommit(putTree(new Map(treeOf(a1.commit_sha))), [a1.commit_sha], 'someone pushed to the branch'))
+  const w1 = ghWrites.length
+  await must('apply_change', UI('main', mainSha, { approval_id: r.result.approval_id }), 409, 'base_changed'); assert.equal(ghWrites.length, w1)
+  assert.equal(db.approvals.find(x => x.id === r.result.approval_id)!.details.executed_at, undefined)
+  refs.delete(a1.branch)
+  await must('apply_change', UI('main', mainSha, { approval_id: r.result.approval_id }), 409, 'base_changed'); assert.equal(ghWrites.length, w1) // deleted branch is NOT silently re-created
+})
+
+test('CONTINUE 4: dev_proposal naming an existing branch + "naya mat banao" continues it; an unknown name is an error, not a new branch', async () => {
+  const a1 = await firstBranch(); const mainSha = refs.get('main')!
+  devPlanReply = plan([{ path: 'src/New.js', op: 'update', why: 'tweak' }])
+  const w0 = ghWrites.length
+  const r = await proposal('Proposal only. Working branch (existing, naya mat banao): ' + a1.branch + '. Sirf src/New.js update karo.', UI('main', mainSha))
+  assert.equal(r.status, 'awaiting_approval'); assert.equal(r.result.branch, a1.branch); assert.equal(r.result.mode, 'append'); assert.equal(r.result.parent_sha, a1.commit_sha)
+  assert.equal(r.result.changed_files[0].path, 'src/New.js'); assert.equal(r.result.changed_files[0].op, 'update'); assert.equal(ghWrites.length, w0)
+  const r2 = await proposal('Update src/New.js', { ...UI('main', mainSha), continue_branch: a1.branch }) // explicit field (UI input) works without magic words
+  assert.equal(r2.result.branch, a1.branch); assert.equal(r2.result.mode, 'append')
+  const n = db.approvals.filter(x => x.details.kind === 'code_change').length
+  await must('dev_proposal', { ...UI('main', mainSha), request: 'existing branch agent2/ghost-2611180000 par kaam karo' }, 404, 'branch_not_found')
+  await must('dev_proposal', { ...UI('main', mainSha), request: 'x', continue_branch: 'main' }, 400, 'bad_continue_branch')
+  assert.equal(db.approvals.filter(x => x.details.kind === 'code_change').length, n); assert.equal(ghWrites.length, w0)
+  // default behaviour is unchanged: without a continue request a NEW agent2/* branch is proposed
+  const r3 = await proposal('Update src/New.js', UI('main', mainSha))
+  assert.notEqual(r3.result.branch, a1.branch); assert.equal(r3.result.mode, 'new_branch')
 })
