@@ -326,12 +326,12 @@ function ZipUpload({ repos, projects, onCreated, setErr }) {
 
 export default function Orchestrator({ go }) {
   const [err, setErr] = useState('')
-  const [sel, setSel] = useState(() => (location.hash.startsWith('#wf=') ? location.hash.slice(4) : ''))
+  const [sel, setSel] = useState(() => { const m = /wf=([\w-]+)/.exec(location.hash); if (m) return m[1]; try { return sessionStorage.getItem('orch_sel') || '' } catch { return '' } })
   const [repos, setRepos] = useState([])
   const [projects, setProjects] = useState([])
   useEffect(() => { callOrch('heartbeat').then(r => { setRepos(r.repos || []); setProjects(r.supabase_projects || []) }).catch(e => setErr(e.message)) }, [])
   const { data, error, loading, reload } = usePoll(() => callOrch('list'), [], 10000)
-  const pick = (id) => { setSel(id); history.replaceState(null, '', id ? '#wf=' + id : location.pathname); reload() } // survives refresh
+  const pick = (id) => { setSel(id); history.replaceState(null, '', id ? '#orchestrator&wf=' + id : '#orchestrator'); try { if (id) sessionStorage.setItem('orch_sel', id); else sessionStorage.removeItem('orch_sel') } catch { /* skip */ } reload() } // survives refresh and tab switches
   const list = (data && data.workflows) || []
   const deleted = (id) => { if (id === sel) pick(''); else reload() }
   return (
