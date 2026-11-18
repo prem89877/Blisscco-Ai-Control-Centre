@@ -127,8 +127,33 @@ export function Empty({ text }) {
   return <div className="empty">{text}</div>
 }
 
-export function Loading() {
-  return <div className="empty">Loading...</div>
+/* iOS-style activity spinner (12 fading blades) */
+export function Spinner({ size = 22 }) {
+  return (
+    <span className="ios-spin" style={{ width: size, height: size }} aria-hidden="true">
+      {Array.from({ length: 12 }, (_, i) => <i key={i} style={{ transform: 'rotate(' + i * 30 + 'deg)', animationDelay: -(1.2 - i * 0.1).toFixed(1) + 's' }} />)}
+    </span>
+  )
+}
+
+/* White iPhone-style loading HUD */
+export function Loading({ text = 'Loading' }) {
+  return (
+    <div className="loading-wrap" role="status" aria-live="polite">
+      <div className="hud"><Spinner /><span>{text}</span></div>
+    </div>
+  )
+}
+
+/* White shimmer placeholder cards while a list loads */
+export function Skeleton({ rows = 3 }) {
+  return (
+    <div className="skel-list" aria-hidden="true">
+      {Array.from({ length: rows }, (_, i) => (
+        <div className="skel" key={i} style={{ animationDelay: i * 70 + 'ms' }}><i className="l1" /><i className="l2" /><i className="l3" /></div>
+      ))}
+    </div>
+  )
 }
 
 export async function logAction(action, message, { level = 'info', task_id = null, agent_id = null, metadata = {} } = {}) {

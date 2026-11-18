@@ -4,6 +4,7 @@ import { usePoll, q, Badge, Err, Loading, Icon, timeAgo, effStatus, logAction } 
 import Agent1Panel from './Agent1.jsx'
 import Agent2Panel from './Agent2.jsx'
 import Agent3Panel from './Agent3.jsx'
+import AgentHistory from './AgentHistory.jsx'
 
 function AgentCard({ a, offlineSec, onSaved }) {
   const hasConsole = a.slot === 1 || a.slot === 2 || a.slot === 3
@@ -37,6 +38,8 @@ function AgentCard({ a, offlineSec, onSaved }) {
             <Err msg={err} />
             {hasConsole && <><div className="sec-title">Console</div>{a.slot === 1 ? <Agent1Panel /> : a.slot === 2 ? <Agent2Panel /> : <Agent3Panel />}</>}
             {!hasConsole && <div className="sub">No console for this slot yet.</div>}
+            <div className="sec-title">History <span className="sub">(only {a.name})</span></div>
+            <AgentHistory agentId={a.id} />
             <div className="sec-title">Details</div>
             {edit ? (
               <div>

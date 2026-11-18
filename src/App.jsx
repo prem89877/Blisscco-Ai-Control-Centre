@@ -13,7 +13,7 @@ import Orchestrator from './Orchestrator.jsx'
 import { useAgent1Heartbeat } from './Agent1.jsx'
 import { useAgent2Heartbeat } from './Agent2.jsx'
 import { useAgent3Heartbeat } from './Agent3.jsx'
-import { Icon } from './ui.jsx'
+import { Icon, Loading } from './ui.jsx'
 import { usePendingApprovals, PendingDot } from './Monitor.jsx'
 
 const TABS = [
@@ -122,9 +122,9 @@ export default function App() {
   useAgent2Heartbeat(Boolean(owner))
   useAgent3Heartbeat(Boolean(owner))
 
-  if (session === undefined) return <div className="empty">Loading...</div>
+  if (session === undefined) return <Loading />
   if (!session) return <Login />
-  if (owner === null) return <div className="empty">Checking access...</div>
+  if (owner === null) return <Loading text="Checking access" />
   if (owner === false) {
     return (
       <div className="login">
@@ -150,7 +150,7 @@ export default function App() {
   return (
     <div className="app">
       <div className="top"><span>Blisscco AI</span><span className="sub">{TABS.find(t => t[0] === tab)[2]}</span></div>
-      <div className="main" ref={mainRef} onScroll={e => { const t = Date.now(); if (restored.current && t - lastSave.current > 150) { lastSave.current = t; writeScroll(tab, e.currentTarget.scrollTop) } }}>{page}</div>
+      <div className="main" ref={mainRef} onScroll={e => { const t = Date.now(); if (restored.current && t - lastSave.current > 150) { lastSave.current = t; writeScroll(tab, e.currentTarget.scrollTop) } }}><div key={tab} className="page-in">{page}</div></div>
       <div className="nav">
         {TABS.map(([id, icon, label]) => (
           <button key={id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>
