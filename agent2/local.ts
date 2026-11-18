@@ -5,10 +5,11 @@ import { repoAllowed, secretValues } from './config.js'
 import { AgentError, b64, errMsg, redactString } from './util.js'
 import { assertAgentBranch, branchFor, classifyCommand, isSafeScript, minimalEnv, scanSecrets, sha256, tokenize, validateFiles, validatePath, type FileIn } from './guard.js'
 import { claim, loadApproved, monitor, now, recordAi, release, withTask, type Ctx, type Out } from './agent.js'
-import { review } from './gemini.js'
+import { review, codegen } from './gemini.js'
+import { devLimits } from './config.js'
 
 // Termux-only actions: real git + shell on the device. This file is never imported by the Vercel function.
-export const LOCAL_ACTIONS = ['local_inspect', 'local_apply', 'local_checks', 'exec', 'apply_command', 'local_commit', 'request_push', 'apply_push', 'local_rollback'] as const
+export const LOCAL_ACTIONS = ['local_inspect', 'local_apply', 'local_checks', 'exec', 'apply_command', 'local_commit', 'request_push', 'apply_push', 'local_rollback', 'local_iterate'] as const
 
 interface RunRes { code: number; out: string; ms: number; timedOut: boolean }
 const OUT_CAP = 200_000
@@ -150,8 +151,8 @@ async function localApply(ctx: Ctx, p: any): Promise<any> {
 }
 
 // ---------------------------------------------------------------- checks (lint / types / tests)
-async function localChecks(ctx: Ctx, p: any): Promise<any> {
-  return withTask(ctx, 'local_checks', 'Run lint, type check and tests', { only: p.only || null }, async () => {
+async function collectChecks(ctx: Ctx, p: any): Promise<any> {
+  {
     const root = await repoRoot(ctx)
     const branch = await curBranch(root)
     const pkgFile = join(root, 'package.json')
@@ -196,7 +197,46 @@ async function localChecks(ctx: Ctx, p: any): Promise<any> {
     }
     const passed = checks.length > 0 && checks.every(c => c.ok)
     const result = { branch, passed, checks, skipped, note: checks.length ? undefined : 'No checks could run. Nothing was verified.' }
-    return { result }
+    return result
+  }
+}
+async function localChecks(ctx: Ctx, p: any): Promise<any> {
+  return withTask(ctx, 'local_checks', 'Run lint, type check and tests', { only: p.only || null }, async () => ({ result: await collectChecks(ctx, p) }))
+}
+
+
+// ---------------------------------------------------------------- iterate: run REAL checks, let the model fix failures, re-run (bounded)
+// Only files already in this change set are rewritten. Every verdict comes from an actual process exit code.
+async function localIterate(ctx: Ctx, p: any): Promise<any> {
+  const lim = devLimits()
+  const rounds = Math.min(Math.max(p.rounds === undefined ? lim.maxFixRounds : Number(p.rounds), 0), 5)
+  return withTask(ctx, 'local_iterate', 'Run checks and fix failures (max ' + rounds + ' rounds)', { rounds }, async () => {
+    const root = await repoRoot(ctx)
+    const branch = await curBranch(root)
+    assertAgentBranch(branch, ctx.cfg.protectedBranches)
+    const m = readManifest(root, branch)
+    const history: any[] = []
+    let last: any = null
+    for (let round = 0; round <= rounds; round++) {
+      last = await collectChecks(ctx, { only: p.only, ack: p.ack })
+      history.push({ round, passed: last.passed, checks: last.checks.map((c: any) => ({ name: c.name, ok: c.ok, ms: c.ms })) })
+      if (last.passed || !last.checks.length || round === rounds) break
+      const failing = last.checks.filter((c: any) => !c.ok)
+      const current = m.files.filter((f: any) => f.op !== 'delete').map((f: any) => ({ path: f.path, content: readFileSync(safeJoin(root, f.path), 'utf8') }))
+      const ai = await codegen(ctx.cfg, { request: 'Fix the failing checks. Keep behaviour; change as little as possible.', plan: { summary: m.title }, batch_files: current.map((c: any) => ({ path: c.path, op: 'update' })), current_files: current, already_generated_paths: [], check_failures_to_fix: failing.map((c: any) => ({ check: c.name, output: c.tail })) })
+      await recordAi(ctx, 'local_iterate', ai)
+      if (!ai.text) throw new AgentError('Gemini could not propose a fix: ' + (ai.error || 'empty'), 502, 'gemini')
+      let j: any
+      try { j = JSON.parse(ai.text.slice(ai.text.indexOf('{'), ai.text.lastIndexOf('}') + 1)) } catch { throw new AgentError('Gemini fix was not valid JSON; files left as they were', 502, 'gemini_format') }
+      const out: FileIn[] = (Array.isArray(j.files) ? j.files : []).filter((f: any) => f && typeof f.content === 'string').map((f: any) => ({ path: f.path, op: 'update' as const, content: f.content }))
+      for (const f of out) if (!m.files.some((x: any) => x.path === f.path && x.op !== 'delete')) throw new AgentError('Gemini tried to change a file outside this change set (' + String(f.path).slice(0, 80) + '); stopped', 422, 'out_of_scope')
+      if (!out.length) throw new AgentError('Gemini proposed no fix; stopped', 422, 'no_change')
+      validateFiles(out) // path rules + secret scan on the new content
+      for (const f of out) writeFileSync(safeJoin(root, f.path), f.content as string)
+      history[history.length - 1].fixed_files = out.map(f => f.path)
+    }
+    const passed = Boolean(last && last.passed)
+    return { result: { branch, passed, verified: Boolean(last && last.checks.length), rounds_used: history.length - 1, history, final_checks: last.checks, skipped: last.skipped, note: !last.checks.length ? 'No checks could run. Nothing was verified.' : passed ? undefined : 'Checks still fail after the allowed rounds. Review the output; nothing was committed.', next: passed ? 'npm run agent2 -- commit --message="..."' : 'Fix manually or raise AGENT2_DEV_MAX_FIX_ROUNDS (max 5).' } }
   })
 }
 
@@ -346,6 +386,7 @@ export async function runLocal(ctx: Ctx, action: string, params: any = {}): Prom
     case 'local_inspect': return withTask(ctx, action, 'Inspect local repository', { path: params.path || null }, () => localInspect(ctx, params))
     case 'local_apply': return localApply(ctx, params)
     case 'local_checks': return localChecks(ctx, params)
+    case 'local_iterate': return localIterate(ctx, params)
     case 'exec': return execCommand(ctx, params)
     case 'apply_command': return applyCommand(ctx, params)
     case 'local_commit': return localCommit(ctx, params)

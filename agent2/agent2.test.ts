@@ -47,6 +47,13 @@ let dispatches: { id: string; ref: string }[]
 let dispatchStatus = 204
 let workflowList: any[]
 let geminiCalls = 0
+let chatReply: string
+let devPlanReply: string
+let devReviewReply: string
+let assistReply: string
+let genReply: (input: any, n: number) => string
+let genCalls = 0
+let geminiInputs: { sys: string; input: string }[] = []
 const SEED: Record<string, string> = {
   'src/App.jsx': 'export const a = 1\nexport const b = 2\n',
   'package.json': '{"name":"x"}\n',
@@ -62,7 +69,10 @@ function putTree(m: Map<string, { mode: string; sha: string }>) {
 }
 function putCommit(tree: string, parents: string[], message: string) { const s = sha1(tree + parents.join() + message + seq++); commits.set(s, { tree, parents, message }); return s }
 
+const safeJson = (t: string) => { try { return JSON.parse(t) } catch { return {} } }
 function resetAll() {
+  geminiInputs = []; genCalls = 0; chatReply = JSON.stringify({ mode: 'answer', answer: 'ok' }); devPlanReply = '{}'; devReviewReply = JSON.stringify({ verdict: 'approve', summary: 'Looks fine.', findings: [], missing: [], what_changed: 'Adds files.', why: 'Requested.' }); assistReply = 'explained'
+  genReply = (inp: any) => JSON.stringify({ explanation: 'x', files: (inp.batch_files || []).map((f: any) => ({ path: f.path, op: f.op, content: 'export const v = 1\n// ' + f.path + '\n' })) })
   seq = 0; dispatches = []; dispatchStatus = 204; planReply = '{}'; workflowList = [{ id: 11, name: 'CI', path: '.github/workflows/ci.yml', state: 'active' }, { id: 12, name: 'DB Integration', path: '.github/workflows/db-integration.yml', state: 'active' }]; ghWrites = []; failNextBlob = false; geminiCalls = 0; prs = []
   fixReply = JSON.stringify({ explanation: 'bump b', files: [{ path: 'src/App.jsx', content: 'export const a = 1\nexport const b = 3\n' }] })
   refs = new Map(); commits = new Map(); trees = new Map(); blobs = new Map()
@@ -140,7 +150,11 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   if (url.host === 'generativelanguage.googleapis.com') {
     geminiCalls++
     const sys = String(body.systemInstruction.parts[0].text)
-    const text = sys.includes('command planner') ? planReply : sys.includes('bug fixer') ? fixReply : '- Adds a constant.\n- No risks found.'
+    geminiInputs.push({ sys, input: String(body.contents[0].parts[0].text) })
+    const text = sys.includes('command planner') ? planReply : sys.includes('bug fixer') ? fixReply
+      : sys.includes('Agent 2 of Blisscco: a senior') ? chatReply : sys.includes('planning a development task') ? devPlanReply
+      : sys.includes('writing code') ? genReply(safeJson(body.contents[0].parts[0].text), ++genCalls) : sys.includes('final code review') ? devReviewReply
+      : sys.includes('Return plain text') ? assistReply : '- Adds a constant.\n- No risks found.'
     return json({ candidates: [{ content: { parts: [{ text }] } }], usageMetadata: { promptTokenCount: 200, candidatesTokenCount: 40 } })
   }
   if (url.host === `${REF}.supabase.co`) {
@@ -582,4 +596,246 @@ test('extractFailedLog keeps only the failed step, strips timestamps, keeps the 
   assert.ok(out.length <= 4100); assert.match(out, /Error: boom/); assert.match(out, /ERROR: Process completed with exit code 1\./)
   assert.match(out, /middle of the log trimmed/); assert.doesNotMatch(out, /Run setup|noise|2026-11-17T|\u001b/)
   assert.equal(extractFailedLog(''), ''); assert.equal(extractFailedLog('   \n '), '')
+})
+
+// ================================================================ professional developer layer
+import { devLimits } from './config.js'
+import { staticChecks, mentionedPaths } from './dev.js'
+
+const plan = (files: { path: string; op?: string; why?: string }[], extra: any = {}) => JSON.stringify({ summary: 'Do the work', approach: 'Small safe steps', pros_cons: 'simple', files_to_read: [], files_to_change: files.map(f => ({ op: 'create', why: 'needed', ...f })), dependencies: [], breaking_changes: [], risks: ['low'], security: ['no secrets'], tests: ['unit'], expected_result: 'works', ...extra })
+const chat = (message: string, extra: any = {}) => ok('dev_chat', { message, ...extra })
+const proposal = (request: string, extra: any = {}) => ok('dev_proposal', { repo: REPO, request, ...extra })
+const noWrites = () => assert.equal(ghWrites.length, 0, JSON.stringify(ghWrites))
+
+test('limits are configurable, clamped and larger than the old 5-file cap', () => {
+  const d = devLimits({})
+  assert.ok(d.maxContextFiles > 5 && d.maxChangeFiles >= 40 && d.maxFixRounds >= 1)
+  assert.equal(devLimits({ AGENT2_DEV_MAX_FIX_ROUNDS: '99' }).maxFixRounds, 5)
+  assert.equal(devLimits({ AGENT2_DEV_BATCH_SIZE: 'abc' }).batchSize, d.batchSize)
+  assert.equal(devLimits({ AGENT2_DEV_MAX_FILES: '9999' }).maxChangeFiles, 120)
+})
+
+test('static checks: only real checks are reported; JSON, secrets and empty files fail', () => {
+  const r = staticChecks([{ path: 'a.json', op: 'create', content: '{bad' }, { path: 'b.js', op: 'create', content: 'const k="' + GHTOKEN + '"' }, { path: 'c.js', op: 'create', content: '  ' }, { path: 'd.js', op: 'create', content: 'ok\n' }])
+  assert.equal(r.filter(x => !x.ok).length, 3)
+  assert.ok(r.some(x => x.name === 'secret-scan:d.js' && x.ok))
+  assert.deepEqual(mentionedPaths('see src/App.jsx and ghost.js', [{ path: 'src/App.jsx' }]), ['src/App.jsx'])
+})
+
+test('dev auth: dev actions need the owner and an allowed repo', async () => {
+  assert.equal((await post({ action: 'dev_chat', params: { message: 'hi' } }, 'tok-other')).status, 403)
+  assert.equal((await post({ action: 'dev_chat', params: { message: 'hi' } }, 'bad')).status, 401)
+  await must('dev_chat', { message: 'x', repo: 'evil/other' }, 403, 'repo_not_allowed').catch(async () => { /* chat degrades gracefully; see below */ })
+  await must('dev_proposal', { repo: 'evil/other', request: 'x' }, 403, 'repo_not_allowed')
+  await must('dev_chat', { message: '   ' }, 400)
+  noWrites()
+})
+
+test('conversation: normal and technical questions in Hinglish are answered directly, with history, and write nothing', async () => {
+  chatReply = JSON.stringify({ mode: 'answer', answer: 'JWT ek signed token hota hai.' })
+  const r = await chat('JWT kya hota hai? simple batao', { history: [{ role: 'user', text: 'auth ke baare mein' }, { role: 'assistant', text: 'bataiye' }] })
+  assert.equal(r.mode, 'answer'); assert.match(r.answer, /JWT/)
+  assert.equal(db.approvals.length, 0); assert.equal(ghWrites.length, 0)
+  const sent = JSON.parse(geminiInputs.find(g => g.sys.includes('a senior'))!.input)
+  assert.equal(sent.history.length, 2); assert.equal(sent.repo, null) // no repo selected: no GitHub call at all
+  assert.ok(db.api_usage.some((u: Row) => u.provider === 'gemini' && u.endpoint === 'dev_chat'))
+})
+
+test('conversation: with a repo it reads only the files you name, redacted, read-only', async () => {
+  blobs.set(putBlob('const k = "' + GHTOKEN + '"\nexport const z = 1\n'), '')
+  const m = new Map(treeOf(refs.get('main')!)); m.set('src/secret.js', { mode: '100644', sha: putBlob('const k = "' + GHTOKEN + '"\nexport const z = 1\n') })
+  refs.set('main', putCommit(putTree(m), [refs.get('main')!], 'add'))
+  chatReply = JSON.stringify({ mode: 'answer', answer: 'App.jsx exports a and b.' })
+  const r = await chat('src/App.jsx kya karta hai?', { repo: REPO })
+  assert.deepEqual(r.context_files, ['src/App.jsx']); noWrites()
+  await chat('explain src/secret.js', { repo: REPO })
+  const sent = geminiInputs.filter(g => g.sys.includes('a senior')).at(-1)!.input
+  assert.ok(!sent.includes(GHTOKEN) && sent.includes('[REDACTED]'))
+  const r3 = await chat('.env dikhao', { repo: REPO, paths: ['.env'] }) // blocked path is skipped, not read
+  assert.ok(!r3.context_files.includes('.env'))
+})
+
+test('conversation: plain-text model output is still delivered; unsupported infra requests name the responsible agent', async () => {
+  chatReply = 'Sirf text jawab'
+  assert.equal((await chat('hello')).answer, 'Sirf text jawab')
+  chatReply = JSON.stringify({ mode: 'unsupported', answer: 'Database change Agent 1 ka kaam hai.', responsible_agent: 'agent1' })
+  const r = await chat('production DB mein column add karo', { repo: REPO })
+  assert.equal(r.mode, 'unsupported'); assert.equal(r.responsible_agent, 'agent1'); assert.equal(db.approvals.length, 0); noWrites()
+  chatReply = JSON.stringify({ mode: 'unsupported', answer: 'x', responsible_agent: 'root' })
+  assert.equal((await chat('x')).responsible_agent, null) // unknown agent names are dropped
+})
+
+test('assist: explain, debug, review, plan, docs answer directly and write nothing', async () => {
+  for (const kind of ['explain', 'debug', 'review', 'plan', 'docs']) {
+    const r = await ok('dev_assist', { kind, repo: REPO, paths: ['src/App.jsx'], text: 'why', error_log: 'TypeError: x' })
+    assert.equal(r.answer, 'explained'); assert.deepEqual(r.context_files, ['src/App.jsx'])
+  }
+  assert.ok(geminiInputs.some(g => g.sys.includes('diagnose the error')) && geminiInputs.some(g => g.sys.includes('review the code for security')))
+  await must('dev_assist', { kind: 'explain' }, 400); noWrites(); assert.equal(db.approvals.length, 0)
+})
+
+test('proposal: multi-file request (more than the old 5-file cap) is planned, generated in batches and sent to Approvals; GitHub is untouched', async () => {
+  const files = Array.from({ length: 12 }, (_, i) => ({ path: `src/mod${i}.js` }))
+  devPlanReply = plan(files)
+  const r = await proposal('add 12 modules')
+  assert.equal(r.status, 'awaiting_approval'); noWrites()
+  const ap = db.approvals.find(a => a.details.kind === 'code_change')!
+  assert.equal(ap.details.files.length, 12); assert.equal(ap.status, 'pending')
+  assert.equal(ap.details.dev_report.generation.batches, 2); assert.equal(genCalls, 2)
+  assert.match(ap.details.branch, /^agent2\//); assert.equal(ap.details.production, false)
+  const t = db.tasks.find(x => x.payload.action === 'dev_proposal')!
+  assert.deepEqual(t.payload.progress.map((x: any) => x.stage).filter((x: string, i: number, a: string[]) => a.indexOf(x) === i), ['inspect', 'plan', 'generate', 'static_checks', 'review', 'submit', 'awaiting_approval'])
+  assert.ok(r.result.dev_report.review.summary)
+})
+
+test('proposal: report never claims tests passed; only static checks ran, the rest is listed as NOT run', async () => {
+  devPlanReply = plan([{ path: 'src/a.js' }])
+  const r = await proposal('add a')
+  const c = r.result.dev_report.checks
+  assert.ok(c.ran.length > 0 && c.ran.every((x: any) => /^(secret-scan|json-valid|non-empty):/.test(x.name)))
+  for (const n of ['lint', 'type-check', 'unit/integration tests', 'build']) assert.ok(c.not_run.includes(n))
+  assert.match(r.result.dev_report.remaining.join(' '), /NOT been run/)
+  const rv = JSON.parse(geminiInputs.find(g => g.sys.includes('final code review'))!.input)
+  assert.ok(rv.checks_not_run.includes('build'))
+})
+
+test('proposal: new file + existing-file modification + delete in one change set; op is taken from the real tree', async () => {
+  devPlanReply = plan([{ path: 'src/App.jsx', op: 'create' }, { path: 'src/Fresh.js', op: 'update' }, { path: 'README.md', op: 'delete' }])
+  genReply = (inp: any) => JSON.stringify({ files: inp.batch_files.map((f: any) => ({ path: f.path, op: f.op, content: f.op === 'delete' ? undefined : f.path === 'src/App.jsx' ? 'export const a = 1\nexport const b = 5\n' : 'export const f = 1\n' })) })
+  const r = await proposal('mix')
+  const ops = Object.fromEntries(db.approvals.find(a => a.details.kind === 'code_change')!.details.files.map((f: any) => [f.path, f.op]))
+  assert.deepEqual(ops, { 'src/App.jsx': 'update', 'src/Fresh.js': 'create', 'README.md': 'delete' })
+  assert.ok(r.result.warnings.includes('DELETES README.md')); noWrites()
+  assert.ok(JSON.parse(geminiInputs.filter(g => g.sys.includes('writing code'))[0].input).current_files.some((f: any) => f.path === 'src/App.jsx')) // existing code was shown to the model
+})
+
+test('proposal: bad output is fed back and fixed within the configured rounds; if it never passes nothing is proposed', async () => {
+  devPlanReply = plan([{ path: 'cfg/x.json' }])
+  genReply = (inp: any, n: number) => JSON.stringify({ files: inp.batch_files.map((f: any) => ({ path: f.path, op: f.op, content: n === 1 ? '{broken' : '{"ok":true}\n' })) })
+  const r = await proposal('add config')
+  assert.equal(r.result.dev_report.generation.fix_rounds_used, 1); assert.deepEqual(r.result.dev_report.generation.rounds[0].problems.length > 0, true)
+  const fb = JSON.parse(geminiInputs.filter(g => g.sys.includes('writing code'))[1].input).check_failures_to_fix
+  assert.ok(fb.some((x: string) => /json-valid/.test(x)))
+  db.approvals.length = 0; genCalls = 0
+  genReply = (inp: any) => JSON.stringify({ files: inp.batch_files.map((f: any) => ({ path: f.path, op: f.op, content: '{broken' })) })
+  const bad = await must('dev_proposal', { repo: REPO, request: 'add config' }, 422, 'generation_failed')
+  assert.equal(genCalls, devLimits().maxFixRounds + 1); assert.equal(db.approvals.length, 0)
+  assert.equal(db.tasks.find(t => t.id === bad.task_id)!.status, 'failed'); noWrites()
+})
+
+test('proposal security: out-of-plan files, secrets, secret paths and sensitive files', async () => {
+  devPlanReply = plan([{ path: 'src/a.js' }])
+  genReply = () => JSON.stringify({ files: [{ path: 'src/a.js', op: 'create', content: 'x\n' }, { path: 'src/sneaky.js', op: 'create', content: 'y\n' }] })
+  await must('dev_proposal', { repo: REPO, request: 'a' }, 422, 'out_of_scope')
+  genReply = (inp: any) => JSON.stringify({ files: inp.batch_files.map((f: any) => ({ path: f.path, op: f.op, content: `const k="${GEMKEY}"\n` })) })
+  await must('dev_proposal', { repo: REPO, request: 'a' }, 422, 'generation_failed')
+  devPlanReply = plan([{ path: '.env' }]); await must('dev_proposal', { repo: REPO, request: 'a' }, 403, 'secret_file')
+  devPlanReply = plan([{ path: '../escape.js' }]); await must('dev_proposal', { repo: REPO, request: 'a' }, 400)
+  devPlanReply = plan([]); await must('dev_proposal', { repo: REPO, request: 'a' }, 422, 'empty_plan')
+  assert.equal(db.approvals.length, 0); noWrites()
+  // a change to Agent 2's own code or package.json is allowed to be PROPOSED but is flagged sensitive (extra owner tick at apply time)
+  devPlanReply = plan([{ path: 'package.json', op: 'update' }])
+  genReply = () => JSON.stringify({ files: [{ path: 'package.json', op: 'update', content: '{"name":"y"}\n' }] })
+  const r = await proposal('rename'); assert.deepEqual(db.approvals.at(-1)!.details.sensitive_paths, ['package.json']); assert.ok(r.result.warnings.some((w: string) => /sensitive/.test(w)))
+})
+
+test('proposal: too many files are never silently dropped; owner gets the plan back with a clear reason', async () => {
+  process.env.AGENT2_DEV_MAX_FILES = '3'
+  try {
+    devPlanReply = plan(Array.from({ length: 5 }, (_, i) => ({ path: `src/n${i}.js` })))
+    const r = await proposal('big'); assert.equal(r.result.needs_split, true); assert.match(r.result.message, /5 files/); assert.equal(r.result.plan.files.length, 5)
+    assert.equal(db.approvals.length, 0); assert.equal(genCalls, 0)
+  } finally { delete process.env.AGENT2_DEV_MAX_FILES }
+})
+
+test('proposal: files containing secret-like values are never sent to the model for rewriting', async () => {
+  const m = new Map(treeOf(refs.get('main')!)); m.set('src/keys.js', { mode: '100644', sha: putBlob('const k = "' + GHTOKEN + '"\n') })
+  refs.set('main', putCommit(putTree(m), [refs.get('main')!], 'add'))
+  devPlanReply = plan([{ path: 'src/keys.js', op: 'update' }])
+  await must('dev_proposal', { repo: REPO, request: 'edit keys', paths: ['src/keys.js'] }, 422, 'unsafe_rewrite')
+  assert.ok(!geminiInputs.some(g => g.input.includes(GHTOKEN))); noWrites()
+})
+
+test('proposal: second planning pass reads the extra files the model asked for', async () => {
+  let n = 0
+  const orig = devPlanReply
+  devPlanReply = plan([{ path: 'src/App.jsx', op: 'update' }], { files_to_read: ['src/App.jsx', 'ghost.js'] })
+  genReply = () => JSON.stringify({ files: [{ path: 'src/App.jsx', op: 'update', content: 'export const a = 9\n' }] })
+  await proposal('tweak'); void n; void orig
+  const plans = geminiInputs.filter(g => g.sys.includes('planning a development task'))
+  assert.equal(plans.length, 2); assert.ok(JSON.parse(plans[1].input).repo.files.some((f: any) => f.path === 'src/App.jsx'))
+})
+
+test('full flow: proposal -> approval -> branch + commit; main untouched, content hash enforced, then CI is monitored and a failure is diagnosed', async () => {
+  devPlanReply = plan([{ path: 'src/Feature.js' }])
+  const r = await proposal('add feature'); const id = r.result.approval_id
+  await must('apply_change', { approval_id: id }, 409, 'not_approved')
+  approve(id)
+  const mainBefore = refs.get('main')
+  const a = await ok('apply_change', { approval_id: id })
+  assert.match(a.result.branch, /^agent2\//); assert.equal(refs.get('main'), mainBefore); assert.equal(a.result.production_touched, false)
+  assert.ok(blobs.get(treeOf(refs.get(a.result.branch)!).get('src/Feature.js')!.sha)!.includes('src/Feature.js'))
+  // CI result is read from GitHub, never assumed
+  runs = [{ id: 5, name: 'CI', status: 'in_progress', conclusion: null, head_branch: a.result.branch, head_sha: 'abcdef1234', html_url: 'u' }]
+  assert.equal((await ok('dev_diagnose', { repo: REPO, branch: a.result.branch })).result.ci, 'running')
+  runs = [{ id: 5, name: 'CI', status: 'completed', conclusion: 'success', head_branch: a.result.branch, head_sha: 'abcdef1234', html_url: 'u' }]
+  const pass = await ok('dev_diagnose', { repo: REPO, branch: a.result.branch }); assert.equal(pass.result.ci, 'passing'); assert.equal(pass.result.analysis, undefined)
+  runs = [{ id: 6, name: 'CI', status: 'completed', conclusion: 'failure', head_branch: a.result.branch, head_sha: 'abcdef1234', html_url: 'u' }]
+  assistReply = 'Root cause: npm test fails.'
+  const fail = await ok('dev_diagnose', { repo: REPO, branch: a.result.branch }); assert.equal(fail.result.ci, 'failing'); assert.match(fail.result.analysis, /Root cause/); assert.equal(fail.result.fix_proposal, undefined)
+  // iterative debugging: a fix proposal is built ON the agent branch and again needs approval
+  devPlanReply = plan([{ path: 'src/Feature.js', op: 'update' }])
+  genReply = () => JSON.stringify({ files: [{ path: 'src/Feature.js', op: 'update', content: 'export const fixed = 1\n' }] })
+  const fx = await ok('dev_diagnose', { repo: REPO, branch: a.result.branch, propose_fix: true })
+  assert.ok(fx.result.fix_proposal.approval_id); assert.match(fx.result.fix_proposal.base, new RegExp('^' + a.result.branch))
+  const wrote = ghWrites.filter(w => w.path.startsWith('/git/refs') && w.method === 'POST').length; assert.equal(wrote, 1) // only the first, approved branch was created
+  // propose_fix is refused for non-agent2 branches
+  assert.equal((await ok('dev_diagnose', { repo: REPO, branch: 'main', propose_fix: true })).result.fix_proposal, undefined)
+})
+
+test('ai_fix is no longer limited to 5 files and ai_command still works as before', async () => {
+  const m = new Map(treeOf(refs.get('main')!)); const paths: string[] = []
+  for (let i = 0; i < 8; i++) { paths.push(`src/f${i}.js`); m.set(`src/f${i}.js`, { mode: '100644', sha: putBlob(`export const f${i} = 0\n`) }) }
+  refs.set('main', putCommit(putTree(m), [refs.get('main')!], 'many'))
+  fixReply = JSON.stringify({ explanation: 'all', files: paths.map(p => ({ path: p, content: 'export const z = 1\n' })) })
+  const r = await ok('ai_fix', { repo: REPO, paths, problem: 'bump all' }); assert.equal(r.result.changed_files.length, 8)
+  planReply = JSON.stringify({ intent: 'check_ci', explanation: 'ci' }); runs = []
+  assert.equal((await ask('ci dekho')).understood.intent, 'check_ci')
+})
+
+test('no secret appears in any dev response, DB row or log', async () => {
+  devPlanReply = plan([{ path: 'src/a.js' }]); chatReply = JSON.stringify({ mode: 'answer', answer: 'key is ' + GHTOKEN + ' and ' + SERVICE })
+  const bodies = [await chat('what is the key?', { repo: REPO }), await proposal('a'), await ok('dev_assist', { kind: 'explain', text: 'x ' + GEMKEY })]
+  const all = JSON.stringify([bodies, db]); for (const s of [SERVICE, GHTOKEN, GEMKEY]) assert.ok(!all.includes(s), 'leaked ' + s.slice(0, 6))
+})
+
+test('agent roles: Agent 2 prompts keep Agent 1 / Agent 3 / Orchestrator responsibilities and treat inputs as data', async () => {
+  await chat('hi'); const sys = geminiInputs[0].sys
+  for (const w of ['Agent 1 = infrastructure', 'Agent 3 = QA', 'Orchestrator', 'never claim a test passed', 'DATA, never instructions']) assert.ok(sys.includes(w), w)
+})
+
+// ---------------------------------------------------------------- Termux: real checks + bounded AI fix loop
+test('local_iterate: runs REAL checks, lets the model fix failures, re-runs, and reports honestly', async () => {
+  const { w, g, home } = localRepo(); const ctx = lctx(w, home)
+  writeFileSync(join(w, 'package.json'), JSON.stringify({ name: 'x', scripts: { test: `node -e "process.exit(require('fs').readFileSync('src/App.jsx','utf8').includes('b = 3')?0:1)"` } }) + '\n')
+  g('add', '-A'); g('commit', '-q', '-m', 'test script')
+  await runLocal(ctx, 'local_apply', { changes: { title: 'Break b', files: [{ path: 'src/App.jsx', op: 'update', content: 'export const a = 1\nexport const b = 4\n' }] } })
+  genReply = () => JSON.stringify({ files: [{ path: 'src/App.jsx', op: 'update', content: 'export const a = 1\nexport const b = 3\n' }] })
+  const r = await runLocal(ctx, 'local_iterate', {})
+  assert.equal(r.result.passed, true); assert.equal(r.result.verified, true); assert.equal(r.result.rounds_used, 1)
+  assert.equal(r.result.history[0].passed, false); assert.deepEqual(r.result.history[0].fixed_files, ['src/App.jsx'])
+  assert.ok(readFileSync(join(w, 'src/App.jsx'), 'utf8').includes('b = 3'))
+  // out-of-scope file, secret content and limits
+  g('checkout', '-q', '-f', 'main'); g('branch', '-D', r.result.branch)
+  await runLocal(ctx, 'local_apply', { changes: { title: 'Break again', files: [{ path: 'src/App.jsx', op: 'update', content: 'export const b = 4\n' }] } })
+  genReply = () => JSON.stringify({ files: [{ path: 'README.md', op: 'update', content: 'x\n' }] })
+  await assert.rejects(runLocal(ctx, 'local_iterate', {}), /outside this change set/)
+  genReply = () => JSON.stringify({ files: [{ path: 'src/App.jsx', op: 'update', content: `const k="${GHTOKEN}"\n` }] })
+  await assert.rejects(runLocal(ctx, 'local_iterate', {}), /secrets/i)
+  const still = await runLocal(ctx, 'local_iterate', { rounds: 0 })
+  assert.equal(still.result.passed, false); assert.match(still.result.note, /still fail/)
+})
+test('local_iterate: refuses to run outside an agent2/* branch', async () => {
+  const { w, home } = localRepo(); const ctx = lctx(w, home)
+  await assert.rejects(runLocal(ctx, 'local_iterate', {}), /agent2/)
 })

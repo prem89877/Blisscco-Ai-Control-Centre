@@ -15,7 +15,8 @@ function loadDotenv(path: string) {
 
 // cli command -> [scope, action]
 const MAP: Record<string, ['local' | 'remote', string]> = {
-  'local-inspect': ['local', 'local_inspect'], 'local-apply': ['local', 'local_apply'], checks: ['local', 'local_checks'],
+  'local-inspect': ['local', 'local_inspect'], 'local-apply': ['local', 'local_apply'], checks: ['local', 'local_checks'], iterate: ['local', 'local_iterate'],
+  chat: ['remote', 'dev_chat'], 'dev-propose': ['remote', 'dev_proposal'], explain: ['remote', 'dev_assist'], diagnose: ['remote', 'dev_diagnose'],
   exec: ['local', 'exec'], 'apply-command': ['local', 'apply_command'], commit: ['local', 'local_commit'],
   'request-push': ['local', 'request_push'], 'apply-push': ['local', 'apply_push'], 'local-rollback': ['local', 'local_rollback'],
   heartbeat: ['remote', 'heartbeat'], 'repo-inspect': ['remote', 'repo_inspect'], monitor: ['remote', 'actions_status'],
@@ -47,12 +48,17 @@ async function main() {
     delete params.file
   }
   if (cmd === 'exec') params.command = words.join(' ')
+  if (cmd === 'chat') params.message = words.join(' ')
+  if (cmd === 'dev-propose') params.request = words.join(' ')
+  if (cmd === 'explain') { params.kind = a.kind || 'explain'; params.text = words.join(' ') }
+  if (cmd === 'diagnose' && a['propose-fix']) params.propose_fix = true
   const ctx = makeCtx(loadConfig(), { type: 'system', id: null })
   const res = entry[0] === 'local' ? await runLocal(ctx, entry[1], params) : await runAction(ctx, entry[1], params)
   const r = res.result || res
   if (r.ai_review) console.log('\nAI review:\n' + r.ai_review + '\n')
   if (r.diffstat || r.stat) console.log(r.diffstat || r.stat)
   if (Array.isArray(r.checks)) for (const c of r.checks) console.log(`[${c.ok ? 'PASS' : 'FAIL'}] ${c.name} (${c.ms}ms)${c.ok ? '' : '\n' + c.tail}`)
+  if (r.answer) console.log('\n' + r.answer + '\n')
   if (r.output) console.log(r.output)
   if (r.next) console.log('\nNext: ' + r.next)
   if (process.argv.includes('--json')) console.log(JSON.stringify(res, null, 2))

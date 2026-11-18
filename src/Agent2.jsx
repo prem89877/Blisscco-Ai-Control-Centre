@@ -50,6 +50,10 @@ function Report({ res }) {
     <div className="card">
       <div className="row"><b>Result</b><Badge s={waiting ? 'awaiting_approval' : 'ok'} /></div>
       {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
+      {r.needs_split && <CodeBlock label="too big for one proposal" tone="warn" text={r.message} />}
+      {r.dev_report && <DevReport r={r.dev_report} />}
+      {r.analysis && <CodeBlock label="CI diagnosis" tone="info" text={r.analysis} />}
+      {r.ci && r.ci !== 'failing' && r.note && <CodeBlock label={'CI: ' + r.ci} tone={r.ci === 'passing' ? 'good' : ''} text={r.note} />}
       {r.unsupported && <CodeBlock label="not done" tone="warn" text={r.message} />}
       {r.branches && <CodeBlock label={'agent2 branches (' + r.branches.length + ')'} wrap={false} text={r.branches.join('\n') || 'none'} />}
       {r.ai_review && <CodeBlock label="ai review" tone="info" text={r.ai_review} />}
@@ -91,7 +95,7 @@ function AskBox({ repos, onResult, setErr }) {
   }
   return (
     <div className="card">
-      <b>Ask Agent 2</b> <span className="sub">(write anything; AI picks one safe action. Changes still need approval)</span>
+      <b>Quick command</b> <span className="sub">(one safe GitHub action: CI status, branches, workflow, delete agent2 branch)</span>
       <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
       <textarea rows={3} placeholder="e.g. agent2 test branch delete karo / ci workflow check karo / db integration workflow run karo" value={text} onChange={e => setText(e.target.value)} />
       <button className="btn" disabled={busy || !text.trim()} onClick={go}>{busy ? 'Thinking...' : 'Do it'}</button>
@@ -221,10 +225,190 @@ function Apply({ a, onDone, onResult, setErr }) {
   )
 }
 
+
+const KINDS = [['feature', 'Feature'], ['bugfix', 'Bug fix'], ['improvement', 'Improvement'], ['refactor', 'Refactor'], ['architecture', 'Architecture'], ['tests', 'Tests'], ['docs', 'Docs']]
+const STAGE = { inspect: 'Reading repository', plan: 'Planning', generate: 'Writing code', static_checks: 'Static checks', review: 'Code review', submit: 'Creating approval', awaiting_approval: 'Waiting for your approval', needs_split: 'Needs splitting' }
+
+function DevReport({ r }) {
+  if (!r) return null
+  const ran = (r.checks && r.checks.ran) || []
+  return (
+    <div>
+      {r.summary && <CodeBlock label="what & why" tone="info" text={[r.summary, r.review && r.review.what_changed, r.review && r.review.why].filter(Boolean).join('\n\n')} />}
+      {r.approach && <CodeBlock label="approach" text={r.approach + (r.pros_cons ? '\n\nPros/cons: ' + r.pros_cons : '')} />}
+      <CodeBlock label={'files (' + (r.files || []).length + ')'} wrap={false} text={(r.files || []).map(f => f.op + ' ' + f.path + (f.why ? '  - ' + f.why : '')).join('\n')} />
+      {r.checks && <CodeBlock label="checks" tone={r.checks.all_ran_passed ? 'good' : 'bad'} text={'RAN (' + ran.length + '): ' + (ran.every(x => x.ok) ? 'all passed' : 'some failed') + ' - ' + ran.slice(0, 6).map(x => x.name).join(', ') + (ran.length > 6 ? ', ...' : '') + '\n\nNOT RUN: ' + (r.checks.not_run || []).join(', ') + '\n' + (r.checks.not_run_reason || '')} />}
+      {r.review && <CodeBlock label={'code review: ' + r.review.verdict} tone={r.review.verdict === 'approve' ? 'good' : 'warn'} text={[r.review.summary, ...(r.review.findings || []).map(f => '[' + f.severity + '/' + f.area + '] ' + f.text), ...(r.review.missing || []).map(m => 'missing: ' + m)].filter(Boolean).join('\n') || 'No review text'} />}
+      {((r.risks || []).length > 0 || (r.security || []).length > 0 || (r.breaking_changes || []).length > 0) && <CodeBlock label="risks & security" tone="warn" text={[...(r.risks || []).map(x => 'risk: ' + x), ...(r.security || []).map(x => 'security: ' + x), ...(r.breaking_changes || []).map(x => 'breaking: ' + x), ...(r.dependencies || []).map(x => 'depends: ' + x)].join('\n')} />}
+      {(r.tests_planned || []).length > 0 && <CodeBlock label="tests planned (not run)" text={r.tests_planned.join('\n')} />}
+      {r.expected_result && <CodeBlock label="expected result" text={r.expected_result} />}
+      {r.generation && <div className="sub">{r.generation.batches} batch(es), {r.generation.fix_rounds_used} fix round(s)</div>}
+      {(r.remaining || []).length > 0 && <CodeBlock label="remaining" tone="warn" text={r.remaining.join('\n')} />}
+    </div>
+  )
+}
+
+function Chat({ repos, onResult, setErr, goTab }) {
+  const [repo, setRepo] = useState('')
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [msgs, setMsgs] = useState([])
+  async function go() {
+    const message = text.trim(); if (!message) return
+    const history = msgs.slice(-10).map(m => ({ role: m.role, text: m.text }))
+    setMsgs(m => [...m, { role: 'user', text: message }]); setText(''); setBusy(true); setErr('')
+    try {
+      const r = await callAgent2('dev_chat', { repo: repo || repos[0] || undefined, message, history })
+      setMsgs(m => [...m, { role: 'assistant', text: r.answer || '', mode: r.mode, agent: r.responsible_agent, res: r.mode === 'proposal' ? r : null, files: r.context_files }])
+      if (r.mode === 'proposal') onResult(r)
+    } catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  return (
+    <div className="card">
+      <b>Ask Agent 2</b> <span className="sub">(Hindi / English / Hinglish. Questions get answers; build requests become a proposal for your approval)</span>
+      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      {msgs.map((m, i) => (
+        <div key={i} className="msg" style={m.role === 'user' ? { background: 'transparent' } : undefined}>
+          <b>{m.role === 'user' ? 'You' : 'Agent 2'}</b>
+          <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', marginTop: 4 }}>{m.text}</div>
+          {m.mode === 'unsupported' && <div className="sub" style={{ marginTop: 6 }}>Not Agent 2's job{m.agent ? ': ask ' + m.agent.replace('agent', 'Agent ') : ''}.</div>}
+          {m.files && m.files.length > 0 && <div className="sub" style={{ marginTop: 6 }}>Read: {m.files.join(', ')}</div>}
+          {m.res && <div className="sub" style={{ marginTop: 6 }}>Proposal sent to Approvals. <a href="#pending" onClick={e => { e.preventDefault(); goTab('pending') }}>Open Pending</a></div>}
+        </div>
+      ))}
+      <textarea rows={3} placeholder="e.g. Login flow kaise kaam karta hai? / Settings page mein dark-mode toggle add karo" value={text} onChange={e => setText(e.target.value)} />
+      <div className="actions">
+        <button className="btn" disabled={busy || !text.trim()} onClick={go}>{busy ? 'Thinking...' : 'Send'}</button>
+        {msgs.length > 0 && <button className="btn ghost" disabled={busy} onClick={() => setMsgs([])}>New chat</button>}
+      </div>
+    </div>
+  )
+}
+
+function ProposalForm({ title, hint, defaultKind, fixedKind, placeholder, initialText, repos, onResult, setErr }) {
+  const [repo, setRepo] = useState('')
+  const [kind, setKind] = useState(defaultKind || 'feature')
+  const [request, setRequest] = useState(initialText || '')
+  const [paths, setPaths] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function go() {
+    setBusy(true); setErr('')
+    try { onResult(await callAgent2('dev_proposal', { repo: repo || repos[0], kind: fixedKind || kind, request, paths: paths.split(',').map(x => x.trim()).filter(Boolean) })); setRequest('') }
+    catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  return (
+    <div className="card">
+      <b>{title}</b> <span className="sub">{hint}</span>
+      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      {!fixedKind && <select value={kind} onChange={e => setKind(e.target.value)}>{KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>}
+      <textarea rows={4} placeholder={placeholder} value={request} onChange={e => setRequest(e.target.value)} />
+      <input placeholder="Files to look at (optional, comma separated)" value={paths} onChange={e => setPaths(e.target.value)} autoCapitalize="none" />
+      <button className="btn" disabled={busy || !request.trim() || !repos.length} onClick={go}>{busy ? 'Working (plan, code, review)... may take a minute' : 'Create proposal'}</button>
+    </div>
+  )
+}
+
+const ASSIST = {
+  explain: { title: 'Explain code', ph: 'Which file or concept should I explain? e.g. api/agent2.js kya karta hai?', btn: 'Explain' },
+  debug: { title: 'Debug error', ph: 'What is going wrong?', btn: 'Find the cause', log: true },
+  review: { title: 'Review code', ph: 'What should I review? (security, performance, scalability, maintainability)', btn: 'Review' },
+  plan: { title: 'Development plan', ph: 'Describe the feature or change to plan (no code is written)', btn: 'Make plan' },
+  docs: { title: 'Write documentation', ph: 'What should be documented?', btn: 'Write docs' }
+}
+function Assist({ kind, repos, setErr, onPropose }) {
+  const c = ASSIST[kind]
+  const [repo, setRepo] = useState('')
+  const [text, setText] = useState('')
+  const [paths, setPaths] = useState('')
+  const [log, setLog] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [out, setOut] = useState(null)
+  async function go() {
+    setBusy(true); setErr(''); setOut(null)
+    try { setOut(await callAgent2('dev_assist', { kind, repo: repo || repos[0] || undefined, text, error_log: log || undefined, paths: paths.split(',').map(x => x.trim()).filter(Boolean) })) } catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  return (
+    <div className="card">
+      <b>{c.title}</b> <span className="sub">(answer only; nothing is changed)</span>
+      <RepoPick repos={repos} repo={repo || repos[0] || ''} setRepo={setRepo} />
+      <input placeholder="Files (optional, comma separated)" value={paths} onChange={e => setPaths(e.target.value)} autoCapitalize="none" />
+      <textarea rows={3} placeholder={c.ph} value={text} onChange={e => setText(e.target.value)} />
+      {c.log && <textarea rows={3} placeholder="Error log / stack trace" value={log} onChange={e => setLog(e.target.value)} spellCheck="false" />}
+      <div className="actions">
+        <button className="btn" disabled={busy || (!text.trim() && !paths.trim() && !log.trim())} onClick={go}>{busy ? 'Thinking...' : c.btn}</button>
+        {out && (kind === 'debug' || kind === 'plan' || kind === 'review') && onPropose && <button className="btn ghost" onClick={() => onPropose(kind === 'debug' ? 'bugfix' : kind === 'review' ? 'improvement' : 'feature', (text + (log ? '\nError: ' + log.slice(0, 1500) : '')).trim(), paths)}>Turn into proposal</button>}
+      </div>
+      {out && <CodeBlock label={kind} tone="info" text={out.answer} />}
+      {out && out.omitted && out.omitted.length > 0 && <div className="sub">Not read: {out.omitted.join(', ')}</div>}
+    </div>
+  )
+}
+
+function Progress() {
+  const { data } = usePoll(() => q(supabase.from('tasks').select('id,title,status,payload,error_message,created_at').like('title', 'Dev proposal%').order('created_at', { ascending: false }).limit(8)), [], 4000)
+  const rows = data || []
+  if (!rows.length) return <div className="card"><b>Implementation progress</b><div className="sub">No development runs yet.</div></div>
+  return (
+    <>
+      {rows.map(t => {
+        const st = (t.payload && t.payload.progress) || []
+        const last = st[st.length - 1]
+        return (
+          <div className="card" key={t.id}>
+            <div className="row"><b>{t.title.replace('Dev proposal ', '')}</b><Badge s={t.status} /></div>
+            <div className="sub">{last ? (STAGE[last.stage] || last.stage) + (last.note ? ' - ' + last.note : '') : 'starting'}</div>
+            <div className="filters" style={{ marginTop: 6 }}>{['inspect', 'plan', 'generate', 'static_checks', 'review', 'submit'].map(k => <span key={k} className={'badge ' + (st.some(x => x.stage === k) ? (t.status === 'running' && last && last.stage === k ? 'warn' : 'good') : 'mute')}>{STAGE[k]}</span>)}</div>
+            {t.error_message && <CodeBlock label="stopped" tone="bad" text={t.error_message} />}
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
+function Proposals({ mode, onResult, setErr }) {
+  const { data, reload } = usePoll(() => q(supabase.from('approvals').select('*').eq('details->>kind', 'code_change').order('requested_at', { ascending: false }).limit(15)), [], 8000)
+  const [open, setOpen] = useState('')
+  const [busy, setBusy] = useState('')
+  const all = (data || []).filter(a => a.details)
+  const rows = mode === 'pending' ? all.filter(a => !a.details.executed_at && ['pending', 'approved'].includes(a.status)) : all.filter(a => a.details.dev_report)
+  async function ci(a) {
+    setBusy(a.id); setErr('')
+    try { onResult(await callAgent2('dev_diagnose', { repo: a.details.repo, branch: a.details.branch })) } catch (e) { setErr(e.message) }
+    setBusy('')
+  }
+  if (!rows.length) return <div className="card"><b>{mode === 'pending' ? 'Pending proposals' : 'Final development reports'}</b><div className="sub">{mode === 'pending' ? 'Nothing waiting.' : 'No AI-generated proposals yet.'}</div></div>
+  return (
+    <>
+      {rows.map(a => (
+        <div className="card" key={a.id}>
+          <div className="row"><b>{a.title}</b><Badge s={a.details.executed_at ? 'ok' : a.status} /></div>
+          <div className="sub">{(a.details.files || []).length} file(s) &rarr; {a.details.branch}{a.details.commit_sha ? ' @' + String(a.details.commit_sha).slice(0, 7) : ''}</div>
+          {(a.details.warnings || []).length > 0 && <CodeBlock label="warnings" tone="warn" text={a.details.warnings.join('\n')} />}
+          <div className="actions">
+            <button className="btn ghost" onClick={() => setOpen(open === a.id ? '' : a.id)}>{open === a.id ? 'Hide' : mode === 'pending' ? 'Details' : 'Report'}</button>
+            {a.details.executed_at && <button className="btn ghost" disabled={busy === a.id} onClick={() => ci(a)}>{busy === a.id ? 'Checking...' : 'Check CI'}</button>}
+            {mode === 'pending' && a.status === 'pending' && <span className="sub">Approve in the list above.</span>}
+          </div>
+          {open === a.id && (a.details.dev_report ? <DevReport r={a.details.dev_report} /> : <CodeBlock label="review" tone="info" text={a.details.ai_review || 'No report stored'} />)}
+        </div>
+      ))}
+      <button className="btn ghost" onClick={reload}>Refresh</button>
+    </>
+  )
+}
+
+const TABS = [['ask', 'Ask'], ['proposal', 'Proposal'], ['build', 'Build'], ['explain', 'Explain'], ['debug', 'Debug'], ['review', 'Review'], ['plan', 'Plan'], ['pending', 'Pending'], ['progress', 'Progress'], ['report', 'Reports'], ['tools', 'Tools']]
+
 export default function Agent2Panel() {
   const [hb, setHb] = useState(null)
   const [res, setRes] = useState(null)
   const [err, setErr] = useState('')
+  const [tab, setTab] = useState('ask')
+  const [prefill, setPrefill] = useState(null)
 
   useEffect(() => { callAgent2('heartbeat').then(setHb).catch(e => setErr(e.message)) }, [])
 
@@ -259,12 +443,24 @@ export default function Agent2Panel() {
           ))}
         </>
       )}
-      <AskBox repos={repos} onResult={setRes} setErr={setErr} />
-      <Inspect repos={repos} onResult={setRes} setErr={setErr} />
-      <Propose repos={repos} onResult={setRes} setErr={setErr} />
-      <Fix repos={repos} onResult={setRes} setErr={setErr} />
-      <BranchRequest title="Promote to production" hint="(PR + merge; needs approval and a PRODUCTION tick)" action="request_promote" repos={repos} onResult={setRes} setErr={setErr} />
-      <BranchRequest title="Delete Agent 2 branch" hint="(only that agent2/* branch is deleted; nothing else changes. Needs approval)" action="request_rollback" repos={repos} onResult={setRes} setErr={setErr} />
+      <div className="filters">{TABS.map(([k, l]) => <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{l}</button>)}</div>
+      {tab === 'ask' && <Chat repos={repos} onResult={setRes} setErr={setErr} goTab={setTab} />}
+      {tab === 'proposal' && <ProposalForm key={prefill ? prefill.n : 'p'} title="Generate development proposal" hint="(Agent 2 reads the repo, plans, writes the code, reviews it, then sends it to Approvals. No JSON needed)" defaultKind={prefill ? prefill.kind : 'feature'} initialText={prefill ? prefill.text : ''} placeholder="Describe the feature, bug fix, improvement or architecture change" repos={repos} onResult={setRes} setErr={setErr} />}
+      {tab === 'build' && <ProposalForm title="Build feature" hint="(complete module: new files + edits to existing files)" fixedKind="feature" placeholder="e.g. Add a notes page with create / edit / delete, with tests" repos={repos} onResult={setRes} setErr={setErr} />}
+      {['explain', 'debug', 'review', 'plan'].includes(tab) && <Assist key={tab} kind={tab} repos={repos} setErr={setErr} onPropose={(kind, text) => { setPrefill({ kind, text, n: Date.now() }); setTab('proposal') }} />}
+      {tab === 'pending' && <Proposals mode="pending" onResult={setRes} setErr={setErr} />}
+      {tab === 'progress' && <Progress />}
+      {tab === 'report' && <Proposals mode="report" onResult={setRes} setErr={setErr} />}
+      {tab === 'tools' && (
+        <>
+          <AskBox repos={repos} onResult={setRes} setErr={setErr} />
+        <Inspect repos={repos} onResult={setRes} setErr={setErr} />
+        <Propose repos={repos} onResult={setRes} setErr={setErr} />
+        <Fix repos={repos} onResult={setRes} setErr={setErr} />
+        <BranchRequest title="Promote to production" hint="(PR + merge; needs approval and a PRODUCTION tick)" action="request_promote" repos={repos} onResult={setRes} setErr={setErr} />
+        <BranchRequest title="Delete Agent 2 branch" hint="(only that agent2/* branch is deleted; nothing else changes. Needs approval)" action="request_rollback" repos={repos} onResult={setRes} setErr={setErr} />
+        </>
+      )}
       <div className="sub">Local lint, type check, tests and shell commands run only in Termux: <code>npm run agent2 -- checks</code></div>
     </>
   )

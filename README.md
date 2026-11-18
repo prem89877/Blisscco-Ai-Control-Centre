@@ -43,3 +43,7 @@ The existing Orchestrator dashboard accepts a ZIP of changed files (and optional
 
 ## Orchestrator automation (Phase 3 Part 1 update)
 The Orchestrator now advances routine stages by itself (`advance` action, dashboard auto-polls) and asks the owner only for sensitive or mandatory steps. Successful runs show only "Successful"; failures show agent, stage, task, the real error and recovery guidance. See `17-PHASE3-PART1-AUTOMATION-REPORT.md`.
+
+
+## Agent 2 - professional developer mode
+See `19-AGENT2-PROFESSIONAL-DEVELOPER-REPORT.md`. Dashboard: Agents > Agent 2 > Ask / Proposal / Build / Explain / Debug / Review / Plan / Pending / Progress / Reports.

@@ -48,3 +48,18 @@ export function readiness(c: Config) {
 export function repoAllowed(c: Config, repo: string): boolean {
   return c.githubRepos.some(r => r.toLowerCase() === repo.toLowerCase())
 }
+
+// Configurable, safe limits for the professional developer workflow (env AGENT2_DEV_*). Clamped so a bad value can neither
+// disable a limit nor starve the workflow.
+export interface DevLimits { maxContextFiles: number; maxContextBytes: number; maxChangeFiles: number; batchSize: number; maxFixRounds: number; historyTurns: number }
+const clampN = (raw: string | undefined, def: number, lo: number, hi: number) => { const n = Math.floor(Number(raw)); return Number.isFinite(n) && n > 0 ? Math.min(hi, Math.max(lo, n)) : def }
+export function devLimits(env: Record<string, string | undefined> = process.env): DevLimits {
+  return {
+    maxContextFiles: clampN(env.AGENT2_DEV_MAX_CONTEXT_FILES, 25, 1, 80),
+    maxContextBytes: clampN(env.AGENT2_DEV_MAX_CONTEXT_BYTES, 120_000, 10_000, 400_000),
+    maxChangeFiles: clampN(env.AGENT2_DEV_MAX_FILES, 40, 1, 120), // hard cap of one proposal; larger work is split into batches
+    batchSize: clampN(env.AGENT2_DEV_BATCH_SIZE, 8, 1, 20),
+    maxFixRounds: clampN(env.AGENT2_DEV_MAX_FIX_ROUNDS, 2, 0, 5),
+    historyTurns: clampN(env.AGENT2_DEV_HISTORY_TURNS, 10, 1, 30)
+  }
+}

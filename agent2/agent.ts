@@ -3,12 +3,14 @@ import { AgentError, clip, errMsg, extractFailedLog, redact, redactString } from
 import { Store } from './store.js'
 import { GitHub, type CommitFile } from './github.js'
 import { planCommand, proposeFix, review, type AiResult } from './gemini.js'
-import { assertAgentBranch, branchFor, diffStats, gitBlobSha, isProtected, isSensitivePath, sha256, validatePath, validRepo, validateFiles, type FileIn } from './guard.js'
+import { runDev } from './dev.js'
+import { devLimits } from './config.js'
+import { assertAgentBranch, branchFor, diffStats, gitBlobSha, isProtected, LIMITS, isSensitivePath, sha256, validatePath, validRepo, validateFiles, type FileIn } from './guard.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
 // Actions that need only GitHub + Supabase, so they can run on Vercel (/api/agent2) and in Termux.
-export const ACTIONS = ['heartbeat', 'repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'apply_change', 'request_promote', 'apply_promote', 'request_rollback', 'apply_rollback', 'ai_command', 'request_workflow', 'apply_workflow'] as const
+export const ACTIONS = ['heartbeat', 'repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'apply_change', 'request_promote', 'apply_promote', 'request_rollback', 'apply_rollback', 'ai_command', 'request_workflow', 'apply_workflow', 'dev_chat', 'dev_assist', 'dev_proposal', 'dev_diagnose'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -116,13 +118,13 @@ async function actionsStatus(ctx: Ctx, p: any): Promise<Out> {
 }
 
 // ---------------------------------------------------------------- propose (nothing is written to GitHub)
-async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: string }): Promise<any> {
+export async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: string; dev_report?: unknown }): Promise<any> {
   const gh = new GitHub(ctx.cfg, ctx.calls)
   const repo = gh.repo(validRepo(p.repo))
   const title = String(p.title || '').trim().slice(0, 120)
   if (!title) throw new AgentError('title is required', 400)
   const description = String(p.description || '').slice(0, 1000)
-  const files: FileIn[] = validateFiles(p.files)
+  const files: FileIn[] = validateFiles(p.files, { ...LIMITS, maxFiles: Math.max(LIMITS.maxFiles, devLimits().maxChangeFiles) })
   return withTask(ctx, 'propose_change', 'Propose: ' + title, { repo, files }, async taskId => {
     const info = await gh.info(repo)
     const base = String(p.base || info.default_branch)
@@ -176,7 +178,7 @@ async function proposeChange(ctx: Ctx, p: any, fix?: { explanation: string }): P
     assertAgentBranch(branch, ctx.cfg.protectedBranches)
     const ap = await ctx.store.createApproval({
       task_id: taskId, title: `Code change: ${title}`,
-      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
+      details: { kind: 'code_change', repo, title, description, base_branch: base, base_sha: baseSha, branch, files: entries, sensitive_paths: sensitive, warnings, ai_review: ai.text, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null }, ai_fix: fix ? fix.explanation.slice(0, 500) : undefined, dev_report: fix ? fix.dev_report : undefined, production: false, note: `Creates branch ${branch} from ${base}@${baseSha.slice(0, 7)} with one commit. ${base} is not touched.` }
     })
     await ctx.store.log('warn', 'agent2_approval_requested', 'Code change: ' + title, { approval_id: ap.id }, taskId, ctx.actor.id)
     return { status: 'awaiting_approval', result: { approval_id: ap.id, branch, base: `${base}@${baseSha.slice(0, 7)}`, changed_files: entries.map(({ path, op, added, removed, sensitive: s }) => ({ path, op, added, removed, sensitive: s })), warnings, ai_review: ai.text, ai_note: ai.text ? undefined : ai.error, ai_usage: { model: ai.model, tokens_in: ai.tokensIn, tokens_out: ai.tokensOut, input_chars: ai.inputChars ?? null, partial: Boolean(ai.partial), omitted: ai.omitted || null, estimated_cost_usd: Number(((ai.tokensIn * ctx.cfg.priceIn + ai.tokensOut * ctx.cfg.priceOut) / 1_000_000).toFixed(6)) }, base_sha: baseSha, next: 'Approve in the Approvals tab, then press "Create branch & commit" in the Agent 2 console.' + (sensitive.length ? ' Sensitive files need the extra confirmation tick.' : '') } }
@@ -187,8 +189,8 @@ async function aiFix(ctx: Ctx, p: any): Promise<any> {
   const gh = new GitHub(ctx.cfg, ctx.calls)
   const repo = gh.repo(validRepo(p.repo))
   const problem = String(p.problem || '').trim().slice(0, 2000)
-  const paths: string[] = (Array.isArray(p.paths) ? p.paths : []).slice(0, 5).map(validatePath)
-  if (!problem || !paths.length) throw new AgentError('problem and paths[] (max 5) are required', 400)
+  const paths: string[] = (Array.isArray(p.paths) ? p.paths : []).slice(0, devLimits().maxContextFiles).map(validatePath)
+  if (!problem || !paths.length) throw new AgentError('problem and paths[] (max ' + devLimits().maxContextFiles + ') are required', 400)
   const info = await gh.info(repo)
   const base = String(p.base || info.default_branch)
   const sha = await gh.branchSha(repo, base)
@@ -458,6 +460,7 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'ai_command': return aiCommand(ctx, params)
     case 'request_workflow': return requestWorkflow(ctx, params)
     case 'apply_workflow': return applyWorkflow(ctx, params)
+    case 'dev_chat': case 'dev_assist': case 'dev_proposal': case 'dev_diagnose': return runDev(ctx, action, params)
   }
 }
 
