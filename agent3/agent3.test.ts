@@ -5,7 +5,7 @@ import { assertAuthorizedTarget, assertBillingSafe, assertReadOnlySql, isBilling
 import * as C from './checks.js'
 import { redact } from './util.js'
 import { handleRequest } from './server.js'
-import { makeCtx, runAction } from './agent.js'
+import { makeCtx, runAction, assertRouteAllowed, assertRouteBudget, hardBurstCap, MAX_REQUESTS_PER_ROUTE } from './agent.js'
 import { workOnce } from './worker.js'
 import { parseCommand, runLocal, runOne, realExec, scanLocalSecrets, analyzeTests, analyzeAudit, analyzeGit, analyzeEnv, analyzeBuild, ALLOWED_HELP, type ExecFn } from './local.js'
 import { maskSecrets } from './guard.js'
@@ -78,6 +78,12 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   const h: Record<string, string> = {}
   const rawH = init.headers || {}
   for (const k of Object.keys(rawH)) h[k.toLowerCase()] = rawH[k]
+  if (url.origin === 'https://blisscco.online') {
+    siteCalls.push({ method, path: url.pathname + url.search, headers: h })
+    if (url.pathname === '/api/v1/ads/impression') return json({ error: 'invalid' }, 400)
+    if (url.pathname === '/api/v1/ads/click') return json({ error: 'not found' }, 404)
+    if (url.pathname === '/api/v1/ads/match') return json({ error: 'unauthorized' }, 401)
+  }
   if (url.origin === SITE) {
     siteCalls.push({ method, path: url.pathname + url.search, headers: h })
     if (url.pathname === '/api/serve' || url.pathname === '/api/stats') {
@@ -95,6 +101,9 @@ async function fake(input: any, init: any = {}): Promise<Response> {
       if (rateLimit && rateCount > 12) return json({ error: 'slow down' }, 429, { 'retry-after': '30' })
       return json({ ok: 1 })
     }
+    if (url.pathname === '/api/v1/ads/impression') return json({ error: 'invalid' }, 400)
+    if (url.pathname === '/api/v1/ads/click') return json({ error: 'not found' }, 404)
+    if (url.pathname === '/api/v1/ads/match') return json({ error: 'unauthorized' }, 401)
     return site(url.pathname + url.search, method)
   }
   if (url.host === `${REF}.supabase.co`) {
@@ -613,4 +622,149 @@ test('STRICT: retest of a repo scan that has no recorded branch is refused inste
   a3Queries = []
   await assert.rejects(() => runAction(ctx(), 'retest', { task_id: t.id }), (e: any) => e.status === 400 && e.code === 'branch_required')
   assert.ok(!a3Queries.some(q => q.includes('/git/trees/')))
+})
+
+
+test('Agent 3 fixed Ads routes check uses only production whitelist and invalid credentials/ref', async () => {
+  const r = await runAction(ctx(), 'ads_routes_check', {})
+  assert.equal(r.result.verdict, 'PASS')
+  assert.deepEqual(siteCalls.map(c => [c.method, c.path.split('?')[0]]), [
+    ['POST', '/api/v1/ads/impression'], ['GET', '/api/v1/ads/click']
+  ])
+  assert.ok(siteCalls.every(c => !c.headers.authorization && !c.headers['x-api-key']))
+  for (const route of ['/api/v1/ads/impression', '/api/v1/ads/click']) assert.ok(siteCalls.filter(c => c.path.startsWith(route)).length <= 4, 'route request cap exceeded')
+  assert.ok(r.result.evidence.every((e: any) => /status \d+; time /.test(e.detail)))
+  assert.equal(r.result.rate_limit, 'NOT TESTED (no burst requests sent)')
+  assert.deepEqual(otherHostCalls, [])
+})
+test('Agent 3 Match route checks only exact production route', async () => {
+  const r = await runAction(ctx(), 'match_route_check', {})
+  assert.equal(r.result.verdict, 'PASS')
+  assert.deepEqual(siteCalls.map(c => [c.method, c.path]), [['POST', '/api/v1/ads/match']])
+  assert.ok(!siteCalls[0].headers.authorization && !siteCalls[0].headers['x-api-key'])
+})
+test('Agent 3 route whitelist rejects any route outside the 3 allowed ones (no request sent)', () => {
+  const bad: [string, string][] = [
+    ['POST', 'https://blisscco.online/api/v1/ads/payout'], ['GET', 'https://blisscco.online/api/v1/ads/impression'],
+    ['POST', 'https://blisscco.online/api/v1/ads/match?x=1'], ['GET', 'https://blisscco.online/api/v1/ads/click?ref=REAL_REF'],
+    ['GET', 'https://blisscco.online/api/v1/ads/click'], ['DELETE', 'https://blisscco.online/api/v1/ads/match'],
+    ['POST', 'https://preview-abc.vercel.app/api/v1/ads/match'], ['POST', 'https://staging.blisscco.online/api/v1/ads/match'],
+    ['POST', 'http://blisscco.online/api/v1/ads/match'], ['POST', 'https://blisscco.online@evil.example/api/v1/ads/match'], ['POST', 'not a url']
+  ]
+  for (const [m, u] of bad) assert.throws(() => assertRouteAllowed(m, u), (e: any) => e.code === 'route_blocked', m + ' ' + u)
+  assert.equal(assertRouteAllowed('POST', 'https://blisscco.online/api/v1/ads/impression'), '/api/v1/ads/impression')
+  assert.equal(assertRouteAllowed('get', 'https://blisscco.online/api/v1/ads/click?ref=invalid_qa_ref'), '/api/v1/ads/click')
+  assert.equal(assertRouteAllowed('POST', 'https://blisscco.online/api/v1/ads/match'), '/api/v1/ads/match')
+})
+test('Agent 3 enforces max 4 requests per route per run and a hard burst cap of 40', () => {
+  const counts: Record<string, number> = {}
+  for (let i = 0; i < MAX_REQUESTS_PER_ROUTE; i++) assertRouteBudget(counts, 'POST', '/api/v1/ads/match')
+  assert.throws(() => assertRouteBudget(counts, 'POST', '/api/v1/ads/match'), (e: any) => e.code === 'route_budget')
+  assert.equal(MAX_REQUESTS_PER_ROUTE, 4)
+  assert.equal(hardBurstCap(1000), 40); assert.equal(hardBurstCap(30), 30); assert.equal(hardBurstCap(-5), 0); assert.equal(hardBurstCap('x'), 0)
+})
+test('Agent 3 route check ignores caller path/host input and only ever calls the fixed routes', async () => {
+  const r = await runAction(ctx(), 'ads_routes_check', { path: '/api/v1/ads/payout', target: 'https://evil.example' })
+  assert.equal(r.result.verdict, 'PASS')
+  assert.deepEqual(siteCalls.map(c => c.path.split('?')[0]), ['/api/v1/ads/impression', '/api/v1/ads/click'])
+  assert.deepEqual(otherHostCalls, [])
+})
+test('Agent 3 route check immediately FAILS and stops on 200 or 302', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: any, init: any = {}) => {
+    const u = new URL(String(input))
+    if (u.origin === 'https://blisscco.online') return new Response('{}', { status: 200 })
+    return fake(input, init)
+  }) as any
+  try {
+    const r = await runAction(ctx(), 'ads_routes_check', {})
+    assert.equal(r.result.verdict, 'FAIL')
+    assert.equal(r.result.evidence.length, 1)
+    assert.equal(r.result.findings[0].severity, 'critical')
+  } finally { globalThis.fetch = original }
+})
+test('Agent 3 unsupported AI task is BLOCKED, never swapped for another check, and is logged', async () => {
+  // Planner wrongly maps a firewall request to security_scan: the task text has no security words -> BLOCKED, nothing runs.
+  planReply = JSON.stringify({ intent: 'security_scan', explanation: 'x', target: null })
+  const r = await runAction(ctx(), 'ai_command', { text: 'check firewall waf rules on production' })
+  assert.equal(r.status, 'blocked')
+  assert.equal(r.result.verdict, 'BLOCKED')
+  assert.equal(r.result.reason, 'unsupported check')
+  assert.equal(r.understood.intent, 'unsupported check')
+  assert.ok(Array.isArray(r.result.supported_checks) && r.result.supported_checks.length >= 8)
+  assert.match(r.result.message, /Supported checks:/)
+  assert.equal(siteCalls.length, 0)
+  assert.ok(db.activity_logs.some(l => l.action === 'agent3_ai_command_blocked'))
+  planReply = JSON.stringify({ intent: 'make_payout', explanation: 'no', target: null })
+  assert.equal((await runAction(ctx(), 'ai_command', { text: 'payout karo' })).result.verdict, 'BLOCKED')
+  assert.equal(siteCalls.length, 0)
+})
+test('Agent 3 "rate limit" / "429" text runs the Route Check only (no burst)', async () => {
+  const r = await runAction(ctx(), 'ai_command', { text: 'check production firewall config and rate limit rules' })
+  assert.equal(r.result.verdict, 'PASS'); assert.equal(siteCalls.length, 2)
+  assert.match(r.result.rate_limit, /^NOT TESTED/)
+  assert.equal((db.approvals || []).length, 0)
+})
+test('Agent 3 match route text is routed deterministically', async () => {
+  const r = await runAction(ctx(), 'ai_command', { text: 'test /api/v1/ads/match route' })
+  assert.match(r.understood.intent, /Match route/); assert.deepEqual(siteCalls.map(c => c.path), ['/api/v1/ads/match'])
+})
+test('Agent 3 records 429 / Retry-After as rate-limit evidence and FAILs (unexpected status)', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: any, init: any = {}) => new URL(String(input)).origin === 'https://blisscco.online'
+    ? new Response('{}', { status: 429, headers: { 'retry-after': '30' } }) : fake(input, init)) as any
+  try {
+    const r = await runAction(ctx(), 'match_route_check', {})
+    assert.equal(r.result.verdict, 'FAIL')
+    assert.match(r.result.evidence[0].detail, /status 429; time .*Retry-After 30/)
+    assert.match(r.result.rate_limit, /429.*Retry-After 30/)
+  } finally { globalThis.fetch = original }
+})
+test('Agent 3 verdict: an unexpected status is FAIL even if a later route is unreachable', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: any, init: any = {}) => {
+    const u = new URL(String(input))
+    if (u.origin !== 'https://blisscco.online') return fake(input, init)
+    if (u.pathname.endsWith('/impression')) return new Response('{}', { status: 500 })
+    throw new Error('network down')
+  }) as any
+  try {
+    const r = await runAction(ctx(), 'ads_routes_check', {})
+    assert.equal(r.result.verdict, 'FAIL'); assert.equal(r.result.evidence.length, 2)
+  } finally { globalThis.fetch = original }
+})
+test('Agent 3 impression/click/rate-limit intent bypasses AI and routes deterministically', async () => {
+  const r = await runAction(ctx(), 'ai_command', { text: 'O2 impression/click rate-limit check' })
+  assert.equal(r.result.verdict, 'PASS')
+  assert.match(r.understood.intent, /Ads routes/)
+  assert.equal(siteCalls.length, 2)
+})
+test('Agent 3 route check never exposes configured secrets', async () => {
+  const r = await runAction(ctx(), 'ads_routes_check', {})
+  const out = JSON.stringify([r, db.tasks, db.activity_logs, db.api_usage])
+  for (const secret of [SERVICE, GEMKEY, TESTKEY, ENV.AGENT3_GITHUB_TOKEN, ENV.AGENT3_SUPABASE_ACCESS_TOKEN]) assert.ok(!out.includes(secret))
+  assert.ok(siteCalls.every(c => !c.headers.authorization && !c.headers['x-api-key'] && !c.headers.cookie))
+})
+
+test('Agent 3 stops immediately on HTTP 302 as a critical FAIL', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: any, init: any = {}) => new URL(String(input)).origin === 'https://blisscco.online'
+    ? new Response(null, { status: 302, headers: { location: '/login' } })
+    : fake(input, init)) as any
+  try {
+    const r = await runAction(ctx(), 'match_route_check', {})
+    assert.equal(r.result.verdict, 'FAIL')
+    assert.equal(r.result.evidence.length, 1)
+    assert.equal(r.result.findings[0].severity, 'critical')
+  } finally { globalThis.fetch = original }
+})
+test('Agent 3 marks unreachable route BLOCKED without retrying', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: any, init: any = {}) => new URL(String(input)).origin === 'https://blisscco.online'
+    ? Promise.reject(new Error('network down')) : fake(input, init)) as any
+  try {
+    const r = await runAction(ctx(), 'match_route_check', {})
+    assert.equal(r.result.verdict, 'BLOCKED')
+    assert.equal(r.result.evidence.length, 1)
+  } finally { globalThis.fetch = original }
 })

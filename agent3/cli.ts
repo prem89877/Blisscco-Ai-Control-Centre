@@ -14,7 +14,7 @@ function loadDotenv(path: string) {
 }
 const MAP: Record<string, string> = {
   heartbeat: 'heartbeat', website: 'website_smoke', auth: 'auth_check', api: 'api_test', db: 'db_test', security: 'security_scan', report: 'full_report',
-  worker: 'worker', local: 'local_check', 'request-rate': 'request_rate_test', 'apply-rate': 'apply_rate_test', retest: 'retest', ask: 'ai_command'
+  worker: 'worker', local: 'local_check', 'request-rate': 'request_rate_test', 'apply-rate': 'apply_rate_test', retest: 'retest', ask: 'ai_command', 'ads-routes': 'ads_routes_check', 'match-route': 'match_route_check'
 }
 async function main() {
   loadDotenv('.env.agent3')

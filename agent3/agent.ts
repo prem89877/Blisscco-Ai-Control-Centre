@@ -10,7 +10,7 @@ import type { Finding } from './checks.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number>; adopt?: string; worker?: boolean; exec?: ExecFn }
-export const ACTIONS = ['heartbeat', 'github_branches', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task', 'queue_local', 'request_local_command', 'queue_local_command', 'local_check', 'local_command'] as const
+export const ACTIONS = ['heartbeat', 'github_branches', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task', 'queue_local', 'request_local_command', 'queue_local_command', 'local_check', 'local_command', 'ads_routes_check', 'match_route_check'] as const
 export type Action = typeof ACTIONS[number]
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
 export const now = () => new Date().toISOString()
@@ -159,6 +159,87 @@ export async function apiChecks(ctx: Ctx, origin: string) {
   if (acao === 'https://evil.example') f.push({ id: 'sec.cors.reflect', area: 'security', severity: 'high', title: 'CORS reflects any Origin', evidence: 'ACAO echoed https://evil.example', fix: 'Allow-list origins.', target: first.path })
   return { f, ev }
 }
+
+// ---------------------------------------------------------------- fixed, safe Blisscco production route checks (no credentials, no burst)
+export const BLISSCCO_PRODUCTION = 'https://blisscco.online'
+export const MAX_REQUESTS_PER_ROUTE = 4
+export const MAX_BURST_REQUESTS = 40
+export const SUPPORTED_CHECKS = ['Ads routes (impression + click)', 'Match route', 'Website + mobile', 'Login / roles', 'API tests', 'Database', 'Security', 'Full report'] as const
+// The ONLY routes this module may ever call. Method + path + exact (invalid) query are all pinned.
+export const ROUTE_WHITELIST = [
+  { method: 'POST', path: '/api/v1/ads/impression', search: '' },
+  { method: 'GET', path: '/api/v1/ads/click', search: '?ref=invalid_qa_ref' },
+  { method: 'POST', path: '/api/v1/ads/match', search: '' }
+] as const
+const ROUTE_CASES = {
+  impression: { method: 'POST', path: '/api/v1/ads/impression', expected: [400, 401], init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"invalid":' } },
+  click: { method: 'GET', path: '/api/v1/ads/click?ref=invalid_qa_ref', expected: [400, 404], init: { method: 'GET' } },
+  match: { method: 'POST', path: '/api/v1/ads/match', expected: [401], init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"topic":"qa-invalid"}' } }
+} as const
+const CREDENTIAL_HEADERS = ['authorization', 'x-api-key', 'apikey', 'cookie', 'proxy-authorization']
+export const hardBurstCap = (n: unknown) => Math.min(Math.max(Math.floor(Number(n)) || 0, 0), MAX_BURST_REQUESTS)
+
+/** Throws unless method + URL is exactly one of the whitelisted production routes. Returns the pathname. */
+export function assertRouteAllowed(method: string, url: string): string {
+  let u: URL
+  try { u = new URL(url) } catch { throw new AgentError('Route not allow-listed', 403, 'route_blocked') }
+  const ok = u.origin === BLISSCCO_PRODUCTION && !u.username && !u.password && !u.hash &&
+    ROUTE_WHITELIST.some(r => r.method === String(method).toUpperCase() && r.path === u.pathname && r.search === u.search)
+  if (!ok) throw new AgentError('Route not allow-listed (production whitelist only)', 403, 'route_blocked')
+  return u.pathname
+}
+/** Counts one request for this route in this run; throws when the per-route cap is already used up. */
+export function assertRouteBudget(counts: Record<string, number>, method: string, pathname: string) {
+  const key = String(method).toUpperCase() + ' ' + pathname
+  if ((counts[key] || 0) >= MAX_REQUESTS_PER_ROUTE) throw new AgentError('Request cap reached for ' + key + ' (max ' + MAX_REQUESTS_PER_ROUTE + ' per run)', 403, 'route_budget')
+  counts[key] = (counts[key] || 0) + 1
+}
+function assertNoCredentials(init: RequestInit) {
+  const h = (init.headers || {}) as Record<string, string>
+  for (const k of Object.keys(h)) if (CREDENTIAL_HEADERS.includes(k.toLowerCase())) throw new AgentError('Credentials are never sent by route checks', 403, 'route_credentials')
+}
+
+async function safeRouteCheck(ctx: Ctx, mode: 'ads' | 'match'): Promise<Out> {
+  const cases = mode === 'ads' ? [ROUTE_CASES.impression, ROUTE_CASES.click] : [ROUTE_CASES.match]
+  const title = mode === 'ads' ? 'Ads routes safe check' : 'Match route safe check'
+  const understood = mode === 'ads' ? 'Ads routes: impression + click safe check' : 'Match route safe check'
+  return withTask(ctx, mode === 'ads' ? 'ads_routes_check' : 'match_route_check', title, { target: BLISSCCO_PRODUCTION }, async () => {
+    const evidence: Ev[] = [], findings: Finding[] = [], counts: Record<string, number> = {}
+    let blocked = false, stopped = false, rate = 'NOT TESTED (no burst requests sent)'
+    for (const route of cases) {
+      const url = BLISSCCO_PRODUCTION + route.path
+      const headers = { 'User-Agent': 'BlisccoQA/1.0 (+read-only test)', ...((route.init as any).headers || {}) }
+      const init: RequestInit = { ...route.init, headers, redirect: 'manual' } as RequestInit
+      const pathname = assertRouteAllowed(route.method, url)   // whitelist + production origin, enforced before any request
+      assertNoCredentials(init)                                 // never a key / token
+      assertRouteBudget(counts, route.method, pathname)         // max 4 per route per run
+      bump(ctx, 'target_http')
+      const pr = await probe(url, init, 10000)
+      const at = now()
+      const label = `${route.method} ${pathname}`
+      if (pr.status === 0) {
+        blocked = true
+        evidence.push({ check: label, ok: false, detail: `BLOCKED route unreachable; status 0; time ${at}` })
+        break
+      }
+      const retryAfter = pr.headers['retry-after']
+      if (pr.status === 429 || retryAfter) rate = `OBSERVED: ${pr.status === 429 ? '429' : 'status ' + pr.status}${retryAfter ? ', Retry-After ' + String(retryAfter).slice(0, 40) : ''} on ${label}`
+      const ok = (route.expected as readonly number[]).includes(pr.status)
+      evidence.push({ check: label, ok, detail: `status ${pr.status}; time ${at}${retryAfter ? '; Retry-After ' + String(retryAfter).slice(0, 40) : ''}` })
+      if (pr.status === 200 || pr.status === 302) {
+        findings.push({ id: 'route.unsafe_acceptance', area: 'api', severity: 'critical', title: 'Safe negative request unexpectedly accepted or redirected', evidence: `${label} returned ${pr.status}`, fix: 'Investigate route authentication/validation immediately.', target: pathname })
+        stopped = true
+        break
+      }
+      if (!ok) findings.push({ id: 'route.unexpected_status', area: 'api', severity: 'high', title: 'Unexpected route status', evidence: `${label} returned ${pr.status}; expected ${(route.expected as readonly number[]).join('/')}`, fix: 'Review route validation and authentication.', target: pathname })
+    }
+    // FAIL (an unexpected status was seen) always wins over BLOCKED; PASS only when every route answered as expected.
+    const verdict = findings.length ? 'FAIL' : blocked || evidence.length !== cases.length ? 'BLOCKED' : 'PASS'
+    const base = report(title, findings, evidence, { target: BLISSCCO_PRODUCTION, understood, rate_limit: rate, stopped_critical: stopped, ...(blocked ? { reason: 'route unreachable' } : {}), billing_safety: 'No API key, user token or valid ref used. No billable event, ledger, payment or database write requested.' })
+    return { result: { ...base, verdict } }
+  })
+}
+
 async function apiTest(ctx: Ctx, p: any): Promise<Out> {
   const origin = pickTarget(ctx, p)
   return withTask(ctx, 'api_test', 'API tests ' + origin, { target: origin }, async () => {
@@ -195,8 +276,10 @@ async function applyRateTest(ctx: Ctx, p: any): Promise<Out> {
     const statuses: Record<string, number> = {}
     let first429: number | null = null, retry = false, has5xx = false, sent = 0
     const batch = 5
-    for (let i = 0; i < d.requests; i += batch) {
-      const rs = await Promise.all(Array.from({ length: Math.min(batch, d.requests - i) }, () => hit(ctx, origin, d.path)))
+    const total = hardBurstCap(d.requests)   // hard cap, even if the stored approval was tampered with
+    if (!total) throw new AgentError('Invalid request count in approval', 409, 'bad_approval')
+    for (let i = 0; i < total; i += batch) {
+      const rs = await Promise.all(Array.from({ length: Math.min(batch, total - i) }, () => hit(ctx, origin, d.path)))
       for (const r of rs) {
         sent++
         statuses[r.status] = (statuses[r.status] || 0) + 1
@@ -473,9 +556,31 @@ async function retest(ctx: Ctx, p: any): Promise<any> {
 }
 
 // ---------------------------------------------------------------- free text -> ONE read-only test
+// Words that must appear in the task text before the AI planner may run the matching check (prevents "O2 impression" -> auth_check style mix-ups).
+const INTENT_WORDS: Record<string, RegExp> = {
+  website_smoke: /site|website|\bweb\b|page|mobile|smoke|homepage/,
+  auth_check: /login|log in|sign ?in|auth|role|access|password|dashboard/,
+  api_test: /\bapi\b|endpoint|route|api key/,
+  db_test: /database|\bdb\b|supabase|\brls\b|table|\bsql\b|polic/,
+  security_scan: /security|secret|scan|vulnerab|leak|header|cors/,
+  full_report: /full|report|everything|complete/
+}
+async function blockUnsupported(ctx: Ctx): Promise<any> {
+  await ctx.store.ensureAgent()
+  // logged in ai_control activity logs; the task text itself is never stored (it could contain a secret)
+  await ctx.store.log('warn', 'agent3_ai_command_blocked', 'unsupported check', { reason: 'unsupported check' }, null, ctx.actor.id)
+  return { task_id: null, status: 'blocked', understood: { intent: 'unsupported check', explanation: 'No supported check matches this task. Nothing was run.' }, result: { unsupported: true, verdict: 'BLOCKED', reason: 'unsupported check', supported_checks: [...SUPPORTED_CHECKS], message: 'Supported checks: ' + SUPPORTED_CHECKS.join(', ') + '.' } }
+}
+
 async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   const text = String(p.text || '').trim().slice(0, 500)
   if (!text) throw new AgentError('text is required', 400)
+  const lower = text.toLowerCase()
+  if (/impression|click|rate[ -]?limit|429|ads\/match|match (route|api|endpoint)/.test(lower)) {
+    const mode = /match/.test(lower) && !/impression|click|rate[ -]?limit|429/.test(lower) ? 'match' : 'ads'
+    const out = await safeRouteCheck(ctx, mode)
+    return { ...out, understood: { intent: mode === 'ads' ? 'Ads routes: impression + click safe check' : 'Match route safe check', explanation: 'Deterministic route intent; fixed production whitelist only.' } }
+  }
   const r = await planCommand(ctx.cfg, { request: text, targets: ctx.cfg.targets })
   await recordAi(ctx, 'plan', r)
   if (!r.text) throw new AgentError('AI planner unavailable: ' + (r.error || 'no answer'), 503, 'ai_unavailable')
@@ -483,8 +588,8 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   try { plan = JSON.parse(r.text) } catch { throw new AgentError('AI planner returned an unreadable answer', 502, 'ai_bad') }
   const intent = String(plan.intent || '')
   const understood = { intent, explanation: String(plan.explanation || '').slice(0, 300) }
-  if (!['website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report'].includes(intent))
-    return { task_id: null, status: 'succeeded', understood, result: { unsupported: true, message: understood.explanation || 'Not supported. Agent 3 only runs read-only tests.' } }
+  // The AI may only pick a check the task text itself asks for. Anything else is BLOCKED, never swapped for another check.
+  if (!INTENT_WORDS[intent] || !INTENT_WORDS[intent].test(lower)) return blockUnsupported(ctx)
   const target = plan.target && ctx.cfg.targets.includes(String(plan.target)) ? String(plan.target) : undefined
   // The model only picks WHICH test to run. Repo/branch/SHA always come from the owner's dropdown selection (sent by the dashboard).
   // Repo-scanning tests without a selection are refused: they never run on a default branch.
@@ -585,6 +690,8 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'website_smoke': return websiteSmoke(ctx, params)
     case 'auth_check': return authCheck(ctx, params)
     case 'api_test': return apiTest(ctx, params)
+    case 'ads_routes_check': return safeRouteCheck(ctx, 'ads')
+    case 'match_route_check': return safeRouteCheck(ctx, 'match')
     case 'db_test': return dbTest(ctx)
     case 'security_scan': return securityScan(ctx, params)
     case 'full_report': return fullReport(ctx, params)

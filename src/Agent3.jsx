@@ -43,13 +43,16 @@ function Report({ res, onRetest }) {
   const r = res.result || {}
   const waiting = res.status === 'awaiting_approval'
   const c = r.counts || {}
+  const v = String(r.verdict || '').toLowerCase()
+  const u = res.understood || r.understood
   return (
     <div className="card">
-      <div className="row"><b>{r.title || 'Result'}</b><Badge s={res.status === 'queued' ? 'queued' : waiting ? 'awaiting_approval' : r.verdict === 'fail' ? 'failed' : r.verdict === 'attention' ? 'degraded' : 'ok'} /></div>
+      <div className="row"><b>{r.title || 'Result'}</b><Badge s={res.status === 'queued' ? 'queued' : waiting ? 'awaiting_approval' : v === 'fail' ? 'failed' : (v === 'blocked' || res.status === 'blocked') ? 'warn' : v === 'attention' ? 'degraded' : 'ok'} /></div>
       {(r.repo || r.branch) && <CodeBlock label="GitHub branch context" tone="info" text={[r.repo && 'Repository: ' + r.repo, r.branch && 'Branch (selected): ' + r.branch, r.branch_sha && 'Commit: ' + String(r.branch_sha).slice(0, 7), (r.repo && r.branch && r.branch_sha) ? 'Used: ' + r.repo + ' @ ' + r.branch + ' @ ' + String(r.branch_sha).slice(0, 7) : null].filter(Boolean).join('\\n')} wrap={false} />}
-      {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
+      {u && <CodeBlock label={'understood: ' + (typeof u === 'string' ? u : u.intent)} tone="info" text={typeof u === 'string' ? u : (u.explanation || u.intent)} />}
       {r.unsupported && <CodeBlock label="not done" tone="warn" text={r.message} />}
-      {r.verdict && <div className="sub" style={{ margin: '6px 0' }}>Verdict: <b>{r.verdict.toUpperCase()}</b> | {r.tests_passed}/{r.tests_run} checks ok | critical {c.critical} | high {c.high} | medium {c.medium} | low {c.low}</div>}
+      {r.verdict && <div className="sub" style={{ margin: '6px 0' }}>Verdict: <b>{String(r.verdict).toUpperCase()}</b>{r.reason ? ' (' + r.reason + ')' : ''}{r.tests_run != null && <> | {r.tests_passed}/{r.tests_run} checks ok</>}{r.counts && <> | critical {c.critical} | high {c.high} | medium {c.medium} | low {c.low}</>}</div>}
+      {r.rate_limit && <CodeBlock label="rate limit" tone={String(r.rate_limit).startsWith('NOT TESTED') ? 'info' : 'warn'} text={r.rate_limit} />}
       {r.ai_summary && <CodeBlock label="ai summary" tone="info" text={r.ai_summary} />}
       {r.ai_note && <CodeBlock label="ai note" tone="warn" text={'AI summary unavailable: ' + r.ai_note} />}
       {r.retest && <CodeBlock label="retest" tone="good" text={['fixed: ' + r.retest.fixed.length, ...r.retest.fixed.map(x => '  + ' + x), 'still failing: ' + r.retest.still_failing.length, ...r.retest.still_failing.map(x => '  ! ' + x), 'new: ' + r.retest.new_findings.length, ...r.retest.new_findings.map(x => '  ? ' + x)].join('\n')} wrap={false} />}
@@ -231,17 +234,19 @@ export default function Agent3Panel() {
         <SelectedLine agent="agent3" label="Repo scans (secrets, dependencies) read" />
         <div className="sub">Live website / API / DB checks always run against the live target, not a branch.</div>
         <div className="actions" style={{ flexWrap: 'wrap' }}>
+          <button className="btn ghost" disabled={!!busy} onClick={() => run('ads_routes_check')}>{busy === 'ads_routes_check' ? 'Checking...' : 'Ads routes'}</button>
+          <button className="btn ghost" disabled={!!busy} onClick={() => run('match_route_check')}>{busy === 'match_route_check' ? 'Checking...' : 'Match route'}</button>
           {TESTS.map(([a, l]) => <button key={a} className={'btn' + (a === 'full_report' ? '' : ' ghost')} disabled={!!busy || !targets.length} onClick={() => run(a)}>{busy === a ? 'Testing...' : l}</button>)}
         </div>
       </div>
       <LocalCard busy={busy} setBusy={setBusy} setErr={setErr} setRes={setRes} setQueuedId={setQueuedId} rows={localRows} reload={reload} />
       <div className="card">
-        <b>Ask Agent 3</b> <span className="sub">(AI picks ONE read-only test)</span>
+        <b>Ask Agent 3</b> <span className="sub">(supported checks only; unsupported requests are BLOCKED)</span>
         <textarea rows={2} placeholder="e.g. api test karo / security check chalao" value={text} onChange={e => setText(e.target.value)} />
         <button className="btn" disabled={!!busy || !text.trim()} onClick={async () => { setBusy('ask'); setErr(''); try { setRes(await callAgent3('ai_command', { text })); setText('') } catch (e) { setErr(e.message) } setBusy('') }}>{busy === 'ask' ? 'Thinking...' : 'Do it'}</button>
       </div>
       <div className="card">
-        <b>Rate-limit test</b> <span className="sub">(needs approval + confirmation; anonymous GETs only)</span>
+        <b>Optional burst test</b> <span className="sub">(OFF by default; separate approval + confirmation; hard cap 40 requests)</span>
         <input placeholder="/api/some-path (not a billing path)" value={ratePath} onChange={e => setRatePath(e.target.value)} autoCapitalize="none" />
         <button className="btn ghost" disabled={!!busy || !ratePath.startsWith('/') || !targets.length} onClick={() => run('request_rate_test', { path: ratePath })}>Request approval</button>
       </div>
