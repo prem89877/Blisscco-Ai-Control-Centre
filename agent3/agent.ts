@@ -241,8 +241,8 @@ async function safeRouteCheck(ctx: Ctx, mode: 'ads' | 'match'): Promise<Out> {
 }
 
 // ---------------------------------------------------------------- rate-limit burst
-// POST /api/v1/ads/impression only, invalid body {} , no credentials. OFF by default, approval + production ack every run.
-// Levels: 40 (default), 350, 700. 350/700 additionally need their own explicit per-run ack (level_ack) at request AND at run time.
+// Route option: POST /api/v1/ads/impression (invalid body {}, levels 40/350/700) or GET /api/v1/ads/click?ref=invalid_qa_ref (levels 40/700). No credentials. OFF by default, approval + production ack every run.
+// Levels: 40 (default), 350 (impression only), 700. 350/700 additionally need their own explicit per-run ack (level_ack) at request AND at run time.
 // Concurrency 10, whole run inside the deadline. 40/350 stop launching at the first 429; 700 never stops on a 429.
 export const BURST_LEVELS = [40, 350, 700] as const
 export type BurstLevel = typeof BURST_LEVELS[number]
@@ -255,7 +255,19 @@ const parseBurstLevel = (v: unknown): BurstLevel => {
   if (!(BURST_LEVELS as readonly number[]).includes(n)) throw new AgentError('level must be one of ' + BURST_LEVELS.join(', '), 400, 'bad_level')
   return n as BurstLevel
 }
-const BURST_ROUTE = { method: 'POST', path: '/api/v1/ads/impression', expected: [400, 401] as readonly number[], init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' } }
+export type BurstRouteKey = 'impression' | 'click'
+const BURST_ROUTES: Record<BurstRouteKey, { method: string; path: string; expected: readonly number[]; levels: readonly number[]; init: { method: string; headers: Record<string, string>; body?: string } }> = {
+  impression: { method: 'POST', path: '/api/v1/ads/impression', expected: [400, 401], levels: [40, 350, 700], init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' } },
+  click: { method: 'GET', path: '/api/v1/ads/click?ref=invalid_qa_ref', expected: [400, 404], levels: [40, 700], init: { method: 'GET', headers: {} } }
+}
+const parseBurstRoute = (v: unknown): BurstRouteKey => {
+  const k = v === undefined || v === '' || v === null ? 'impression' : String(v)
+  if (k !== 'impression' && k !== 'click') throw new AgentError('route must be impression or click', 400, 'bad_route')
+  return k
+}
+const assertLevelForRoute = (route: BurstRouteKey, level: number) => {
+  if (!BURST_ROUTES[route].levels.includes(level)) throw new AgentError(`Level ${level} is not available for the ${route} route (allowed: ${BURST_ROUTES[route].levels.join(', ')})`, 400, 'bad_level')
+}
 
 export type Body429 = 'JSON rate_limited' | 'Vercel page' | 'other'
 export type Source429 = 'App' | 'Vercel Firewall' | 'Unknown'
@@ -274,17 +286,20 @@ export function classify429(pr: { headers: Record<string, string>; text: string 
 
 async function requestAdsBurst(ctx: Ctx, p: any): Promise<Out> {
   if (!(p.enabled === true || p.enabled === 'true')) throw new AgentError('Rate-limit burst is OFF by default. Switch it on first, then request approval.', 403, 'burst_off')
+  const routeKey = parseBurstRoute(p.route)
   const level = parseBurstLevel(p.level)
+  assertLevelForRoute(routeKey, level)
+  const rt = BURST_ROUTES[routeKey]
   if (isHighLevel(level) && p.level_ack !== burstLevelAck(level)) throw new AgentError(`Level ${level} needs its own explicit approval for this run (level_ack).`, 403, 'level_ack')
   // level 40 keeps the optional smaller count (2..40); 350 / 700 are always exactly that many requests
   const n = isHighLevel(level) ? level : hardBurstCap(p.requests === undefined || p.requests === '' ? MAX_BURST_REQUESTS : p.requests)
   if (n < 2) throw new AgentError('requests must be between 2 and ' + MAX_BURST_REQUESTS, 400, 'bad_request')
-  return withTask(ctx, 'request_ads_burst', `Rate-limit burst (ads impression) x${n}`, { target: BLISSCCO_PRODUCTION, requests: n, level }, async taskId => {
+  return withTask(ctx, 'request_ads_burst', `Rate-limit burst (ads ${routeKey}) x${n}`, { target: BLISSCCO_PRODUCTION, requests: n, level, route: routeKey }, async taskId => {
     const stopRule = level === 700 ? 'Does NOT stop on 429: all 700 requests are sent.' : 'Stops launching new requests at the first 429.'
-    const details = { kind: 'ads_burst', target: BLISSCCO_PRODUCTION, routes: ['POST /api/v1/ads/impression'], level, high_level: isHighLevel(level), requests: n, concurrency: BURST_CONCURRENCY, max_seconds: BURST_DEADLINE_MS / 1000, production: true, note: `Sends up to ${n} invalid (body {}), credential-free POST requests to ${BLISSCCO_PRODUCTION}/api/v1/ads/impression, ${BURST_CONCURRENCY} at a time, finishing within 60 seconds. ${stopRule} Click is never called. No valid key, token or ref; nothing can be billed or written.` }
-    const ap = await ctx.store.createApproval({ task_id: taskId, title: `Rate-limit burst: ads impression x${n}`, details })
+    const details = { kind: 'ads_burst', target: BLISSCCO_PRODUCTION, route: routeKey, routes: [rt.method + ' ' + rt.path], level, high_level: isHighLevel(level), requests: n, concurrency: BURST_CONCURRENCY, max_seconds: BURST_DEADLINE_MS / 1000, production: true, note: `Sends up to ${n} invalid, credential-free ${rt.method} requests to ${BLISSCCO_PRODUCTION}${rt.path}${routeKey === 'impression' ? ' (body {})' : ' (invalid ref)'}, ${BURST_CONCURRENCY} at a time, finishing within 60 seconds. ${stopRule} Only this one route is called. No valid key, token or ref; nothing can be billed or written.` }
+    const ap = await ctx.store.createApproval({ task_id: taskId, title: `Rate-limit burst: ads ${routeKey} x${n}`, details })
     await ctx.store.log('warn', 'agent3_approval_requested', ap.id, { approval_id: ap.id, level }, taskId, ctx.actor.id)
-    return { status: 'awaiting_approval', result: { approval_id: ap.id, level, next: 'Approve in the Approvals tab, then press Run burst in the Agent 3 console' + (isHighLevel(level) ? ' (level ' + level + ' needs its own confirmation again).' : '.') } }
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, level, route: routeKey, next: 'Approve in the Approvals tab, then press Run burst in the Agent 3 console' + (isHighLevel(level) ? ' (level ' + level + ' needs its own confirmation again).' : '.') } }
   })
 }
 async function applyAdsBurst(ctx: Ctx, p: any): Promise<Out> {
@@ -296,15 +311,17 @@ async function applyAdsBurst(ctx: Ctx, p: any): Promise<Out> {
   if (!ap.decided_at || Date.now() - new Date(ap.decided_at).getTime() > 24 * 3600 * 1000) throw new AgentError('Approval older than 24h; request again', 409, 'expired')
   if (p.production_ack !== 'APPROVE-PRODUCTION') throw new AgentError('Needs explicit confirmation (production_ack)', 403, 'production_ack')
   if (d.target !== BLISSCCO_PRODUCTION) throw new AgentError('Target not allowed (production whitelist only)', 403, 'route_blocked')
+  const routeKey = parseBurstRoute(d.route)   // approvals made before the route option default to impression
   const level = parseBurstLevel(d.level)   // a tampered / unknown level in the stored approval is refused
+  assertLevelForRoute(routeKey, level)
   if (isHighLevel(level) && p.level_ack !== burstLevelAck(level)) throw new AgentError(`Level ${level} needs its own explicit confirmation for this run (level_ack).`, 403, 'level_ack')
   const total = isHighLevel(level) ? level : hardBurstCap(d.requests)   // 40 / 350 / 700 hard ceiling, even if the stored approval was tampered with
   if (total < 2) throw new AgentError('Invalid request count in approval', 409, 'bad_approval')
   const stopOn429 = level !== 700
-  return withTask(ctx, 'apply_ads_burst', `Rate-limit burst (ads impression) level ${level}`, { approval_id: ap.id, level }, async () => {
+  return withTask(ctx, 'apply_ads_burst', `Rate-limit burst (ads ${routeKey}) level ${level}`, { approval_id: ap.id, level, route: routeKey }, async () => {
     const claimed = await ctx.store.claimApproval(ap.id, { ...d, executed_at: now(), executed_by: ctx.actor.id })
     if (!claimed) throw new AgentError('Already executed', 409, 'already_executed')
-    const route = BURST_ROUTE
+    const route = BURST_ROUTES[routeKey]
     const url = BLISSCCO_PRODUCTION + route.path
     const pathname = assertRouteAllowed(route.method, url)
     const label = `${route.method} ${pathname}`
@@ -354,8 +371,8 @@ async function applyAdsBurst(ctx: Ctx, p: any): Promise<Out> {
     const n429 = statuses[429] || 0
     const first429 = events429.length ? Math.min(...events429.map(e => e.request_no)) : null
     const complete = sent >= total
-    if (first429 != null) findings.push(...C.analyzeRate('/api/v1/ads/impression', { total: sent, statuses, first429, hasRetryAfter: Boolean(retryAfter), has5xx }))
-    else if (complete && !unreachable) findings.push(...C.analyzeRate('/api/v1/ads/impression', { total: sent, statuses, first429, hasRetryAfter: false, has5xx }))
+    if (first429 != null) findings.push(...C.analyzeRate(pathname, { total: sent, statuses, first429, hasRetryAfter: Boolean(retryAfter), has5xx }))
+    else if (complete && !unreachable) findings.push(...C.analyzeRate(pathname, { total: sent, statuses, first429, hasRetryAfter: false, has5xx }))
     const inconclusive = first429 == null && !complete
     if (inconclusive) findings.push({ id: 'rate.inconclusive', area: 'api', severity: 'low', title: 'Rate-limit result INCONCLUSIVE', evidence: `No 429 seen, but only ${sent} of ${total} planned requests were sent (${stop}). This does not prove there is no rate limiting.`, fix: 'Repeat the run so that all planned requests are sent.', target: pathname })
     const at = now()
@@ -368,9 +385,9 @@ async function applyAdsBurst(ctx: Ctx, p: any): Promise<Out> {
     if (n429) evidence.push({ check: '429 source', ok: true, detail: `${source429}; first 429 at request ${first429}; body types ${JSON.stringify(bodyCounts)}; time ${at}` })
     const bad = findings.some(f => f.severity === 'critical' || f.severity === 'high')
     const verdict = bad ? 'FAIL' : unreachable && sent === 0 ? 'BLOCKED' : inconclusive ? 'INCONCLUSIVE' : findings.length ? 'ATTENTION' : 'PASS'
-    const base = report(`Rate-limit burst (ads impression, level ${level})`, findings, evidence, {
-      target: BLISSCCO_PRODUCTION, understood: `Rate-limit burst: POST /api/v1/ads/impression, level ${level}, invalid body {} only, concurrency ${BURST_CONCURRENCY}, within 60 seconds`,
-      level, concurrency: BURST_CONCURRENCY, stop_on_429: stopOn429, elapsed_seconds: Math.round(elapsedMs / 100) / 10, deadline_seconds: BURST_DEADLINE_MS / 1000,
+    const base = report(`Rate-limit burst (ads ${routeKey}, level ${level})`, findings, evidence, {
+      target: BLISSCCO_PRODUCTION, understood: `Rate-limit burst: ${label}, level ${level}, invalid requests only, concurrency ${BURST_CONCURRENCY}, within 60 seconds`,
+      route: routeKey, level, concurrency: BURST_CONCURRENCY, stop_on_429: stopOn429, elapsed_seconds: Math.round(elapsedMs / 100) / 10, deadline_seconds: BURST_DEADLINE_MS / 1000,
       status_counts: statuses, count_400: statuses[400] || 0, count_429: n429, count_other: sent - (statuses[400] || 0) - n429,
       source_429: source429, source_429_counts: sourceCounts, body_type_429_counts: bodyCounts,
       first_429_request: first429, first_429: events429.slice().sort((a, b) => a.request_no - b.request_no)[0] || null,
@@ -378,7 +395,7 @@ async function applyAdsBurst(ctx: Ctx, p: any): Promise<Out> {
       requests_sent: sent, request_cap: level, requests_planned: total, stopped: stop, retry_after: retryAfter,
       rate_limit: first429 != null ? `DETECTED: ${n429} x 429 (first at request ${first429}); source ${source429}; Retry-After ${retryAfter || 'not sent'}` : inconclusive ? `INCONCLUSIVE: no 429 in ${sent} of ${total} planned requests` : `NOT DETECTED in ${sent} requests`,
       ...(unreachable ? { reason: 'route unreachable' } : {}),
-      billing_safety: 'No API key, user token or valid ref used. Only invalid requests (body {}) to the impression route; click is never called. No billable event, ledger, payment or database write requested.'
+      billing_safety: 'No API key, user token or valid ref used. Only invalid requests to one route (impression with body {}, or click with an invalid ref); the other route is not called. No billable event, ledger, payment or database write requested.'
     })
     return { result: { ...base, verdict } }
   })

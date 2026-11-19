@@ -114,7 +114,7 @@ function Apply({ a, onDone, onResult, setErr }) {
     <div className="card">
       <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
       <div className="sub">{a.details.note}</div>
-      <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> {burst ? `I confirm this burst test on the live site (POST impression only, invalid body {}, ${level === 700 ? 'does NOT stop on 429' : 'stops at first 429'})` : 'I confirm this rate test on the live site'}</label>
+      <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> {burst ? `I confirm this burst test on the live site (${a.details.route === 'click' ? 'GET click, invalid ref' : 'POST impression, invalid body {}'} only, ${level === 700 ? 'does NOT stop on 429' : 'stops at first 429'})` : 'I confirm this rate test on the live site'}</label>
       {high && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={levelAck} onChange={e => setLevelAck(e.target.checked)} style={{ width: 'auto' }} /> I separately approve the HIGH level {level} for this run only</label>}
       <button className="btn ok" disabled={busy || !ack || (high && !levelAck)} onClick={go}>{busy ? 'Running...' : burst ? 'Run burst (' + level + ')' : 'Run rate test'}</button>
     </div>
@@ -183,6 +183,7 @@ export default function Agent3Panel() {
   const [ratePath, setRatePath] = useState('')
   const [burstOn, setBurstOn] = useState(false) // default OFF, never remembered
   const [burstN, setBurstN] = useState('40')
+  const [burstRoute, setBurstRoute] = useState('impression') // impression (40/350/700) or click (40/700)
   const [burstLevel, setBurstLevel] = useState('40') // 40 default; 350 / 700 need their own approval every run
   const [burstHighAck, setBurstHighAck] = useState(false)
   const [where, setWhere] = useState('vercel')
@@ -260,19 +261,22 @@ export default function Agent3Panel() {
         <button className="btn" disabled={!!busy || !text.trim()} onClick={async () => { setBusy('ask'); setErr(''); try { setRes(await callAgent3('ai_command', { text })); setText('') } catch (e) { setErr(e.message) } setBusy('') }}>{busy === 'ask' ? 'Thinking...' : 'Do it'}</button>
       </div>
       <div className="card">
-        <b>Rate-limit burst</b> <span className="sub">(OFF by default; POST /api/v1/ads/impression only, invalid body {'{}'}; 10 at a time; finishes within 60 s; approval every run)</span>
+        <b>Rate-limit burst</b> <span className="sub">(OFF by default; one route at a time: POST impression (body {'{}'}) or GET click (invalid ref); invalid requests only; 10 at a time; finishes within 60 s; approval every run)</span>
         <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={burstOn} onChange={e => { setBurstOn(e.target.checked); if (!e.target.checked) setBurstHighAck(false) }} style={{ width: 'auto' }} /> Enable burst test (this visit only)</label>
         <div className="filters" style={{ margin: '6px 0' }}>
-          {['40', '350', '700'].map(l => <button key={l} className={'btn' + (burstLevel === l ? '' : ' ghost')} disabled={!burstOn} onClick={() => { setBurstLevel(l); setBurstHighAck(false) }}>{l}{l === '40' ? ' (default)' : ''}</button>)}
+          {[['impression', 'POST impression'], ['click', 'GET click']].map(([k, l]) => <button key={k} className={'btn' + (burstRoute === k ? '' : ' ghost')} disabled={!burstOn} onClick={() => { setBurstRoute(k); setBurstHighAck(false); if (k === 'click' && burstLevel === '350') setBurstLevel('40') }}>{l}</button>)}
+        </div>
+        <div className="filters" style={{ margin: '6px 0' }}>
+          {(burstRoute === 'click' ? ['40', '700'] : ['40', '350', '700']).map(l => <button key={l} className={'btn' + (burstLevel === l ? '' : ' ghost')} disabled={!burstOn} onClick={() => { setBurstLevel(l); setBurstHighAck(false) }}>{l}{l === '40' ? ' (default)' : ''}</button>)}
         </div>
         <div className="sub">{burstLevel === '700' ? 'Level 700: does NOT stop on 429, all 700 requests are sent.' : burstLevel === '350' ? 'Level 350: stops at the first 429.' : 'Level 40: stops at the first 429.'}</div>
         {burstLevel === '40' && <input type="number" min="2" max="40" value={burstN} onChange={e => setBurstN(e.target.value)} disabled={!burstOn} />}
         {burstLevel !== '40' && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={burstHighAck} disabled={!burstOn} onChange={e => setBurstHighAck(e.target.checked)} style={{ width: 'auto' }} /> I explicitly approve HIGH level {burstLevel} for this run only</label>}
         <button className="btn ghost" disabled={!!busy || !burstOn || (burstLevel !== '40' && !burstHighAck)} onClick={async () => {
           const level = Number(burstLevel)
-          await run('request_ads_burst', level === 40 ? { enabled: true, level, requests: Math.min(40, Math.max(2, Number(burstN) || 40)) } : { enabled: true, level, level_ack: 'APPROVE-HIGH-BURST-' + level })
-          setBurstOn(false); setBurstHighAck(false); setBurstLevel('40')
-        }}>{busy === 'request_ads_burst' ? 'Requesting...' : 'Request burst approval (' + burstLevel + ')'}</button>
+          await run('request_ads_burst', level === 40 ? { enabled: true, route: burstRoute, level, requests: Math.min(40, Math.max(2, Number(burstN) || 40)) } : { enabled: true, route: burstRoute, level, level_ack: 'APPROVE-HIGH-BURST-' + level })
+          setBurstOn(false); setBurstHighAck(false); setBurstLevel('40'); setBurstRoute('impression')
+        }}>{busy === 'request_ads_burst' ? 'Requesting...' : 'Request burst approval (' + burstRoute + ' ' + burstLevel + ')'}</button>
       </div>
       <div className="card">
         <b>Optional burst test</b> <span className="sub">(OFF by default; separate approval + confirmation; hard cap 40 requests)</span>

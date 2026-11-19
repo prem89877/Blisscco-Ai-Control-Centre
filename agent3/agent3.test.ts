@@ -770,8 +770,8 @@ test('Agent 3 marks unreachable route BLOCKED without retrying', async () => {
 })
 
 // ---------------------------------------------------------------- Rate-limit burst (ads impression only, levels 40 / 350 / 700)
-async function approvedBurst(requests?: number, level?: number) {
-  const req = await runAction(ctx(), 'request_ads_burst', { enabled: true, ...(requests === undefined ? {} : { requests }), ...(level ? { level, level_ack: burstLevelAck(level) } : {}) })
+async function approvedBurst(requests?: number, level?: number, route?: string) {
+  const req = await runAction(ctx(), 'request_ads_burst', { enabled: true, ...(route ? { route } : {}), ...(requests === undefined ? {} : { requests }), ...(level ? { level, level_ack: burstLevelAck(level) } : {}) })
   Object.assign(db.approvals.find(a => a.id === req.result.approval_id)!, { status: 'approved', decided_at: new Date().toISOString() })
   return req.result.approval_id as string
 }
@@ -945,4 +945,46 @@ test('Burst refuses a non-production target in the approval and never exposes se
   const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id2, ...ACK })
   const out = JSON.stringify([r, db.tasks, db.activity_logs, db.api_usage, db.approvals])
   for (const secret of [SERVICE, GEMKEY, TESTKEY, ENV.AGENT3_GITHUB_TOKEN, ENV.AGENT3_SUPABASE_ACCESS_TOKEN]) assert.ok(!out.includes(secret))
+})
+
+test('Click burst: only GET /api/v1/ads/click?ref=invalid_qa_ref, levels 40 and 700 only, same approval gates', async () => {
+  for (const level of [350, 41, 100]) await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: true, route: 'click', level, level_ack: burstLevelAck(level) }), (e: any) => e.code === 'bad_level')
+  await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: true, route: 'payout' }), (e: any) => e.code === 'bad_route')
+  await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: false, route: 'click' }), (e: any) => e.code === 'burst_off')
+  await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: true, route: 'click', level: 700 }), (e: any) => e.code === 'level_ack')
+  assert.equal(siteCalls.length, 0); assert.equal((db.approvals || []).length, 0)
+  const id = await approvedBurst(25, undefined, 'click')
+  assert.equal(db.approvals[0].details.route, 'click')
+  const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
+  assert.equal(siteCalls.length, 25)
+  assert.ok(siteCalls.every(c => c.method === 'GET' && c.path === '/api/v1/ads/click?ref=invalid_qa_ref' && !c.body))
+  assert.ok(siteCalls.every(c => !c.headers.authorization && !c.headers['x-api-key'] && !c.headers.cookie))
+  assert.equal(r.result.route, 'click'); assert.deepEqual(r.result.status_counts, { 404: 25 }); assert.equal(r.result.count_429, 0); assert.equal(r.result.concurrency, 10)
+  assert.deepEqual(otherHostCalls, [])
+})
+test('Click burst level 700 does NOT stop on 429 and records first 429, Retry-After, x-vercel-mitigated, source', async () => {
+  const id = await approvedBurst(undefined, 700, 'click')
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK }), (e: any) => e.code === 'level_ack')
+  assert.equal(siteCalls.length, 0)
+  const restore = limitAt(50, 429, { 'retry-after': '45', 'content-type': 'text/html' }, VERCEL_PAGE, () => ({ 'x-vercel-mitigated': 'deny' }))
+  try {
+    const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK700 })
+    assert.equal(siteCalls.length, 700); assert.ok(siteCalls.every(c => c.method === 'GET' && c.path.startsWith('/api/v1/ads/click?ref=invalid_qa_ref')))
+    assert.equal(r.result.stop_on_429, false); assert.equal(r.result.count_429, 651)
+    assert.deepEqual(r.result.first_429, { request_no: 50, retry_after: '45', body_type: 'Vercel page', x_vercel_mitigated: 'deny', source: 'Vercel Firewall' })
+    assert.equal(r.result.source_429, 'Vercel Firewall')
+  } finally { restore() }
+})
+test('Click burst: a tampered level/route in the stored approval is refused; 200/302 stop it', async () => {
+  const id = await approvedBurst(10, undefined, 'click')
+  db.approvals[0].details.level = 350
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK350 }), (e: any) => e.code === 'bad_level')
+  assert.equal(siteCalls.length, 0)
+  siteCalls = []; db.approvals = []
+  const id2 = await approvedBurst(40, undefined, 'click')
+  const restore = limitAt(1, 302, {}, '')
+  try {
+    const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id2, ...ACK })
+    assert.ok(siteCalls.length <= 10); assert.equal(r.result.verdict, 'FAIL'); assert.equal(r.result.findings[0].severity, 'critical')
+  } finally { restore() }
 })
