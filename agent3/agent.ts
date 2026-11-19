@@ -240,17 +240,51 @@ async function safeRouteCheck(ctx: Ctx, mode: 'ads' | 'match'): Promise<Out> {
   })
 }
 
-// ---------------------------------------------------------------- rate-limit burst (OFF by default, approval every run, hard cap 40, stops at first 429)
-const BURST_ROUTES = [ROUTE_CASES.impression, ROUTE_CASES.click]
+// ---------------------------------------------------------------- rate-limit burst
+// POST /api/v1/ads/impression only, invalid body {} , no credentials. OFF by default, approval + production ack every run.
+// Levels: 40 (default), 350, 700. 350/700 additionally need their own explicit per-run ack (level_ack) at request AND at run time.
+// Concurrency 10, whole run inside the deadline. 40/350 stop launching at the first 429; 700 never stops on a 429.
+export const BURST_LEVELS = [40, 350, 700] as const
+export type BurstLevel = typeof BURST_LEVELS[number]
+export const BURST_CONCURRENCY = 10
+export const BURST_DEADLINE_MS = 55_000   // inside the 60 s limit (and the 60 s Vercel function limit)
+export const burstLevelAck = (level: number) => 'APPROVE-HIGH-BURST-' + level
+const isHighLevel = (level: number) => level > 40
+const parseBurstLevel = (v: unknown): BurstLevel => {
+  const n = v === undefined || v === '' || v === null ? 40 : Number(v)
+  if (!(BURST_LEVELS as readonly number[]).includes(n)) throw new AgentError('level must be one of ' + BURST_LEVELS.join(', '), 400, 'bad_level')
+  return n as BurstLevel
+}
+const BURST_ROUTE = { method: 'POST', path: '/api/v1/ads/impression', expected: [400, 401] as readonly number[], init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' } }
+
+export type Body429 = 'JSON rate_limited' | 'Vercel page' | 'other'
+export type Source429 = 'App' | 'Vercel Firewall' | 'Unknown'
+/** Tells an app-level 429 (our JSON "rate_limited") from a Vercel Firewall 429 (x-vercel-mitigated header or Vercel HTML page). */
+export function classify429(pr: { headers: Record<string, string>; text: string }): { body_type: Body429; source: Source429; mitigated: string | null } {
+  const mitigated = pr.headers['x-vercel-mitigated'] ? String(pr.headers['x-vercel-mitigated']).slice(0, 40) : null
+  const text = String(pr.text || '')
+  let isJsonRl = false
+  try { const j = JSON.parse(text); isJsonRl = j !== null && typeof j === 'object' && /rate_limited/i.test(JSON.stringify(j)) } catch { /* not JSON */ }
+  const isHtml = /^\s*<(!doctype|html)/i.test(text) || /text\/html/i.test(pr.headers['content-type'] || '')
+  const isVercelPage = isHtml && (/vercel/i.test(text) || Boolean(mitigated) || Boolean(pr.headers['x-vercel-id']))
+  const body_type: Body429 = isJsonRl ? 'JSON rate_limited' : isVercelPage ? 'Vercel page' : 'other'
+  const source: Source429 = mitigated || body_type === 'Vercel page' ? 'Vercel Firewall' : body_type === 'JSON rate_limited' ? 'App' : 'Unknown'
+  return { body_type, source, mitigated }
+}
+
 async function requestAdsBurst(ctx: Ctx, p: any): Promise<Out> {
   if (!(p.enabled === true || p.enabled === 'true')) throw new AgentError('Rate-limit burst is OFF by default. Switch it on first, then request approval.', 403, 'burst_off')
-  const n = hardBurstCap(p.requests === undefined || p.requests === '' ? MAX_BURST_REQUESTS : p.requests)
+  const level = parseBurstLevel(p.level)
+  if (isHighLevel(level) && p.level_ack !== burstLevelAck(level)) throw new AgentError(`Level ${level} needs its own explicit approval for this run (level_ack).`, 403, 'level_ack')
+  // level 40 keeps the optional smaller count (2..40); 350 / 700 are always exactly that many requests
+  const n = isHighLevel(level) ? level : hardBurstCap(p.requests === undefined || p.requests === '' ? MAX_BURST_REQUESTS : p.requests)
   if (n < 2) throw new AgentError('requests must be between 2 and ' + MAX_BURST_REQUESTS, 400, 'bad_request')
-  return withTask(ctx, 'request_ads_burst', 'Rate-limit burst (ads routes) x' + n, { target: BLISSCCO_PRODUCTION, requests: n }, async taskId => {
-    const details = { kind: 'ads_burst', target: BLISSCCO_PRODUCTION, routes: ['POST /api/v1/ads/impression', 'GET /api/v1/ads/click?ref=invalid_qa_ref'], requests: n, production: true, note: `Sends up to ${n} invalid, credential-free requests (alternating impression POST and click GET) to ${BLISSCCO_PRODUCTION}. Stops immediately at the first 429. No valid key, token or ref; nothing can be billed or written.` }
-    const ap = await ctx.store.createApproval({ task_id: taskId, title: `Rate-limit burst: ads impression + click x${n}`, details })
-    await ctx.store.log('warn', 'agent3_approval_requested', ap.id, { approval_id: ap.id }, taskId, ctx.actor.id)
-    return { status: 'awaiting_approval', result: { approval_id: ap.id, next: 'Approve in the Approvals tab, then press Run burst in the Agent 3 console.' } }
+  return withTask(ctx, 'request_ads_burst', `Rate-limit burst (ads impression) x${n}`, { target: BLISSCCO_PRODUCTION, requests: n, level }, async taskId => {
+    const stopRule = level === 700 ? 'Does NOT stop on 429: all 700 requests are sent.' : 'Stops launching new requests at the first 429.'
+    const details = { kind: 'ads_burst', target: BLISSCCO_PRODUCTION, routes: ['POST /api/v1/ads/impression'], level, high_level: isHighLevel(level), requests: n, concurrency: BURST_CONCURRENCY, max_seconds: BURST_DEADLINE_MS / 1000, production: true, note: `Sends up to ${n} invalid (body {}), credential-free POST requests to ${BLISSCCO_PRODUCTION}/api/v1/ads/impression, ${BURST_CONCURRENCY} at a time, finishing within 60 seconds. ${stopRule} Click is never called. No valid key, token or ref; nothing can be billed or written.` }
+    const ap = await ctx.store.createApproval({ task_id: taskId, title: `Rate-limit burst: ads impression x${n}`, details })
+    await ctx.store.log('warn', 'agent3_approval_requested', ap.id, { approval_id: ap.id, level }, taskId, ctx.actor.id)
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, level, next: 'Approve in the Approvals tab, then press Run burst in the Agent 3 console' + (isHighLevel(level) ? ' (level ' + level + ' needs its own confirmation again).' : '.') } }
   })
 }
 async function applyAdsBurst(ctx: Ctx, p: any): Promise<Out> {
@@ -262,52 +296,89 @@ async function applyAdsBurst(ctx: Ctx, p: any): Promise<Out> {
   if (!ap.decided_at || Date.now() - new Date(ap.decided_at).getTime() > 24 * 3600 * 1000) throw new AgentError('Approval older than 24h; request again', 409, 'expired')
   if (p.production_ack !== 'APPROVE-PRODUCTION') throw new AgentError('Needs explicit confirmation (production_ack)', 403, 'production_ack')
   if (d.target !== BLISSCCO_PRODUCTION) throw new AgentError('Target not allowed (production whitelist only)', 403, 'route_blocked')
-  const total = hardBurstCap(d.requests)   // hard cap 40, even if the stored approval was tampered with
+  const level = parseBurstLevel(d.level)   // a tampered / unknown level in the stored approval is refused
+  if (isHighLevel(level) && p.level_ack !== burstLevelAck(level)) throw new AgentError(`Level ${level} needs its own explicit confirmation for this run (level_ack).`, 403, 'level_ack')
+  const total = isHighLevel(level) ? level : hardBurstCap(d.requests)   // 40 / 350 / 700 hard ceiling, even if the stored approval was tampered with
   if (total < 2) throw new AgentError('Invalid request count in approval', 409, 'bad_approval')
-  return withTask(ctx, 'apply_ads_burst', 'Rate-limit burst (ads routes)', { approval_id: ap.id }, async () => {
+  const stopOn429 = level !== 700
+  return withTask(ctx, 'apply_ads_burst', `Rate-limit burst (ads impression) level ${level}`, { approval_id: ap.id, level }, async () => {
     const claimed = await ctx.store.claimApproval(ap.id, { ...d, executed_at: now(), executed_by: ctx.actor.id })
     if (!claimed) throw new AgentError('Already executed', 409, 'already_executed')
-    const statuses: Record<string, number> = {}, byRoute: Record<string, Record<string, number>> = {}
+    const route = BURST_ROUTE
+    const url = BLISSCCO_PRODUCTION + route.path
+    const pathname = assertRouteAllowed(route.method, url)
+    const label = `${route.method} ${pathname}`
+    const statuses: Record<string, number> = {}
     const findings: Finding[] = []
-    let sent = 0, first429: number | null = null, retryAfter: string | null = null, has5xx = false, stop = `completed all ${total} requests`, unreachable = false, halted = false
-    for (let i = 0; i < total && !halted; i++) {   // one at a time, so we can stop the moment a 429 arrives
-      const route = BURST_ROUTES[i % BURST_ROUTES.length]
-      const url = BLISSCCO_PRODUCTION + route.path
-      const init: RequestInit = { ...route.init, headers: { 'User-Agent': 'BlisccoQA/1.0 (+read-only test)', ...((route.init as any).headers || {}) }, redirect: 'manual' } as RequestInit
-      const pathname = assertRouteAllowed(route.method, url)
-      assertNoCredentials(init)
-      bump(ctx, 'target_http')
-      const pr = await probe(url, init, 10000)
-      const label = `${route.method} ${pathname}`
-      if (pr.status === 0) { unreachable = true; stop = `route unreachable at request ${sent + 1} (${label})`; break }
-      sent++
-      statuses[pr.status] = (statuses[pr.status] || 0) + 1
-      byRoute[label] = byRoute[label] || {}; byRoute[label][pr.status] = (byRoute[label][pr.status] || 0) + 1
-      if (pr.status === 429) {
-        first429 = sent; retryAfter = pr.headers['retry-after'] ? String(pr.headers['retry-after']).slice(0, 40) : null
-        stop = `stopped at first 429 (request ${sent}, ${label})`; halted = true
-      } else if (pr.status === 200 || pr.status === 302) {
-        findings.push({ id: 'route.unsafe_acceptance', area: 'api', severity: 'critical', title: 'Safe negative request unexpectedly accepted or redirected', evidence: `${label} returned ${pr.status} at request ${sent}`, fix: 'Investigate route authentication/validation immediately.', target: pathname })
-        stop = `stopped: critical ${pr.status} at request ${sent} (${label})`; halted = true
-      } else if (!(route.expected as readonly number[]).includes(pr.status)) {
-        if (pr.status >= 500) has5xx = true
-        findings.push({ id: 'route.unexpected_status', area: 'api', severity: 'high', title: 'Unexpected route status during burst', evidence: `${label} returned ${pr.status}; expected ${(route.expected as readonly number[]).join('/')}`, fix: 'Review route validation and authentication.', target: pathname })
-        stop = `stopped: unexpected ${pr.status} at request ${sent} (${label})`; halted = true
+    const events429: { request_no: number; retry_after: string | null; body_type: Body429; x_vercel_mitigated: string | null; source: Source429 }[] = []
+    const sourceCounts: Record<string, number> = {}, bodyCounts: Record<string, number> = {}
+    let sent = 0, next = 0, retryAfter: string | null = null, has5xx = false, unreachable = false, halted = false, timedOut = false
+    let stop = `completed all ${total} requests`
+    const started = Date.now(), deadline = started + BURST_DEADLINE_MS
+    const worker = async () => {
+      for (;;) {
+        if (halted) return
+        if (next >= total) return
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) { timedOut = true; return }
+        const no = ++next   // request number, in launch order
+        const init: RequestInit = { ...route.init, headers: { 'User-Agent': 'BlisccoQA/1.0 (+read-only test)', ...route.init.headers }, redirect: 'manual' } as RequestInit
+        assertNoCredentials(init)
+        bump(ctx, 'target_http')
+        const pr = await probe(url, init, Math.min(10000, remaining), 20000)
+        if (pr.status === 0) { if (!halted) { unreachable = true; halted = true; stop = `route unreachable at request ${no} (${pr.error ? 'network/timeout' : 'no response'})` } return }
+        sent++
+        statuses[pr.status] = (statuses[pr.status] || 0) + 1
+        if (pr.status === 429) {
+          const c = classify429(pr)
+          const ra = pr.headers['retry-after'] ? String(pr.headers['retry-after']).slice(0, 40) : null
+          if (ra && !retryAfter) retryAfter = ra
+          sourceCounts[c.source] = (sourceCounts[c.source] || 0) + 1
+          bodyCounts[c.body_type] = (bodyCounts[c.body_type] || 0) + 1
+          if (events429.length < 50) events429.push({ request_no: no, retry_after: ra, body_type: c.body_type, x_vercel_mitigated: c.mitigated, source: c.source })
+          else { /* counted above; detail list capped at 50 */ }
+          if (stopOn429 && !halted) { halted = true; stop = `stopped at first 429 (request ${no}); in-flight requests were allowed to finish` }
+        } else if (pr.status === 200 || pr.status === 302) {
+          findings.push({ id: 'route.unsafe_acceptance', area: 'api', severity: 'critical', title: 'Safe negative request unexpectedly accepted or redirected', evidence: `${label} returned ${pr.status} at request ${no}`, fix: 'Investigate route authentication/validation immediately.', target: pathname })
+          if (!halted) { halted = true; stop = `stopped: critical ${pr.status} at request ${no}` }
+        } else if (!route.expected.includes(pr.status)) {
+          if (pr.status >= 500) has5xx = true
+          if (!findings.some(f => f.id === 'route.unexpected_status')) findings.push({ id: 'route.unexpected_status', area: 'api', severity: 'high', title: 'Unexpected route status during burst', evidence: `${label} returned ${pr.status}; expected ${route.expected.join('/')}`, fix: 'Review route validation and authentication.', target: pathname })
+          if (pr.status >= 500 && !halted) { halted = true; stop = `stopped: ${pr.status} at request ${no}` }
+        }
       }
     }
-    if (!halted && !unreachable) findings.push(...C.analyzeRate('/api/v1/ads/impression + click', { total: sent, statuses, first429, hasRetryAfter: false, has5xx }))
-    else if (first429 != null) findings.push(...C.analyzeRate('/api/v1/ads/impression + click', { total: sent, statuses, first429, hasRetryAfter: Boolean(retryAfter), has5xx }))
+    await Promise.all(Array.from({ length: BURST_CONCURRENCY }, () => worker()))
+    const elapsedMs = Date.now() - started
+    if (timedOut && !halted && sent < total) stop = `time limit reached after ${Math.round(elapsedMs / 1000)}s; sent ${sent}/${total}`
+    const n429 = statuses[429] || 0
+    const first429 = events429.length ? Math.min(...events429.map(e => e.request_no)) : null
+    const complete = sent >= total
+    if (first429 != null) findings.push(...C.analyzeRate('/api/v1/ads/impression', { total: sent, statuses, first429, hasRetryAfter: Boolean(retryAfter), has5xx }))
+    else if (complete && !unreachable) findings.push(...C.analyzeRate('/api/v1/ads/impression', { total: sent, statuses, first429, hasRetryAfter: false, has5xx }))
+    const inconclusive = first429 == null && !complete
+    if (inconclusive) findings.push({ id: 'rate.inconclusive', area: 'api', severity: 'low', title: 'Rate-limit result INCONCLUSIVE', evidence: `No 429 seen, but only ${sent} of ${total} planned requests were sent (${stop}). This does not prove there is no rate limiting.`, fix: 'Repeat the run so that all planned requests are sent.', target: pathname })
     const at = now()
-    const evidence: Ev[] = Object.entries(byRoute).map(([k, v]) => ({ check: 'Burst ' + k, ok: !findings.some(f => f.severity === 'critical' || f.severity === 'high'), detail: `status counts ${JSON.stringify(v)}; time ${at}` }))
-    evidence.push({ check: 'Burst stop reason', ok: !unreachable, detail: `${stop}; sent ${sent}/${total}; Retry-After ${retryAfter || 'none'}; time ${at}` })
+    const srcKeys = Object.keys(sourceCounts)
+    const source429 = !n429 ? 'none (no 429)' : srcKeys.length === 1 ? srcKeys[0] : 'Mixed (' + srcKeys.map(k => `${k} ${sourceCounts[k]}`).join(', ') + ')'
+    const evidence: Ev[] = [
+      { check: 'Burst ' + label, ok: !findings.some(f => f.severity === 'critical' || f.severity === 'high'), detail: `level ${level}; sent ${sent}/${total}; concurrency ${BURST_CONCURRENCY}; 400: ${statuses[400] || 0}; 429: ${n429}; status counts ${JSON.stringify(statuses)}; ${Math.round(elapsedMs / 100) / 10}s; time ${at}` },
+      { check: 'Burst stop reason', ok: !unreachable, detail: `${stop}; Retry-After ${retryAfter || 'none'}; time ${at}` }
+    ]
+    if (n429) evidence.push({ check: '429 source', ok: true, detail: `${source429}; first 429 at request ${first429}; body types ${JSON.stringify(bodyCounts)}; time ${at}` })
     const bad = findings.some(f => f.severity === 'critical' || f.severity === 'high')
-    const verdict = bad ? 'FAIL' : unreachable && sent === 0 ? 'BLOCKED' : findings.length ? 'ATTENTION' : 'PASS'
-    const base = report('Rate-limit burst (ads impression + click)', findings, evidence, {
-      target: BLISSCCO_PRODUCTION, understood: 'Rate-limit burst: ads impression + click (invalid requests only, hard cap 40)',
-      status_counts: statuses, by_route: byRoute, requests_sent: sent, request_cap: MAX_BURST_REQUESTS, requests_planned: total, stopped: stop, retry_after: retryAfter,
-      rate_limit: first429 != null ? `DETECTED: 429 at request ${first429}; Retry-After ${retryAfter || 'not sent'}` : `NOT DETECTED in ${sent} requests`,
+    const verdict = bad ? 'FAIL' : unreachable && sent === 0 ? 'BLOCKED' : inconclusive ? 'INCONCLUSIVE' : findings.length ? 'ATTENTION' : 'PASS'
+    const base = report(`Rate-limit burst (ads impression, level ${level})`, findings, evidence, {
+      target: BLISSCCO_PRODUCTION, understood: `Rate-limit burst: POST /api/v1/ads/impression, level ${level}, invalid body {} only, concurrency ${BURST_CONCURRENCY}, within 60 seconds`,
+      level, concurrency: BURST_CONCURRENCY, stop_on_429: stopOn429, elapsed_seconds: Math.round(elapsedMs / 100) / 10, deadline_seconds: BURST_DEADLINE_MS / 1000,
+      status_counts: statuses, count_400: statuses[400] || 0, count_429: n429, count_other: sent - (statuses[400] || 0) - n429,
+      source_429: source429, source_429_counts: sourceCounts, body_type_429_counts: bodyCounts,
+      first_429_request: first429, first_429: events429.slice().sort((a, b) => a.request_no - b.request_no)[0] || null,
+      events_429: events429.slice().sort((a, b) => a.request_no - b.request_no), events_429_listed_max: 50,
+      requests_sent: sent, request_cap: level, requests_planned: total, stopped: stop, retry_after: retryAfter,
+      rate_limit: first429 != null ? `DETECTED: ${n429} x 429 (first at request ${first429}); source ${source429}; Retry-After ${retryAfter || 'not sent'}` : inconclusive ? `INCONCLUSIVE: no 429 in ${sent} of ${total} planned requests` : `NOT DETECTED in ${sent} requests`,
       ...(unreachable ? { reason: 'route unreachable' } : {}),
-      billing_safety: 'No API key, user token or valid ref used. Only invalid requests. No billable event, ledger, payment or database write requested.'
+      billing_safety: 'No API key, user token or valid ref used. Only invalid requests (body {}) to the impression route; click is never called. No billable event, ledger, payment or database write requested.'
     })
     return { result: { ...base, verdict } }
   })

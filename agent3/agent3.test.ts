@@ -5,7 +5,7 @@ import { assertAuthorizedTarget, assertBillingSafe, assertReadOnlySql, isBilling
 import * as C from './checks.js'
 import { redact } from './util.js'
 import { handleRequest } from './server.js'
-import { makeCtx, runAction, assertRouteAllowed, assertRouteBudget, hardBurstCap, MAX_REQUESTS_PER_ROUTE } from './agent.js'
+import { makeCtx, runAction, assertRouteAllowed, assertRouteBudget, hardBurstCap, MAX_REQUESTS_PER_ROUTE, classify429, burstLevelAck } from './agent.js'
 import { workOnce } from './worker.js'
 import { parseCommand, runLocal, runOne, realExec, scanLocalSecrets, analyzeTests, analyzeAudit, analyzeGit, analyzeEnv, analyzeBuild, ALLOWED_HELP, type ExecFn } from './local.js'
 import { maskSecrets } from './guard.js'
@@ -42,7 +42,7 @@ const json = (b: unknown, status = 200, headers: Record<string, string> = {}) =>
 const html = (b: string, status = 200, headers: Record<string, string> = {}) => new Response(b, { status, headers: { 'content-type': 'text/html', ...headers } })
 
 let siteInsecure: boolean       // true: bugs present
-let siteCalls: { method: string; path: string; headers: Record<string, string> }[]
+let siteCalls: { method: string; path: string; headers: Record<string, string>; body?: any }[]
 let otherHostCalls: string[]
 let sqlSeen: string[]
 let mgmtTables: Row[]
@@ -79,7 +79,7 @@ async function fake(input: any, init: any = {}): Promise<Response> {
   const rawH = init.headers || {}
   for (const k of Object.keys(rawH)) h[k.toLowerCase()] = rawH[k]
   if (url.origin === 'https://blisscco.online') {
-    siteCalls.push({ method, path: url.pathname + url.search, headers: h })
+    siteCalls.push({ method, path: url.pathname + url.search, headers: h, body: init.body })
     if (url.pathname === '/api/v1/ads/impression') return json({ error: 'invalid' }, 400)
     if (url.pathname === '/api/v1/ads/click') return json({ error: 'not found' }, 404)
     if (url.pathname === '/api/v1/ads/match') return json({ error: 'unauthorized' }, 401)
@@ -769,20 +769,24 @@ test('Agent 3 marks unreachable route BLOCKED without retrying', async () => {
   } finally { globalThis.fetch = original }
 })
 
-// ---------------------------------------------------------------- Rate-limit burst (ads impression + click)
-async function approvedBurst(requests?: number) {
-  const req = await runAction(ctx(), 'request_ads_burst', { enabled: true, ...(requests === undefined ? {} : { requests }) })
+// ---------------------------------------------------------------- Rate-limit burst (ads impression only, levels 40 / 350 / 700)
+async function approvedBurst(requests?: number, level?: number) {
+  const req = await runAction(ctx(), 'request_ads_burst', { enabled: true, ...(requests === undefined ? {} : { requests }), ...(level ? { level, level_ack: burstLevelAck(level) } : {}) })
   Object.assign(db.approvals.find(a => a.id === req.result.approval_id)!, { status: 'approved', decided_at: new Date().toISOString() })
   return req.result.approval_id as string
 }
 const ACK = { production_ack: 'APPROVE-PRODUCTION' }
-function limitAt(n: number | null, status = 429, extra: Record<string, string> = { 'retry-after': '30' }) {
+const ACK350 = { ...ACK, level_ack: burstLevelAck(350) }
+const ACK700 = { ...ACK, level_ack: burstLevelAck(700) }
+const VERCEL_PAGE = '<!doctype html><html><head><title>Too many requests | Vercel</title></head><body>Vercel Security Checkpoint</body></html>'
+function limitAt(n: number | null, status = 429, extra: Record<string, string> = { 'retry-after': '30' }, body: string | ((no: number) => string) = '{"error":"rate_limited"}', headersFor?: (no: number) => Record<string, string>) {
   let c = 0; const original = globalThis.fetch
   globalThis.fetch = (async (input: any, init: any = {}) => {
     const u = new URL(String(input))
     if (u.origin === 'https://blisscco.online' && n && ++c >= n) {
-      siteCalls.push({ method: String(init.method || 'GET').toUpperCase(), path: u.pathname + u.search, headers: {} })
-      return new Response('{}', { status, headers: extra })
+      siteCalls.push({ method: String(init.method || 'GET').toUpperCase(), path: u.pathname + u.search, headers: {}, body: init.body })
+      const b = typeof body === 'function' ? body(c) : body
+      return new Response(b, { status, headers: { ...extra, ...(headersFor ? headersFor(c) : {}) } })
     }
     return fake(input, init)
   }) as any
@@ -791,12 +795,31 @@ function limitAt(n: number | null, status = 429, extra: Record<string, string> =
 test('Burst is OFF by default: no request, no approval, no traffic unless explicitly enabled', async () => {
   await assert.rejects(() => runAction(ctx(), 'request_ads_burst', {}), (e: any) => e.code === 'burst_off')
   await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: false, requests: 10 }), (e: any) => e.code === 'burst_off')
+  await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: false, level: 700, level_ack: burstLevelAck(700) }), (e: any) => e.code === 'burst_off')
   assert.equal(siteCalls.length, 0); assert.equal((db.approvals || []).length, 0)
 })
-test('Burst needs approval every run + production ack, is single-use, and request count is capped at 40', async () => {
+test('Level 350 and 700 need their own explicit ack per run; unknown levels are refused', async () => {
+  for (const level of [350, 700]) {
+    await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: true, level }), (e: any) => e.code === 'level_ack')
+    await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: true, level, level_ack: burstLevelAck(level === 350 ? 700 : 350) }), (e: any) => e.code === 'level_ack')
+  }
+  for (const level of [41, 100, 1000, 'x']) await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: true, level }), (e: any) => e.code === 'bad_level')
+  assert.equal(siteCalls.length, 0); assert.equal((db.approvals || []).length, 0)
+  // approved but run without the level ack -> still blocked, no traffic
+  const id = await approvedBurst(undefined, 350)
+  assert.equal(db.approvals[0].details.requests, 350); assert.equal(db.approvals[0].details.high_level, true)
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK }), (e: any) => e.code === 'level_ack')
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK700 }), (e: any) => e.code === 'level_ack')
+  assert.equal(siteCalls.length, 0)
+  // a tampered level in the stored approval is refused
+  db.approvals[0].details.level = 5000
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK350 }), (e: any) => e.code === 'bad_level')
+  assert.equal(siteCalls.length, 0)
+})
+test('Burst needs approval every run + production ack, is single-use, and default level 40 is capped at 40', async () => {
   const req = await runAction(ctx(), 'request_ads_burst', { enabled: true, requests: 500 })
   assert.equal(req.status, 'awaiting_approval'); assert.equal(siteCalls.length, 0)
-  assert.equal(db.approvals[0].details.requests, 40); assert.equal(db.approvals[0].details.kind, 'ads_burst')
+  assert.equal(db.approvals[0].details.requests, 40); assert.equal(db.approvals[0].details.level, 40); assert.equal(db.approvals[0].details.kind, 'ads_burst')
   const id = req.result.approval_id
   await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK }), /Not approved/)
   Object.assign(db.approvals[0], { status: 'approved', decided_at: new Date().toISOString() })
@@ -805,38 +828,109 @@ test('Burst needs approval every run + production ack, is single-use, and reques
   const run = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
   assert.ok(run.result.requests_sent <= 40)
   await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK }), /Already executed/)
+  // every 350/700 run needs a brand new approval
+  const id2 = await approvedBurst(undefined, 350)
+  await runAction(ctx(), 'apply_ads_burst', { approval_id: id2, ...ACK350 })
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id2, ...ACK350 }), /Already executed/)
 })
-test('Burst stops immediately at the first 429 and reports status counts + Retry-After', async () => {
+test('Burst sends ONLY POST /api/v1/ads/impression with body {} , never click, never credentials', async () => {
+  const id = await approvedBurst(30)
+  const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
+  assert.equal(siteCalls.length, 30)
+  assert.ok(siteCalls.every(c => c.method === 'POST' && c.path === '/api/v1/ads/impression' && c.body === '{}'))
+  assert.ok(siteCalls.every(c => !c.headers.authorization && !c.headers['x-api-key'] && !c.headers.cookie))
+  assert.deepEqual(r.result.status_counts, { 400: 30 }); assert.equal(r.result.count_400, 30); assert.equal(r.result.count_429, 0)
+  assert.equal(r.result.concurrency, 10); assert.deepEqual(otherHostCalls, [])
+})
+test('Burst runs with concurrency 10 (never more than 10 in flight)', async () => {
+  const id = await approvedBurst(undefined, 350)
+  let inflight = 0, peak = 0; const original = globalThis.fetch
+  globalThis.fetch = (async (input: any, init: any = {}) => {
+    inflight++; peak = Math.max(peak, inflight)
+    await new Promise(r => setTimeout(r, 2))
+    try { return await fake(input, init) } finally { inflight-- }
+  }) as any
+  try {
+    const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK350 })
+    assert.equal(r.result.requests_sent, 350); assert.equal(peak, 10)
+  } finally { globalThis.fetch = original }
+})
+test('Level 40 stops launching at the first 429 and reports status counts, Retry-After, body type and x-vercel-mitigated', async () => {
   const id = await approvedBurst(40)
   const restore = limitAt(7)
   try {
     const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
-    assert.equal(siteCalls.length, 7)
-    assert.deepEqual(r.result.status_counts, { 400: 3, 404: 3, 429: 1 })
-    assert.equal(r.result.retry_after, '30'); assert.match(r.result.rate_limit, /429 at request 7.*Retry-After 30/)
-    assert.match(r.result.stopped, /first 429/); assert.equal(r.result.verdict, 'PASS')
+    assert.equal(r.result.first_429_request, 7)
+    assert.ok(siteCalls.length >= 7 && siteCalls.length <= 16, 'stopped launching: ' + siteCalls.length)
+    assert.equal(r.result.count_400, 6); assert.ok(r.result.count_429 >= 1)
+    assert.equal(r.result.retry_after, '30'); assert.match(r.result.rate_limit, /first at request 7.*Retry-After 30/)
+    assert.deepEqual(r.result.first_429, { request_no: 7, retry_after: '30', body_type: 'JSON rate_limited', x_vercel_mitigated: null, source: 'App' })
+    assert.equal(r.result.source_429, 'App'); assert.match(r.result.stopped, /first 429/); assert.equal(r.result.verdict, 'PASS')
     assert.ok(r.result.evidence.every((e: any) => /time /.test(e.detail)))
-    assert.deepEqual([...new Set(siteCalls.map(c => c.path.split('?')[0]))].sort(), ['/api/v1/ads/click', '/api/v1/ads/impression'])
-    assert.ok(siteCalls.every(c => !c.headers.authorization && !c.headers['x-api-key']))
   } finally { restore() }
 })
-test('Burst never exceeds 40 requests even if the stored approval says more; no 429 -> ATTENTION', async () => {
+test('Level 350 stops at the first 429; Vercel Firewall 429 (page + x-vercel-mitigated) is told apart from App 429', async () => {
+  const id = await approvedBurst(undefined, 350)
+  const restore = limitAt(25, 429, { 'retry-after': '60', 'content-type': 'text/html' }, VERCEL_PAGE, () => ({ 'x-vercel-mitigated': 'deny' }))
+  try {
+    const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK350 })
+    assert.equal(r.result.level, 350); assert.equal(r.result.stop_on_429, true)
+    assert.equal(r.result.first_429_request, 25); assert.ok(r.result.requests_sent < 350 && r.result.requests_sent <= 25 + 9)
+    assert.equal(r.result.first_429.body_type, 'Vercel page'); assert.equal(r.result.first_429.x_vercel_mitigated, 'deny'); assert.equal(r.result.first_429.retry_after, '60')
+    assert.equal(r.result.source_429, 'Vercel Firewall'); assert.match(r.result.stopped, /first 429/)
+  } finally { restore() }
+})
+test('Level 700 does NOT stop on 429: all 700 are sent, every 429 is recorded and counted', async () => {
+  const id = await approvedBurst(undefined, 700)
+  const restore = limitAt(100, 429, { 'retry-after': '30' }, c => c % 2 ? VERCEL_PAGE : '{"error":"rate_limited"}', (c): Record<string, string> => c % 2 ? { 'x-vercel-mitigated': 'challenge' } : {})
+  try {
+    const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK700 })
+    assert.equal(r.result.stop_on_429, false); assert.equal(siteCalls.length, 700); assert.equal(r.result.requests_sent, 700)
+    assert.equal(r.result.count_400, 99); assert.equal(r.result.count_429, 601); assert.equal(r.result.count_other, 0)
+    assert.equal(r.result.first_429_request, 100); assert.equal(r.result.first_429.body_type, 'JSON rate_limited'); assert.equal(r.result.first_429.source, 'App')
+    assert.equal(r.result.source_429_counts['App'] + r.result.source_429_counts['Vercel Firewall'], 601)
+    assert.match(r.result.source_429, /^Mixed/); assert.ok(r.result.events_429.length <= 50)
+    assert.match(r.result.stopped, /completed all 700/); assert.equal(r.result.verdict, 'PASS')
+  } finally { restore() }
+})
+test('Burst finishes inside the time limit: INCONCLUSIVE (not "No rate limiting") if no 429 and fewer requests than the level were sent', async () => {
+  const id = await approvedBurst(undefined, 700)
+  const original = globalThis.fetch, realNow = Date.now; let t = realNow(), calls = 0
+  Date.now = () => t
+  globalThis.fetch = (async (input: any, init: any = {}) => { calls++; t += 1000; return fake(input, init) }) as any   // every request "takes" 1 s of fake time
+  try {
+    const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK700 })
+    assert.ok(r.result.requests_sent < 700); assert.match(r.result.stopped, /time limit/)
+    assert.equal(r.result.count_429, 0); assert.equal(r.result.verdict, 'INCONCLUSIVE'); assert.match(r.result.rate_limit, /INCONCLUSIVE/)
+    const ids = r.result.findings.map((f: any) => f.id)
+    assert.ok(ids.includes('rate.inconclusive')); assert.ok(!ids.includes('rate.none'))
+    assert.ok(!/No rate limiting detected/i.test(JSON.stringify(r.result)))
+  } finally { globalThis.fetch = original; Date.now = realNow }
+})
+test('Burst never exceeds 40 at level 40 even if the stored approval says more; all sent and no 429 -> ATTENTION (rate.none)', async () => {
   const id = await approvedBurst(10)
   db.approvals[0].details.requests = 100000
   const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
   assert.equal(siteCalls.length, 40); assert.equal(r.result.requests_sent, 40)
-  assert.deepEqual(r.result.status_counts, { 400: 20, 404: 20 })
+  assert.deepEqual(r.result.status_counts, { 400: 40 })
   assert.equal(r.result.verdict, 'ATTENTION'); assert.match(r.result.rate_limit, /NOT DETECTED/)
   assert.ok(r.result.findings.some((f: any) => f.id === 'rate.none'))
 })
-test('Burst stops at once and FAILS (critical) on 200 or 302; 5xx also stops', async () => {
-  for (const status of [200, 302, 503]) {
+test('429 classifier: App JSON rate_limited vs Vercel page vs other', () => {
+  assert.deepEqual(classify429({ headers: {}, text: '{"error":"rate_limited"}' }), { body_type: 'JSON rate_limited', source: 'App', mitigated: null })
+  assert.equal(classify429({ headers: { 'x-vercel-mitigated': 'deny' }, text: VERCEL_PAGE }).source, 'Vercel Firewall')
+  assert.equal(classify429({ headers: { 'x-vercel-mitigated': 'deny' }, text: '' }).source, 'Vercel Firewall')
+  assert.equal(classify429({ headers: {}, text: VERCEL_PAGE }).body_type, 'Vercel page')
+  assert.deepEqual(classify429({ headers: {}, text: 'nope' }), { body_type: 'other', source: 'Unknown', mitigated: null })
+})
+test('Burst stops at once and FAILS (critical) on 200 or 302; 5xx also stops (even at level 700)', async () => {
+  for (const [status, level] of [[200, 40], [302, 350], [503, 700]] as const) {
     siteCalls = []; db.approvals = []
-    const id = await approvedBurst(40)
-    const restore = limitAt(1, status, {})
+    const id = await approvedBurst(40, level === 40 ? undefined : level)
+    const restore = limitAt(1, status, {}, '')
     try {
-      const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
-      assert.equal(siteCalls.length, 1, 'status ' + status); assert.equal(r.result.verdict, 'FAIL')
+      const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...(level === 350 ? ACK350 : level === 700 ? ACK700 : ACK) })
+      assert.ok(siteCalls.length <= 10, 'status ' + status + ' sent ' + siteCalls.length); assert.equal(r.result.verdict, 'FAIL')
       if (status !== 503) assert.equal(r.result.findings[0].severity, 'critical')
     } finally { restore() }
   }

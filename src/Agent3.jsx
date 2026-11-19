@@ -47,7 +47,7 @@ function Report({ res, onRetest }) {
   const u = res.understood || r.understood
   return (
     <div className="card">
-      <div className="row"><b>{r.title || 'Result'}</b><Badge s={res.status === 'queued' ? 'queued' : waiting ? 'awaiting_approval' : v === 'fail' ? 'failed' : (v === 'blocked' || res.status === 'blocked') ? 'warn' : v === 'attention' ? 'degraded' : 'ok'} /></div>
+      <div className="row"><b>{r.title || 'Result'}</b><Badge s={res.status === 'queued' ? 'queued' : waiting ? 'awaiting_approval' : v === 'fail' ? 'failed' : (v === 'blocked' || v === 'inconclusive' || res.status === 'blocked') ? 'warn' : v === 'attention' ? 'degraded' : 'ok'} /></div>
       {(r.repo || r.branch) && <CodeBlock label="GitHub branch context" tone="info" text={[r.repo && 'Repository: ' + r.repo, r.branch && 'Branch (selected): ' + r.branch, r.branch_sha && 'Commit: ' + String(r.branch_sha).slice(0, 7), (r.repo && r.branch && r.branch_sha) ? 'Used: ' + r.repo + ' @ ' + r.branch + ' @ ' + String(r.branch_sha).slice(0, 7) : null].filter(Boolean).join('\\n')} wrap={false} />}
       {u && <CodeBlock label={'understood: ' + (typeof u === 'string' ? u : u.intent)} tone="info" text={typeof u === 'string' ? u : (u.explanation || u.intent)} />}
       {r.unsupported && <CodeBlock label="not done" tone="warn" text={r.message} />}
@@ -95,11 +95,18 @@ function Pick({ options, value, set, empty }) {
 
 function Apply({ a, onDone, onResult, setErr }) {
   const [ack, setAck] = useState(false)
+  const [levelAck, setLevelAck] = useState(false)
   const [busy, setBusy] = useState(false)
   const burst = a.details && a.details.kind === 'ads_burst'
+  const level = burst ? Number(a.details.level || 40) : 0
+  const high = burst && level > 40
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent3(burst ? 'apply_ads_burst' : 'apply_rate_test', { approval_id: a.id, production_ack: ack ? 'APPROVE-PRODUCTION' : undefined })); onDone() }
+    try {
+      const params = { approval_id: a.id, production_ack: ack ? 'APPROVE-PRODUCTION' : undefined }
+      if (high) params.level_ack = levelAck ? 'APPROVE-HIGH-BURST-' + level : undefined
+      onResult(await callAgent3(burst ? 'apply_ads_burst' : 'apply_rate_test', params)); onDone()
+    }
     catch (e) { setErr(e.message) }
     setBusy(false)
   }
@@ -107,8 +114,9 @@ function Apply({ a, onDone, onResult, setErr }) {
     <div className="card">
       <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
       <div className="sub">{a.details.note}</div>
-      <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> I confirm this burst test on the live site (invalid requests only, stops at first 429)</label>
-      <button className="btn ok" disabled={busy || !ack} onClick={go}>{busy ? 'Running...' : burst ? 'Run burst' : 'Run rate test'}</button>
+      <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> {burst ? `I confirm this burst test on the live site (POST impression only, invalid body {}, ${level === 700 ? 'does NOT stop on 429' : 'stops at first 429'})` : 'I confirm this rate test on the live site'}</label>
+      {high && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={levelAck} onChange={e => setLevelAck(e.target.checked)} style={{ width: 'auto' }} /> I separately approve the HIGH level {level} for this run only</label>}
+      <button className="btn ok" disabled={busy || !ack || (high && !levelAck)} onClick={go}>{busy ? 'Running...' : burst ? 'Run burst (' + level + ')' : 'Run rate test'}</button>
     </div>
   )
 }
@@ -175,6 +183,8 @@ export default function Agent3Panel() {
   const [ratePath, setRatePath] = useState('')
   const [burstOn, setBurstOn] = useState(false) // default OFF, never remembered
   const [burstN, setBurstN] = useState('40')
+  const [burstLevel, setBurstLevel] = useState('40') // 40 default; 350 / 700 need their own approval every run
+  const [burstHighAck, setBurstHighAck] = useState(false)
   const [where, setWhere] = useState('vercel')
   const [queuedId, setQueuedId] = useState('')
 
@@ -250,10 +260,19 @@ export default function Agent3Panel() {
         <button className="btn" disabled={!!busy || !text.trim()} onClick={async () => { setBusy('ask'); setErr(''); try { setRes(await callAgent3('ai_command', { text })); setText('') } catch (e) { setErr(e.message) } setBusy('') }}>{busy === 'ask' ? 'Thinking...' : 'Do it'}</button>
       </div>
       <div className="card">
-        <b>Rate-limit burst</b> <span className="sub">(OFF by default; ads impression + click; invalid requests only; stops at first 429; hard cap 40; approval every run)</span>
-        <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={burstOn} onChange={e => setBurstOn(e.target.checked)} style={{ width: 'auto' }} /> Enable burst test (this visit only)</label>
-        <input type="number" min="2" max="40" value={burstN} onChange={e => setBurstN(e.target.value)} disabled={!burstOn} />
-        <button className="btn ghost" disabled={!!busy || !burstOn} onClick={async () => { await run('request_ads_burst', { enabled: true, requests: Math.min(40, Math.max(2, Number(burstN) || 40)) }); setBurstOn(false) }}>{busy === 'request_ads_burst' ? 'Requesting...' : 'Rate-limit burst'}</button>
+        <b>Rate-limit burst</b> <span className="sub">(OFF by default; POST /api/v1/ads/impression only, invalid body {'{}'}; 10 at a time; finishes within 60 s; approval every run)</span>
+        <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={burstOn} onChange={e => { setBurstOn(e.target.checked); if (!e.target.checked) setBurstHighAck(false) }} style={{ width: 'auto' }} /> Enable burst test (this visit only)</label>
+        <div className="filters" style={{ margin: '6px 0' }}>
+          {['40', '350', '700'].map(l => <button key={l} className={'btn' + (burstLevel === l ? '' : ' ghost')} disabled={!burstOn} onClick={() => { setBurstLevel(l); setBurstHighAck(false) }}>{l}{l === '40' ? ' (default)' : ''}</button>)}
+        </div>
+        <div className="sub">{burstLevel === '700' ? 'Level 700: does NOT stop on 429, all 700 requests are sent.' : burstLevel === '350' ? 'Level 350: stops at the first 429.' : 'Level 40: stops at the first 429.'}</div>
+        {burstLevel === '40' && <input type="number" min="2" max="40" value={burstN} onChange={e => setBurstN(e.target.value)} disabled={!burstOn} />}
+        {burstLevel !== '40' && <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={burstHighAck} disabled={!burstOn} onChange={e => setBurstHighAck(e.target.checked)} style={{ width: 'auto' }} /> I explicitly approve HIGH level {burstLevel} for this run only</label>}
+        <button className="btn ghost" disabled={!!busy || !burstOn || (burstLevel !== '40' && !burstHighAck)} onClick={async () => {
+          const level = Number(burstLevel)
+          await run('request_ads_burst', level === 40 ? { enabled: true, level, requests: Math.min(40, Math.max(2, Number(burstN) || 40)) } : { enabled: true, level, level_ack: 'APPROVE-HIGH-BURST-' + level })
+          setBurstOn(false); setBurstHighAck(false); setBurstLevel('40')
+        }}>{busy === 'request_ads_burst' ? 'Requesting...' : 'Request burst approval (' + burstLevel + ')'}</button>
       </div>
       <div className="card">
         <b>Optional burst test</b> <span className="sub">(OFF by default; separate approval + confirmation; hard cap 40 requests)</span>
