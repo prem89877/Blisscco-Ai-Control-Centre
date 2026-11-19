@@ -54,6 +54,13 @@ export class Vercel {
     return items
   }
 
+  // READ-ONLY: inspect the production project's Vercel Firewall/WAF configuration.
+  // The path takes a configVersion; "active" is the deployed config (Vercel docs). The config is project-wide, not per environment.
+  // This method never changes or publishes rules.
+  async firewallConfig(projectId: string): Promise<any> {
+    return this.call('GET', '/v1/security/firewall/config/active', { projectId })
+  }
+
   // Returns metadata only. Values are never read into the result.
   async listEnv(projectId: string): Promise<EnvItem[]> {
     const b = await this.call('GET', '/v9/projects/' + encodeURIComponent(projectId) + '/env')

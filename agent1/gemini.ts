@@ -48,6 +48,7 @@ Intents:
 - supabase_schema: read-only look at tables and columns (schema one of ai_control, public, private, storage; supabase_project optional)
 - rls_check: verify RLS and permissions (supabase_project optional)
 - github_status: GitHub repository and workflow status
+- firewall_inspect: read the selected Vercel project production Firewall/WAF configuration and report whether the firewall is enabled plus the custom rules, rate-limit rules and IP block rules (READ ONLY; never modify/publish; header/cookie values stay hidden)
 - unsupported: everything else, for example changing or reading env values, running or changing SQL, deleting anything, several actions in one request. Say why in "explanation".
 "vercel_project" and "supabase_project" must be copied exactly from the lists you receive, or null. If selected_vercel_project / selected_supabase_project is not null, the owner already chose it: use it. Never invent names. Never output secrets.`
 

@@ -1,7 +1,7 @@
 import { loadConfig, readiness, secretValues, type Config } from './config.js'
 import { AgentError, clip, errMsg, extractFailedLog, redact, redactString } from './util.js'
 import { Store } from './store.js'
-import { GitHub, type CommitFile } from './github.js'
+import { GitHub, GITHUB_RESOURCES, SAFE_REF, validateWrite, type CommitFile } from './github.js'
 import { planCommand, proposeFix, review, type AiResult } from './gemini.js'
 import { runDev } from './dev.js'
 import { devLimits } from './config.js'
@@ -10,7 +10,7 @@ import { assertAgentBranch, branchFor, diffStats, gitBlobSha, isProtected, LIMIT
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
 // Actions that need only GitHub + Supabase, so they can run on Vercel (/api/agent2) and in Termux.
-export const ACTIONS = ['heartbeat', 'github_branches', 'repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'apply_change', 'request_promote', 'apply_promote', 'request_rollback', 'apply_rollback', 'ai_command', 'request_workflow', 'apply_workflow', 'dev_chat', 'dev_assist', 'dev_proposal', 'dev_diagnose'] as const
+export const ACTIONS = ['heartbeat', 'github_branches', 'repo_inspect', 'actions_status', 'propose_change', 'ai_fix', 'apply_change', 'request_promote', 'apply_promote', 'request_rollback', 'apply_rollback', 'ai_command', 'request_workflow', 'apply_workflow', 'dev_chat', 'dev_assist', 'dev_proposal', 'dev_diagnose', 'github_resource', 'github_write'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -520,6 +520,25 @@ async function applyWorkflow(ctx: Ctx, p: any): Promise<any> {
   })
 }
 
+// ---------------------------------------------------------------- GitHub desk: read-only resources + issue/comment writes
+// These actions are NOT branch-scoped: pull requests, issues, releases, tags, workflows and metadata do not belong to one branch.
+// `ref` is optional and used only by commits / checks (default branch when absent). Nothing here can touch code, branches, releases, tags, settings or secrets.
+async function githubResource(ctx: Ctx, p: any): Promise<any> {
+  const repo = validRepo(p.repo)
+  const resource = String(p.resource || '')
+  if (!GITHUB_RESOURCES.includes(resource)) throw new AgentError('Choose a supported GitHub resource: ' + GITHUB_RESOURCES.join(', '), 400, 'bad_resource')
+  const ref = typeof p.ref === 'string' && p.ref && SAFE_REF.test(p.ref) && !p.ref.includes('..') ? p.ref : undefined
+  return withTask(ctx, 'github_resource', 'Inspect GitHub ' + resource + ' for ' + repo, { repo, resource, ref: ref || null }, async () => ({ result: { repo, resource, ref: ref || null, data: await new GitHub(ctx.cfg, ctx.calls).developerResource(repo, resource, ref) } }))
+}
+
+async function githubWrite(ctx: Ctx, p: any): Promise<any> {
+  const gh = new GitHub(ctx.cfg, ctx.calls)
+  const repo = gh.repo(validRepo(p.repo))
+  const op = String(p.operation || '')
+  const input = validateWrite(op, p) // refuses bad input and secret-looking text BEFORE any task or GitHub call
+  return withTask(ctx, 'github_write', 'GitHub ' + op + (input.number ? ' #' + input.number : '') + ' in ' + repo, { repo, operation: op, number: input.number || null, title: input.title || null, text_chars: input.body ? input.body.length : 0 }, async () => ({ result: { repo, operation: op, ...(await gh.writeIssueOp(repo, op, input)) } }))
+}
+
 // ---------------------------------------------------------------- free-text command (AI picks ONE allowed action; code validates everything)
 async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   const gh = new GitHub(ctx.cfg, ctx.calls)
@@ -538,7 +557,7 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   if (!r.text) throw new AgentError('Gemini could not read the request: ' + (r.error || 'no answer'), 502, 'ai_unavailable')
   let plan: any
   try { const a = r.text.indexOf('{'), b = r.text.lastIndexOf('}'); plan = JSON.parse(r.text.slice(a, b + 1)) } catch { throw new AgentError('Gemini answer was not valid JSON. Try again in simpler words.', 502, 'ai_bad_output') }
-  const INTENTS = ['check_ci', 'list_branches', 'inspect', 'delete_branch', 'run_workflow', 'fix_code']
+  const INTENTS = ['check_ci', 'list_branches', 'inspect', 'github_resource', 'github_write', 'delete_branch', 'run_workflow', 'fix_code']
   const intent = INTENTS.includes(String(plan && plan.intent)) ? String(plan.intent) : 'unsupported'
   const understood = { intent, explanation: String((plan && plan.explanation) || '').slice(0, 300) }
   const safeRef = (v: unknown) => (typeof v === 'string' && /^[\w./-]{1,100}$/.test(v) && !v.includes('..') ? v : undefined)
@@ -553,6 +572,8 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
     }
     case 'list_branches': out = await withTask(ctx, 'list_branches', 'List agent2 branches ' + repo, { repo }, async () => ({ result: { repo, branches, count: branches.length } })); break
     case 'inspect': out = await withTask(ctx, 'repo_inspect', 'Inspect repo ' + repo, { repo }, () => repoInspect(ctx, { ...selCtx, repo, path: typeof plan.path === 'string' ? plan.path : undefined, ref: selBase ?? safeRef(plan.ref) })); break
+    case 'github_resource': out = await githubResource(ctx, { repo, resource: plan.resource, ref: selBase ?? safeRef(plan.ref) }); break
+    case 'github_write': out = await githubWrite(ctx, { repo, operation: plan.operation, number: plan.number, title: plan.title, body: plan.body, labels: plan.labels }); break
     case 'delete_branch': {
       const branch = String(plan.branch || '')
       if (!branches.includes(branch)) throw new AgentError('That branch is not one of the agent2/* branches: ' + (branches.join(', ') || 'none exist'), 404, 'not_found')
@@ -588,6 +609,8 @@ async function dispatch(ctx: Ctx, action: string, params: any): Promise<any> {
     case 'github_branches': { const gh = new GitHub(ctx.cfg, ctx.calls); const repo = gh.repo(validRepo(params.repo)); return { result: { repo, branches: await gh.branches(repo) } } }
     case 'repo_inspect': return withTask(ctx, action, 'Inspect repo ' + String(params.repo || '') + (params.path ? '/' + params.path : ''), { repo: params.repo, path: params.path || null }, () => repoInspect(ctx, params))
     case 'actions_status': return withTask(ctx, action, 'GitHub Actions status ' + String(params.repo || ''), { repo: params.repo, branch: params.branch || null }, () => actionsStatus(ctx, params))
+    case 'github_resource': return githubResource(ctx, params)
+    case 'github_write': return githubWrite(ctx, params)
     case 'propose_change': return proposeChange(ctx, params)
     case 'ai_fix': return aiFix(ctx, params)
     case 'apply_change': return applyChange(ctx, params)

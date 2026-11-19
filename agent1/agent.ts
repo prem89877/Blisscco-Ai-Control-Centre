@@ -9,7 +9,7 @@ import { analyzeProject, analyzeRls, classifyDbChange, classifyExecutableSql, co
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number> }
-export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'github_branches', 'deploy_logs', 'request_redeploy', 'apply_redeploy', 'vercel_options', 'project_options', 'ai_command'] as const
+export const ACTIONS = ['heartbeat', 'health_report', 'vercel_status', 'env_audit', 'supabase_schema', 'rls_check', 'request_env_change', 'apply_env_change', 'propose_db_change', 'apply_db_change', 'github_status', 'github_branches', 'deploy_logs', 'firewall_inspect', 'request_redeploy', 'apply_redeploy', 'vercel_options', 'project_options', 'ai_command'] as const
 export type Action = typeof ACTIONS[number]
 
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
@@ -342,6 +342,80 @@ async function projectOptions(ctx: Ctx): Promise<Out> {
   return { result: { vercel, supabase: projectList(ctx.cfg).map(x => ({ ref: x.ref, label: x.label })) } }
 }
 
+// ---------- Vercel Firewall (read-only production inspection) ----------
+// GET /v1/security/firewall/config/active (the deployed config). Real Vercel shape: firewallEnabled, rules[] (custom rules; a rate-limit rule has
+// action.mitigate.action === 'rate_limit' + action.mitigate.rateLimit), ips[] (IP block rules), crs{} (managed rulesets), botIdEnabled.
+// Rule conditions can contain secrets (e.g. a header-match token), so values of header/cookie/query/body conditions and anything that looks like a
+// credential are replaced with [redacted] BEFORE the result is returned, shown or stored.
+const SENSITIVE_COND = new Set(['header', 'cookie', 'query', 'args', 'body', 'raw_path_query'])
+const SECRET_KEY = /(token|secret|password|authorization|api[-_]?key|private[-_]?key)/i
+const SECRET_LOOKING = /^[A-Za-z0-9_\-+/=.]{24,}$/
+export function cleanFw(v: any, depth = 0): any {
+  if (depth > 8) return null
+  if (Array.isArray(v)) return v.slice(0, 50).map(x => cleanFw(x, depth + 1))
+  if (typeof v === 'string') return v.length > 300 ? v.slice(0, 300) + '...' : v
+  if (!v || typeof v !== 'object') return v
+  const out: any = {}
+  const sensitiveCond = typeof v.type === 'string' && SENSITIVE_COND.has(v.type.toLowerCase())
+  for (const [k, val] of Object.entries(v)) {
+    if (SECRET_KEY.test(k)) { out[k] = '[redacted]'; continue }
+    if (k === 'value' && (sensitiveCond || (typeof val === 'string' && SECRET_LOOKING.test(val)))) { out[k] = '[redacted]'; continue }
+    out[k] = cleanFw(val, depth + 1)
+  }
+  return out
+}
+// Structural only (no text guessing): a rule is a rate-limit rule when its action carries a rateLimit block or the rate_limit mitigation.
+export const isRateLimitRule = (r: any): boolean => {
+  const a = r && typeof r === 'object' ? r.action : null
+  if (!a || typeof a !== 'object') return false
+  const m = a.mitigate && typeof a.mitigate === 'object' ? a.mitigate : a
+  return Boolean(m.rateLimit || m.rate_limit || String(m.action || '').toLowerCase() === 'rate_limit')
+}
+
+async function firewallInspect(ctx: Ctx, projectName: string): Promise<Out> {
+  if (!ctx.cfg.vercelToken) throw new AgentError('AGENT1_VERCEL_TOKEN is not set', 503, 'not_configured')
+  const vercel = new Vercel(ctx.cfg, ctx.calls)
+  const projects = await vercel.listProjects()
+  // No project named: use it only when exactly one project is allowed, otherwise the owner must choose.
+  const wanted = projectName || (projects.length === 1 ? projects[0].name : '')
+  if (!wanted) throw new AgentError('Pick the Vercel production project first', 400, 'project_required')
+  const project = projects.find(x => x.name === wanted || x.id === wanted)
+  if (!project) throw new AgentError('Vercel project not found or not allowed: ' + wanted, 404, 'project_not_found')
+  const raw = await vercel.firewallConfig(project.id)
+  const config = raw && (raw.config || raw.firewallConfig || raw) || {}
+  const summarizeRule = (r: any) => {
+    if (!r || typeof r !== 'object') return r
+    return cleanFw({ id: r.id || null, name: r.name || null, description: r.description || null, active: r.active ?? null, action: r.action ?? null, conditionGroup: r.conditionGroup ?? r.conditions ?? null })
+  }
+  const customRaw: any[] = Array.isArray(config.rules) ? config.rules
+    : Array.isArray(config.conditions) ? config.conditions
+    : Array.isArray(config.customRules) ? config.customRules
+    : []
+  const rules = customRaw.map(summarizeRule)
+  const rate_limit_rules = customRaw.filter(isRateLimitRule).map(summarizeRule)
+  const ip_rules = (Array.isArray(config.ips) ? config.ips : []).map((x: any) => cleanFw({ id: x && x.id || null, ip: x && x.ip || null, hostname: x && x.hostname || null, action: x && x.action || null, notes: x && x.notes || null }))
+  const crs = config.crs && typeof config.crs === 'object' ? config.crs : null
+  const crs_summary = crs ? Object.entries(crs).map(([key, val]: [string, any]) => ({ key, active: val?.active ?? null, action: val?.action ?? null })) : []
+  return {
+    result: {
+      project: project.name,
+      project_id: project.id,
+      config_version: config.version ?? config.id ?? 'active',
+      read_only: true,
+      firewall_enabled: config.firewallEnabled ?? config.enabled ?? null,
+      bot_id_enabled: config.botIdEnabled ?? null,
+      rules,
+      rate_limit_rules,
+      ip_rules,
+      rule_count: rules.length,
+      rate_limit_count: rate_limit_rules.length,
+      ip_rule_count: ip_rules.length,
+      managed_rulesets: crs_summary,
+      note: 'Active (deployed) project-wide firewall configuration. Inspection only: no firewall rule was changed or published. Header, cookie and query values are hidden.'
+    }
+  }
+}
+
 // ---------- free-text command (AI picks ONE allowed action; code validates everything) ----------
 // Only read-only checks and a redeploy REQUEST (which still needs approval) can be picked. Env values and SQL are never reachable from here.
 async function aiCommand(ctx: Ctx, p: any): Promise<any> {
@@ -357,7 +431,7 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
   if (!r.text) throw new AgentError('Gemini could not read the request: ' + (r.error || 'no answer'), 502, 'ai_unavailable')
   let plan: any
   try { const a = r.text.indexOf('{'), b = r.text.lastIndexOf('}'); plan = JSON.parse(r.text.slice(a, b + 1)) } catch { throw new AgentError('Gemini answer was not valid JSON. Try again in simpler words.', 502, 'ai_bad_output') }
-  const INTENTS = ['health_report', 'vercel_status', 'env_audit', 'deploy_logs', 'request_redeploy', 'supabase_schema', 'rls_check', 'github_status']
+  const INTENTS = ['health_report', 'vercel_status', 'env_audit', 'deploy_logs', 'request_redeploy', 'supabase_schema', 'rls_check', 'github_status', 'firewall_inspect']
   const intent = INTENTS.includes(String(plan && plan.intent)) ? String(plan.intent) : 'unsupported'
   const understood = { intent, explanation: String((plan && plan.explanation) || '').slice(0, 300) }
   // A dropdown choice always wins; otherwise the AI's pick is used only if it is exactly a known project.
@@ -387,6 +461,7 @@ async function aiCommand(ctx: Ctx, p: any): Promise<any> {
     }
     case 'rls_check': out = await withTask(ctx, 'rls_check', 'RLS & permissions verification' + spLabel, { ...asked, project_ref: sp ? sp.ref : null }, async () => partReport(ctx, await collectRls(ctx, sp ? sp.ref : undefined))); break
     case 'github_status': { const sc = ghScope(); out = await withTask(ctx, 'github_status', 'GitHub repository status (read-only)', { ...asked, repo: sc.repo, branch: sc.branch }, () => githubStatus(ctx, sc)); break }
+    case 'firewall_inspect': { const fp = vp || (vNames.length === 1 ? vNames[0] : ''); if (!fp) throw new AgentError('Pick the Vercel project from the dropdown first', 400, 'project_required'); out = await withTask(ctx, 'firewall_inspect', 'Inspect firewall and rate-limit rules: ' + fp, { ...asked, project: fp }, () => firewallInspect(ctx, fp)); break }
     default:
       await ctx.store.log('warn', 'agent1_command_unsupported', understood.explanation || 'unsupported request', {}, null, ctx.actor.id)
       return { status: 'succeeded', result: { unsupported: true, message: understood.explanation || 'This request is not something Agent 1 can do safely from the Ask box. Use the forms below for env or database changes.' }, understood }
@@ -424,6 +499,7 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'apply_db_change': return applyDbChange(ctx, params)
     case 'github_branches': { const repo = String(params.repo || ctx.cfg.githubRepos[0] || ''); if (!ctx.cfg.githubRepos.includes(repo)) throw new AgentError('Repo not allowed', 403, 'repo_not_allowed'); return { result: { repo, branches: await new GitHub(ctx.cfg, ctx.calls).branches(repo) } } }
     case 'github_status': return withTask(ctx, action, 'GitHub repository status (read-only)', { repo: params.repo || null, branch: params.branch || null }, () => githubStatus(ctx, params))
+    case 'firewall_inspect': return withTask(ctx, action, 'Inspect firewall and rate-limit rules: ' + String(params.project || '(only allowed project)'), { project: params.project || null }, () => firewallInspect(ctx, String(params.project || '')))
     case 'deploy_logs': return withTask(ctx, action, 'Vercel deployment error logs', { project: params.project || null }, () => deployLogs(ctx, params))
     case 'vercel_options': return vercelOptions(ctx)
     case 'request_redeploy': return requestRedeploy(ctx, params)

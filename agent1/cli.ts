@@ -12,7 +12,7 @@ function loadDotenv(path: string) {
   }
 }
 
-const MAP: Record<string, string> = { health: 'health_report', vercel: 'vercel_status', 'env-audit': 'env_audit', schema: 'supabase_schema', rls: 'rls_check', 'request-env': 'request_env_change', 'apply-env': 'apply_env_change', 'propose-db': 'propose_db_change', 'apply-db': 'apply_db_change', github: 'github_status', 'deploy-logs': 'deploy_logs', 'request-redeploy': 'request_redeploy', 'apply-redeploy': 'apply_redeploy', heartbeat: 'heartbeat' }
+const MAP: Record<string, string> = { health: 'health_report', vercel: 'vercel_status', 'env-audit': 'env_audit', schema: 'supabase_schema', rls: 'rls_check', 'request-env': 'request_env_change', 'apply-env': 'apply_env_change', 'propose-db': 'propose_db_change', 'apply-db': 'apply_db_change', github: 'github_status', 'deploy-logs': 'deploy_logs', 'firewall': 'firewall_inspect', 'request-redeploy': 'request_redeploy', 'apply-redeploy': 'apply_redeploy', heartbeat: 'heartbeat' }
 
 async function main() {
   loadDotenv('.env.agent1')

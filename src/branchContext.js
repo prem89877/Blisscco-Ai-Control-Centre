@@ -9,6 +9,8 @@ export const GITHUB_ACTIONS = {
     'request_promote', 'request_rollback', 'apply_change', 'apply_promote', 'apply_rollback', 'apply_workflow'],
   agent3: ['security_scan', 'full_report']
 }
+// NOT listed on purpose: agent2 github_resource / github_write (PRs, issues, releases, tags, workflows, repo info, issue comments). They are not tied to one branch;
+// commits/checks take an optional ref and default to the repository default branch. They can never write code or branches.
 // Actions that only SOMETIMES touch GitHub (the AI picks the intent on the server): the selection is attached when one exists and the
 // server refuses the GitHub-touching intents without it. They never block purely non-GitHub requests (Vercel / Supabase / live site).
 export const SOFT_ACTIONS = { agent1: ['ai_command'], agent3: ['ai_command'] }

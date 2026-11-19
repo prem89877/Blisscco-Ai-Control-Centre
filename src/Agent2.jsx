@@ -85,6 +85,8 @@ function Report({ res }) {
       {(r.failed_jobs || []).length > 0 && <CodeBlock label="failed jobs" tone="bad" text={r.failed_jobs.map(j => j.job + ': ' + (j.failed_steps || []).join(', ')).join('\n')} />}
       {(r.failed_jobs || []).filter(j => j.log).map((j, i) => <CodeBlock key={i} label={'error log - ' + j.job} tone="bad" text={j.log} />)}
       {r.next && <CodeBlock label="next step" tone="info" text={r.next} />}
+      {r.data && <CodeBlock label={'github ' + r.resource + (r.data.count !== undefined ? ' (' + r.data.count + ')' : '')} wrap={false} text={githubLines(r.resource, r.data)} />}
+      {r.operation && <CodeBlock label={'github ' + r.operation} tone="good" wrap={false} text={[r.number ? '#' + r.number : null, r.url, r.state ? 'state: ' + r.state : null, r.labels ? 'labels: ' + r.labels.join(', ') : null].filter(Boolean).join('\n') || 'done'} />}
       {r.content !== undefined && <CodeBlock label={r.path} wrap={false} text={r.content} />}
       {(r.top_level || r.files) && <CodeBlock label="files" wrap={false} text={r.top_level ? r.top_level.map(t => t.name + '  (' + t.files + ')').join('\n') : r.files.join('\n')} />}
       <details style={{ marginTop: 8 }}>
@@ -93,6 +95,24 @@ function Report({ res }) {
       </details>
     </div>
   )
+}
+
+// One short line per item so a phone screen can read it; the full data stays under "Raw data".
+function githubLines(resource, d) {
+  if (!d) return ''
+  if (resource === 'metadata') return [d.full_name, d.description, 'default branch: ' + d.default_branch, (d.private ? 'private' : 'public') + (d.archived ? ', archived' : ''), 'open issues: ' + d.open_issues, 'pushed: ' + d.pushed_at, d.url].filter(Boolean).join('\n')
+  const items = d.items || []
+  const line = x => {
+    if (resource === 'pull_requests') return '#' + x.number + ' [' + x.state + '] ' + x.title + '  (' + x.head + ' -> ' + x.base + ')'
+    if (resource === 'issues') return '#' + x.number + ' [' + x.state + '] ' + x.title
+    if (resource === 'releases') return x.tag + '  ' + (x.name || '') + (x.prerelease ? '  [pre]' : '')
+    if (resource === 'tags') return x.name + '  ' + String(x.sha || '').slice(0, 7)
+    if (resource === 'commits') return String(x.sha).slice(0, 7) + ' ' + x.message
+    if (resource === 'workflows') return x.name + '  (' + x.path + ')  ' + x.state
+    if (resource === 'checks') return x.name + '  ' + x.status + '/' + (x.conclusion || '-')
+    return JSON.stringify(x)
+  }
+  return (d.sha ? 'commit: ' + String(d.sha).slice(0, 7) + '\n' : '') + (items.map(line).join('\n') || 'none')
 }
 
 // There is NO per-card repository/branch picker: the BranchSelector above is the only control (repo + branch + SHA).
@@ -110,9 +130,9 @@ function AskBox({ repos, onResult, setErr }) {
   }
   return (
     <div className="card">
-      <b>Quick command</b> <span className="sub">(one safe GitHub action: CI status, branches, workflow, delete agent2 branch)</span>
+      <b>Quick command</b> <span className="sub">(one GitHub action: inspect files / PRs / issues / releases / tags / commits / CI, comment or open an issue, fix code, run a workflow, delete an agent2 branch)</span>
       <RepoPick />
-      <textarea rows={3} placeholder="e.g. agent2 test branch delete karo / ci workflow check karo / db integration workflow run karo" value={text} onChange={e => setText(e.target.value)} />
+      <textarea rows={3} placeholder="e.g. open issues dikhao / issue #12 pe comment karo: ... / ci workflow check karo / agent2 test branch delete karo" value={text} onChange={e => setText(e.target.value)} />
       <button className="btn" disabled={busy || !text.trim()} onClick={go}>{busy ? 'Thinking...' : 'Do it'}</button>
     </div>
   )
@@ -138,6 +158,40 @@ function Inspect({ repos, onResult, setErr }) {
         <button className="btn ghost" disabled={!!busy || !sel} onClick={() => go('repo_inspect', { path: path || undefined })}>{busy === 'repo_inspect' ? 'Reading...' : 'Inspect'}</button>
         <button className="btn ghost" disabled={!!busy || !sel} onClick={() => go('actions_status', {})}>{busy === 'actions_status' ? 'Checking...' : 'GitHub Actions'}</button>
       </div>
+    </div>
+  )
+}
+
+function GithubDesk({ repos, onResult, setErr }) {
+  const RES = [['pull_requests', 'Pull requests'], ['issues', 'Issues'], ['releases', 'Releases'], ['tags', 'Tags'], ['commits', 'Commits'], ['workflows', 'Workflows'], ['metadata', 'Repo info'], ['checks', 'Commit checks']]
+  const OPS = [['create_issue', 'Open issue'], ['comment', 'Comment on issue / PR'], ['add_labels', 'Add labels'], ['close_issue', 'Close issue'], ['reopen_issue', 'Reopen issue']]
+  const [resource, setResource] = useState('pull_requests')
+  const [op, setOp] = useState('create_issue')
+  const [number, setNumber] = useState('')
+  const [title, setTitle] = useState('')
+  const [body, setBody] = useState('')
+  const [labels, setLabels] = useState('')
+  const [busy, setBusy] = useState('')
+  const sel = useSelection('agent2')
+  async function run(kind, action, params) {
+    setBusy(kind); setErr('')
+    try { onResult(await callAgent2(action, { repo: selectedRepo('agent2', repos), ...params })) } catch (e) { setErr(e.message) }
+    setBusy('')
+  }
+  return (
+    <div className="card">
+      <b>GitHub desk</b> <span className="sub">(read pull requests, issues, releases, tags, commits, checks; open or comment on issues. Works on the repo above; it never changes code, branches, releases, tags or settings)</span>
+      <RepoPick />
+      <select value={resource} onChange={e => setResource(e.target.value)}>{RES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>
+      {(resource === 'commits' || resource === 'checks') && <div className="sub">Branch: <b>{sel ? sel.branch : 'repository default'}</b></div>}
+      <button className="btn ghost" disabled={!!busy} onClick={() => run('read', 'github_resource', { resource, ref: (resource === 'commits' || resource === 'checks') && sel ? sel.branch : undefined })}>{busy === 'read' ? 'Reading...' : 'Show'}</button>
+      <div className="sec-title">Issue actions</div>
+      <select value={op} onChange={e => setOp(e.target.value)}>{OPS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>
+      {op !== 'create_issue' && <input placeholder="Issue / PR number" inputMode="numeric" value={number} onChange={e => setNumber(e.target.value.replace(/\D/g, ''))} />}
+      {op === 'create_issue' && <input placeholder="Title" value={title} onChange={e => setTitle(e.target.value)} />}
+      {(op === 'create_issue' || op === 'comment') && <textarea rows={3} placeholder="Text" value={body} onChange={e => setBody(e.target.value)} />}
+      {(op === 'create_issue' || op === 'add_labels') && <input placeholder="Labels (comma separated)" value={labels} onChange={e => setLabels(e.target.value)} autoCapitalize="none" />}
+      <button className="btn" disabled={!!busy} onClick={() => run('write', 'github_write', { operation: op, number: number ? Number(number) : undefined, title, body, labels: labels.split(',').map(x => x.trim()).filter(Boolean) })}>{busy === 'write' ? 'Sending...' : 'Do it'}</button>
     </div>
   )
 }
@@ -469,6 +523,7 @@ export default function Agent2Panel() {
         <>
           <AskBox repos={repos} onResult={setRes} setErr={setErr} />
         <Inspect repos={repos} onResult={setRes} setErr={setErr} />
+        <GithubDesk repos={repos} onResult={setRes} setErr={setErr} />
         <Propose repos={repos} onResult={setRes} setErr={setErr} />
         <Fix repos={repos} onResult={setRes} setErr={setErr} />
         <BranchRequest title="Promote to production" hint="(PR + merge; needs approval and a PRODUCTION tick)" action="request_promote" repos={repos} onResult={setRes} setErr={setErr} />

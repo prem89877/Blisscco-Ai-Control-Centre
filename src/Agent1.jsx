@@ -56,6 +56,7 @@ function Report({ res }) {
       {branchInfo && <CodeBlock label="GitHub branch context" tone="info" text={branchInfo} wrap={false} />}
       {res.understood && <CodeBlock label={'understood: ' + res.understood.intent} tone="info" text={res.understood.explanation || res.understood.intent} />}
       {r.ai_summary && <CodeBlock label="summary" tone={tone} text={r.ai_summary} />}
+      {r.firewall_enabled !== undefined && <CodeBlock label="firewall / rate limits (read-only)" tone="info" text={JSON.stringify({ project: r.project, config_version: r.config_version, enabled: r.firewall_enabled, bot_id_enabled: r.bot_id_enabled, rule_count: r.rule_count, rate_limit_count: r.rate_limit_count, ip_rule_count: r.ip_rule_count, rate_limit_rules: r.rate_limit_rules, rules: r.rules, ip_rules: r.ip_rules, managed_rulesets: r.managed_rulesets, note: r.note }, null, 2)} wrap={false} />}
       {r.ai_note && <CodeBlock label="ai note" tone="warn" text={'AI summary unavailable: ' + r.ai_note} />}
       {res.status === 'awaiting_approval' && r.next && <CodeBlock label="next step" tone="info" text={r.next} />}
       {issues && <CodeBlock label={'issues (' + r.issues.length + ')'} tone={tone === 'good' ? 'warn' : tone} text={issues} />}
@@ -218,6 +219,29 @@ function ApplyRedeploy({ a, onDone, setErr }) {
   )
 }
 
+function FirewallCheck({ onResult, setErr }) {
+  const [names, setNames] = useState(null)
+  const [project, setProject] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => { callAgent1('project_options').then(r => { const v = (r.result && r.result.vercel) || []; setNames(v); setProject(v[0] || '') }).catch(e => setErr(e.message)) }, [])
+  async function go() {
+    setBusy(true); setErr('')
+    try { onResult(await callAgent1('firewall_inspect', { project })) } catch (e) { setErr(e.message) }
+    setBusy(false)
+  }
+  return (
+    <div className="card">
+      <b>Firewall &amp; rate limits</b> <span className="sub">(read-only: shows the active firewall config, rate-limit rules and IP rules. Nothing is changed. Header and cookie values are hidden)</span>
+      <select value={project} onChange={e => setProject(e.target.value)} disabled={!names || !names.length} style={{ marginTop: 8 }}>
+        {!names && <option value="">Loading projects...</option>}
+        {names && !names.length && <option value="">No Vercel projects</option>}
+        {(names || []).map(n => <option key={n} value={n}>{n}</option>)}
+      </select>
+      <button className="btn" disabled={busy || !project} onClick={go}>{busy ? 'Reading...' : 'Inspect firewall'}</button>
+    </div>
+  )
+}
+
 function AskBox({ onResult, setErr }) {
   const [opts, setOpts] = useState(null)
   const [vp, setVp] = useState('')
@@ -242,7 +266,7 @@ function AskBox({ onResult, setErr }) {
         <option value="">{opts ? 'Default Supabase project' : 'Loading Supabase projects...'}</option>
         {supa.map(x => <option key={x.ref} value={x.ref}>{x.label}</option>)}
       </select>
-      <textarea rows={3} placeholder="e.g. vercel ka status batao / last failed deploy ka log dikhao / rls check karo / is project ko redeploy karo" value={text} onChange={e => setText(e.target.value)} />
+      <textarea rows={3} placeholder="e.g. firewall aur rate-limit rules inspect karo / vercel status / last failed deploy log / RLS check" value={text} onChange={e => setText(e.target.value)} />
       <button className="btn" disabled={busy || !text.trim()} onClick={go}>{busy ? 'Thinking...' : 'Do it'}</button>
     </div>
   )
@@ -306,6 +330,7 @@ export default function Agent1Panel() {
       <PendingInline kinds={['env_change', 'db_change', 'redeploy']} onDone={reload} />
       {applicable.length > 0 && <><div className="sec-title">Approved - ready to apply</div>{applicable.map(a => a.details.kind === 'db_change' ? <ApplyDb key={a.id} a={a} onDone={reload} setErr={setErr} /> : a.details.kind === 'redeploy' ? <ApplyRedeploy key={a.id} a={a} onDone={reload} setErr={setErr} /> : <Apply key={a.id} a={a} onDone={reload} setErr={setErr} />)}</>}
       <AskBox onResult={setRes} setErr={setErr} />
+      <FirewallCheck onResult={setRes} setErr={setErr} />
       <EnvRequest onResult={setRes} setErr={setErr} />
       <RedeployRequest onResult={setRes} setErr={setErr} />
       <DbProposal onResult={setRes} setErr={setErr} />

@@ -1,7 +1,51 @@
 import type { Config } from './config.js'
 import { repoAllowed } from './config.js'
 import { AgentError, b64, jfetch, unb64 } from './util.js'
-import { assertAgentBranch, validRepo } from './guard.js'
+import { assertAgentBranch, scanSecrets, validRepo } from './guard.js'
+
+export const GITHUB_RESOURCES: readonly string[] = ['pull_requests', 'issues', 'releases', 'tags', 'commits', 'workflows', 'metadata', 'checks']
+export const GITHUB_WRITE_OPS: readonly string[] = ['create_issue', 'comment', 'add_labels', 'close_issue', 'reopen_issue']
+export const SAFE_REF = /^[\w./-]{1,100}$/
+export interface WriteInput { number?: number; title?: string; body?: string; labels?: string[] }
+
+// Free text from GitHub is shown to the owner and stored in task results: clip it and withhold anything that looks like a secret.
+function safeText(v: unknown, max: number): string | null {
+  if (v === null || v === undefined) return null
+  const t = String(v)
+  if (scanSecrets(t).length) return '[withheld: possible secret]'
+  return t.length > max ? t.slice(0, max) + '...' : t
+}
+
+// Validates everything BEFORE a task is created or GitHub is called. Text that looks like a secret is refused, never sent.
+export function validateWrite(op: string, p: any): WriteInput {
+  if (!GITHUB_WRITE_OPS.includes(op)) throw new AgentError('Supported GitHub writes: ' + GITHUB_WRITE_OPS.join(', '), 400, 'bad_operation')
+  const out: WriteInput = {}
+  const text = (v: unknown, what: string, max: number, required: boolean) => {
+    const t = typeof v === 'string' ? v.trim() : ''
+    if (!t) { if (required) throw new AgentError(what + ' is required', 400, 'bad_input'); return undefined }
+    if (t.length > max) throw new AgentError(what + ' is too long (max ' + max + ' characters)', 400, 'bad_input')
+    if (scanSecrets(t).length) throw new AgentError(what + ' looks like it contains a secret or credential. Nothing was sent.', 403, 'secret_in_text')
+    return t
+  }
+  if (op !== 'create_issue') {
+    const n = Number(p.number)
+    if (!Number.isInteger(n) || n < 1 || n > 10_000_000) throw new AgentError('A valid issue or PR number is required', 400, 'bad_input')
+    out.number = n
+  }
+  if (op === 'create_issue') out.title = text(p.title, 'Title', 256, true)
+  if (op === 'create_issue' || op === 'comment') {
+    const b = text(p.body, 'Text', 8000, op === 'comment')
+    if (b !== undefined || op === 'comment') out.body = (b || '') + '\n\n_- via Blisscco Agent 2_'
+  }
+  if (op === 'add_labels' || op === 'create_issue') {
+    const raw = Array.isArray(p.labels) ? p.labels : []
+    const labels = raw.map((x: unknown) => String(x).trim()).filter(Boolean)
+    if (labels.length > 10 || labels.some((x: string) => x.length > 50 || /[\0\n\r]/.test(x))) throw new AgentError('Up to 10 labels, each up to 50 characters', 400, 'bad_input')
+    if (op === 'add_labels' && !labels.length) throw new AgentError('At least one label is required', 400, 'bad_input')
+    out.labels = labels
+  }
+  return out
+}
 
 export interface TreeEntry { path: string; mode: string; type: string; sha: string }
 export interface CommitFile { path: string; mode?: string; content?: string; sha?: string | null; delete?: boolean }
@@ -102,6 +146,89 @@ export class GitHub {
   async deleteBranch(repo: string, branch: string) {
     assertAgentBranch(branch, this.cfg.protectedBranches)
     await this.call('DELETE', `/repos/${this.repo(repo)}/git/refs/heads/${branch}`)
+  }
+
+  // Read-only GitHub developer surface. Resource names are an explicit allow-list; the caller cannot supply arbitrary API paths.
+  // Every resource is projected to a compact, fixed set of fields (no raw payloads), free text is length-limited and any text that
+  // looks like a secret is withheld. `collaborators` / permissions are intentionally NOT exposed (sensitive).
+  async developerResource(repo: string, resource: string, ref?: string) {
+    if (!GITHUB_RESOURCES.includes(resource)) throw new AgentError('Unsupported GitHub resource: ' + resource + '. Supported: ' + GITHUB_RESOURCES.join(', '), 400, 'bad_resource')
+    if (ref !== undefined && (!SAFE_REF.test(ref) || ref.includes('..'))) throw new AgentError('Unsafe ref: ' + ref, 400, 'bad_ref')
+    const r = this.repo(repo)
+    const user = (u: any) => (u && u.login ? String(u.login) : null)
+    const labels = (l: any) => ((l || []) as any[]).map(x => String(x && x.name !== undefined ? x.name : x)).slice(0, 20)
+    switch (resource) {
+      case 'pull_requests': {
+        const rows = (await this.call('GET', `/repos/${r}/pulls?state=all&per_page=30`)) as any[]
+        return { count: rows.length, items: rows.map(x => ({ number: x.number, title: safeText(x.title, 200), state: x.merged_at ? 'merged' : x.state, draft: Boolean(x.draft), author: user(x.user), head: x.head && x.head.ref, base: x.base && x.base.ref, labels: labels(x.labels), created_at: x.created_at, updated_at: x.updated_at, url: x.html_url, body: safeText(x.body, 300) })) }
+      }
+      case 'issues': {
+        const rows = ((await this.call('GET', `/repos/${r}/issues?state=all&per_page=50`)) as any[]).filter(x => !x.pull_request) // this endpoint also lists PRs
+        return { count: rows.length, items: rows.map(x => ({ number: x.number, title: safeText(x.title, 200), state: x.state, author: user(x.user), labels: labels(x.labels), comments: x.comments, created_at: x.created_at, updated_at: x.updated_at, url: x.html_url, body: safeText(x.body, 300) })) }
+      }
+      case 'releases': {
+        const rows = (await this.call('GET', `/repos/${r}/releases?per_page=30`)) as any[]
+        return { count: rows.length, items: rows.map(x => ({ name: safeText(x.name, 200), tag: x.tag_name, draft: Boolean(x.draft), prerelease: Boolean(x.prerelease), author: user(x.author), published_at: x.published_at, url: x.html_url, body: safeText(x.body, 300) })) }
+      }
+      case 'tags': {
+        const rows = (await this.call('GET', `/repos/${r}/tags?per_page=100`)) as any[]
+        return { count: rows.length, items: rows.map(x => ({ name: x.name, sha: x.commit && x.commit.sha })) }
+      }
+      case 'commits': {
+        const rows = (await this.call('GET', `/repos/${r}/commits?${ref ? 'sha=' + encodeURIComponent(ref) + '&' : ''}per_page=30`)) as any[]
+        return { ref: ref || 'default branch', count: rows.length, items: rows.map(x => ({ sha: x.sha, message: safeText(String(x.commit && x.commit.message || '').split('\n')[0], 200), author: x.commit && x.commit.author && x.commit.author.name, date: x.commit && x.commit.author && x.commit.author.date, url: x.html_url })) }
+      }
+      case 'workflows': {
+        const b = await this.call('GET', `/repos/${r}/actions/workflows?per_page=100`)
+        const rows = (b.workflows || []) as any[]
+        return { count: rows.length, items: rows.map(x => ({ id: x.id, name: x.name, path: x.path, state: x.state })) }
+      }
+      case 'metadata': {
+        const x = await this.call('GET', `/repos/${r}`)
+        return { full_name: x.full_name, description: safeText(x.description, 300), private: Boolean(x.private), visibility: x.visibility || null, default_branch: x.default_branch, language: x.language, archived: Boolean(x.archived), topics: x.topics || [], open_issues: x.open_issues_count, stars: x.stargazers_count, forks: x.forks_count, size_kb: x.size, license: x.license && x.license.spdx_id || null, created_at: x.created_at, pushed_at: x.pushed_at, url: x.html_url }
+      }
+      case 'checks': {
+        // Resolve the branch to a commit SHA first (branch names with "/" are not safe in this endpoint's path).
+        let sha = ref && /^[0-9a-f]{40}$/i.test(ref) ? ref : ''
+        if (!sha) {
+          const branch = ref || (await this.info(repo)).default_branch
+          const found = await this.branchSha(repo, branch)
+          if (!found) throw new AgentError('Branch not found: ' + branch, 404, 'branch_not_found')
+          sha = found
+        }
+        const b = await this.call('GET', `/repos/${r}/commits/${sha}/check-runs?per_page=100`)
+        const rows = (b.check_runs || []) as any[]
+        return { ref: ref || 'default branch', sha, total: b.total_count, items: rows.map(x => ({ name: x.name, status: x.status, conclusion: x.conclusion, started_at: x.started_at, completed_at: x.completed_at, url: x.html_url })) }
+      }
+    }
+    throw new AgentError('Unsupported GitHub resource: ' + resource, 400, 'bad_resource')
+  }
+
+  // ---- issue / comment writes (low risk, reversible; never touch code, branches, releases, tags, settings or secrets) ----
+  async writeIssueOp(repo: string, op: string, i: WriteInput): Promise<any> {
+    const r = this.repo(repo)
+    switch (op) {
+      case 'create_issue': {
+        const b = await this.call('POST', `/repos/${r}/issues`, { title: i.title, body: i.body, labels: i.labels })
+        return { created: 'issue', number: b.number, url: b.html_url }
+      }
+      case 'comment': {
+        const b = await this.call('POST', `/repos/${r}/issues/${i.number}/comments`, { body: i.body })
+        return { created: 'comment', number: i.number, url: b.html_url }
+      }
+      case 'add_labels': {
+        const b = await this.call('POST', `/repos/${r}/issues/${i.number}/labels`, { labels: i.labels })
+        return { number: i.number, labels: ((b || []) as any[]).map(x => String(x.name)) }
+      }
+      case 'close_issue': case 'reopen_issue': {
+        const cur = await this.call('GET', `/repos/${r}/issues/${i.number}`)
+        // Closing a pull request would break the approval/merge flow: PRs are handled only through Propose / Promote / Rollback.
+        if (cur.pull_request) throw new AgentError('#' + i.number + ' is a pull request. Pull requests are closed or merged only through the approval flow.', 409, 'is_pull_request')
+        const b = await this.call('PATCH', `/repos/${r}/issues/${i.number}`, { state: op === 'close_issue' ? 'closed' : 'open' })
+        return { number: i.number, state: b.state, url: b.html_url }
+      }
+    }
+    throw new AgentError('Unsupported GitHub write: ' + op, 400, 'bad_operation')
   }
 
   // ---- monitoring (read) ----
