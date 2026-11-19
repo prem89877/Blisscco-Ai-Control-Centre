@@ -5,7 +5,7 @@ import { usePoll, q, Badge, Err, logAction } from './ui.jsx'
 // One decision path for every screen: the same update the Approvals tab always did (only a still-pending row can be decided,
 // and RLS / the server re-check it). Approving here changes nothing about what runs afterwards; apply / confirm steps and
 // their PRODUCTION / SENSITIVE ticks stay exactly where they were.
-const NEEDS_CONFIRM = ['promote', 'rollback', 'workflow_run', 'db_change', 'env_change', 'redeploy', 'git_push', 'rate_test']
+const NEEDS_CONFIRM = ['promote', 'rollback', 'workflow_run', 'db_change', 'env_change', 'redeploy', 'git_push', 'rate_test', 'ads_burst']
 
 export async function decideApproval(id, status, { title = 'Approval', note = null, task_id = null, agent_id = null } = {}) {
   const { data: s } = await supabase.auth.getSession()

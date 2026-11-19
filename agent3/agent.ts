@@ -10,7 +10,7 @@ import type { Finding } from './checks.js'
 
 export interface Actor { type: 'user' | 'system'; id: string | null }
 export interface Ctx { cfg: Config; store: Store; actor: Actor; calls: Record<string, number>; adopt?: string; worker?: boolean; exec?: ExecFn }
-export const ACTIONS = ['heartbeat', 'github_branches', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task', 'queue_local', 'request_local_command', 'queue_local_command', 'local_check', 'local_command', 'ads_routes_check', 'match_route_check'] as const
+export const ACTIONS = ['heartbeat', 'github_branches', 'website_smoke', 'auth_check', 'api_test', 'db_test', 'security_scan', 'full_report', 'request_rate_test', 'apply_rate_test', 'retest', 'ai_command', 'queue_task', 'queue_local', 'request_local_command', 'queue_local_command', 'local_check', 'local_command', 'ads_routes_check', 'match_route_check', 'request_ads_burst', 'apply_ads_burst'] as const
 export type Action = typeof ACTIONS[number]
 export function makeCtx(cfg: Config, actor: Actor): Ctx { return { cfg, store: new Store(cfg), actor, calls: {} } }
 export const now = () => new Date().toISOString()
@@ -236,6 +236,79 @@ async function safeRouteCheck(ctx: Ctx, mode: 'ads' | 'match'): Promise<Out> {
     // FAIL (an unexpected status was seen) always wins over BLOCKED; PASS only when every route answered as expected.
     const verdict = findings.length ? 'FAIL' : blocked || evidence.length !== cases.length ? 'BLOCKED' : 'PASS'
     const base = report(title, findings, evidence, { target: BLISSCCO_PRODUCTION, understood, rate_limit: rate, stopped_critical: stopped, ...(blocked ? { reason: 'route unreachable' } : {}), billing_safety: 'No API key, user token or valid ref used. No billable event, ledger, payment or database write requested.' })
+    return { result: { ...base, verdict } }
+  })
+}
+
+// ---------------------------------------------------------------- rate-limit burst (OFF by default, approval every run, hard cap 40, stops at first 429)
+const BURST_ROUTES = [ROUTE_CASES.impression, ROUTE_CASES.click]
+async function requestAdsBurst(ctx: Ctx, p: any): Promise<Out> {
+  if (!(p.enabled === true || p.enabled === 'true')) throw new AgentError('Rate-limit burst is OFF by default. Switch it on first, then request approval.', 403, 'burst_off')
+  const n = hardBurstCap(p.requests === undefined || p.requests === '' ? MAX_BURST_REQUESTS : p.requests)
+  if (n < 2) throw new AgentError('requests must be between 2 and ' + MAX_BURST_REQUESTS, 400, 'bad_request')
+  return withTask(ctx, 'request_ads_burst', 'Rate-limit burst (ads routes) x' + n, { target: BLISSCCO_PRODUCTION, requests: n }, async taskId => {
+    const details = { kind: 'ads_burst', target: BLISSCCO_PRODUCTION, routes: ['POST /api/v1/ads/impression', 'GET /api/v1/ads/click?ref=invalid_qa_ref'], requests: n, production: true, note: `Sends up to ${n} invalid, credential-free requests (alternating impression POST and click GET) to ${BLISSCCO_PRODUCTION}. Stops immediately at the first 429. No valid key, token or ref; nothing can be billed or written.` }
+    const ap = await ctx.store.createApproval({ task_id: taskId, title: `Rate-limit burst: ads impression + click x${n}`, details })
+    await ctx.store.log('warn', 'agent3_approval_requested', ap.id, { approval_id: ap.id }, taskId, ctx.actor.id)
+    return { status: 'awaiting_approval', result: { approval_id: ap.id, next: 'Approve in the Approvals tab, then press Run burst in the Agent 3 console.' } }
+  })
+}
+async function applyAdsBurst(ctx: Ctx, p: any): Promise<Out> {
+  const ap = await ctx.store.getApproval(String(p.approval_id || ''))
+  const d = ap && ap.details
+  if (!ap || !d || d.kind !== 'ads_burst') throw new AgentError('Approval not found', 404, 'not_found')
+  if (ap.status !== 'approved') throw new AgentError('Not approved yet (status: ' + ap.status + ')', 409, 'not_approved')
+  if (d.executed_at) throw new AgentError('Already executed', 409, 'already_executed')
+  if (!ap.decided_at || Date.now() - new Date(ap.decided_at).getTime() > 24 * 3600 * 1000) throw new AgentError('Approval older than 24h; request again', 409, 'expired')
+  if (p.production_ack !== 'APPROVE-PRODUCTION') throw new AgentError('Needs explicit confirmation (production_ack)', 403, 'production_ack')
+  if (d.target !== BLISSCCO_PRODUCTION) throw new AgentError('Target not allowed (production whitelist only)', 403, 'route_blocked')
+  const total = hardBurstCap(d.requests)   // hard cap 40, even if the stored approval was tampered with
+  if (total < 2) throw new AgentError('Invalid request count in approval', 409, 'bad_approval')
+  return withTask(ctx, 'apply_ads_burst', 'Rate-limit burst (ads routes)', { approval_id: ap.id }, async () => {
+    const claimed = await ctx.store.claimApproval(ap.id, { ...d, executed_at: now(), executed_by: ctx.actor.id })
+    if (!claimed) throw new AgentError('Already executed', 409, 'already_executed')
+    const statuses: Record<string, number> = {}, byRoute: Record<string, Record<string, number>> = {}
+    const findings: Finding[] = []
+    let sent = 0, first429: number | null = null, retryAfter: string | null = null, has5xx = false, stop = `completed all ${total} requests`, unreachable = false, halted = false
+    for (let i = 0; i < total && !halted; i++) {   // one at a time, so we can stop the moment a 429 arrives
+      const route = BURST_ROUTES[i % BURST_ROUTES.length]
+      const url = BLISSCCO_PRODUCTION + route.path
+      const init: RequestInit = { ...route.init, headers: { 'User-Agent': 'BlisccoQA/1.0 (+read-only test)', ...((route.init as any).headers || {}) }, redirect: 'manual' } as RequestInit
+      const pathname = assertRouteAllowed(route.method, url)
+      assertNoCredentials(init)
+      bump(ctx, 'target_http')
+      const pr = await probe(url, init, 10000)
+      const label = `${route.method} ${pathname}`
+      if (pr.status === 0) { unreachable = true; stop = `route unreachable at request ${sent + 1} (${label})`; break }
+      sent++
+      statuses[pr.status] = (statuses[pr.status] || 0) + 1
+      byRoute[label] = byRoute[label] || {}; byRoute[label][pr.status] = (byRoute[label][pr.status] || 0) + 1
+      if (pr.status === 429) {
+        first429 = sent; retryAfter = pr.headers['retry-after'] ? String(pr.headers['retry-after']).slice(0, 40) : null
+        stop = `stopped at first 429 (request ${sent}, ${label})`; halted = true
+      } else if (pr.status === 200 || pr.status === 302) {
+        findings.push({ id: 'route.unsafe_acceptance', area: 'api', severity: 'critical', title: 'Safe negative request unexpectedly accepted or redirected', evidence: `${label} returned ${pr.status} at request ${sent}`, fix: 'Investigate route authentication/validation immediately.', target: pathname })
+        stop = `stopped: critical ${pr.status} at request ${sent} (${label})`; halted = true
+      } else if (!(route.expected as readonly number[]).includes(pr.status)) {
+        if (pr.status >= 500) has5xx = true
+        findings.push({ id: 'route.unexpected_status', area: 'api', severity: 'high', title: 'Unexpected route status during burst', evidence: `${label} returned ${pr.status}; expected ${(route.expected as readonly number[]).join('/')}`, fix: 'Review route validation and authentication.', target: pathname })
+        stop = `stopped: unexpected ${pr.status} at request ${sent} (${label})`; halted = true
+      }
+    }
+    if (!halted && !unreachable) findings.push(...C.analyzeRate('/api/v1/ads/impression + click', { total: sent, statuses, first429, hasRetryAfter: false, has5xx }))
+    else if (first429 != null) findings.push(...C.analyzeRate('/api/v1/ads/impression + click', { total: sent, statuses, first429, hasRetryAfter: Boolean(retryAfter), has5xx }))
+    const at = now()
+    const evidence: Ev[] = Object.entries(byRoute).map(([k, v]) => ({ check: 'Burst ' + k, ok: !findings.some(f => f.severity === 'critical' || f.severity === 'high'), detail: `status counts ${JSON.stringify(v)}; time ${at}` }))
+    evidence.push({ check: 'Burst stop reason', ok: !unreachable, detail: `${stop}; sent ${sent}/${total}; Retry-After ${retryAfter || 'none'}; time ${at}` })
+    const bad = findings.some(f => f.severity === 'critical' || f.severity === 'high')
+    const verdict = bad ? 'FAIL' : unreachable && sent === 0 ? 'BLOCKED' : findings.length ? 'ATTENTION' : 'PASS'
+    const base = report('Rate-limit burst (ads impression + click)', findings, evidence, {
+      target: BLISSCCO_PRODUCTION, understood: 'Rate-limit burst: ads impression + click (invalid requests only, hard cap 40)',
+      status_counts: statuses, by_route: byRoute, requests_sent: sent, request_cap: MAX_BURST_REQUESTS, requests_planned: total, stopped: stop, retry_after: retryAfter,
+      rate_limit: first429 != null ? `DETECTED: 429 at request ${first429}; Retry-After ${retryAfter || 'not sent'}` : `NOT DETECTED in ${sent} requests`,
+      ...(unreachable ? { reason: 'route unreachable' } : {}),
+      billing_safety: 'No API key, user token or valid ref used. Only invalid requests. No billable event, ledger, payment or database write requested.'
+    })
     return { result: { ...base, verdict } }
   })
 }
@@ -697,6 +770,8 @@ export async function runAction(ctx: Ctx, action: string, params: any = {}): Pro
     case 'full_report': return fullReport(ctx, params)
     case 'request_rate_test': return requestRateTest(ctx, params)
     case 'apply_rate_test': return applyRateTest(ctx, params)
+    case 'request_ads_burst': return requestAdsBurst(ctx, params)
+    case 'apply_ads_burst': return applyAdsBurst(ctx, params)
     case 'retest': return retest(ctx, params)
     case 'ai_command': return aiCommand(ctx, params)
     case 'queue_task': return queueTask(ctx, params)

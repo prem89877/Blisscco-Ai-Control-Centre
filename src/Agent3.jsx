@@ -52,6 +52,7 @@ function Report({ res, onRetest }) {
       {u && <CodeBlock label={'understood: ' + (typeof u === 'string' ? u : u.intent)} tone="info" text={typeof u === 'string' ? u : (u.explanation || u.intent)} />}
       {r.unsupported && <CodeBlock label="not done" tone="warn" text={r.message} />}
       {r.verdict && <div className="sub" style={{ margin: '6px 0' }}>Verdict: <b>{String(r.verdict).toUpperCase()}</b>{r.reason ? ' (' + r.reason + ')' : ''}{r.tests_run != null && <> | {r.tests_passed}/{r.tests_run} checks ok</>}{r.counts && <> | critical {c.critical} | high {c.high} | medium {c.medium} | low {c.low}</>}</div>}
+      {r.status_counts && <CodeBlock label={'status codes (' + (r.requests_sent || 0) + '/' + (r.request_cap || 40) + ' max sent)'} tone="info" wrap={false} text={[...Object.entries(r.status_counts).map(([k, n]) => k + ': ' + n), 'stopped: ' + r.stopped, 'Retry-After: ' + (r.retry_after || 'none')].join('\n')} />}
       {r.rate_limit && <CodeBlock label="rate limit" tone={String(r.rate_limit).startsWith('NOT TESTED') ? 'info' : 'warn'} text={r.rate_limit} />}
       {r.ai_summary && <CodeBlock label="ai summary" tone="info" text={r.ai_summary} />}
       {r.ai_note && <CodeBlock label="ai note" tone="warn" text={'AI summary unavailable: ' + r.ai_note} />}
@@ -95,9 +96,10 @@ function Pick({ options, value, set, empty }) {
 function Apply({ a, onDone, onResult, setErr }) {
   const [ack, setAck] = useState(false)
   const [busy, setBusy] = useState(false)
+  const burst = a.details && a.details.kind === 'ads_burst'
   async function go() {
     setBusy(true); setErr('')
-    try { onResult(await callAgent3('apply_rate_test', { approval_id: a.id, production_ack: ack ? 'APPROVE-PRODUCTION' : undefined })); onDone() }
+    try { onResult(await callAgent3(burst ? 'apply_ads_burst' : 'apply_rate_test', { approval_id: a.id, production_ack: ack ? 'APPROVE-PRODUCTION' : undefined })); onDone() }
     catch (e) { setErr(e.message) }
     setBusy(false)
   }
@@ -105,8 +107,8 @@ function Apply({ a, onDone, onResult, setErr }) {
     <div className="card">
       <div className="row"><b>{a.title}</b><Badge s="approved" /></div>
       <div className="sub">{a.details.note}</div>
-      <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> I confirm this burst test on the live site</label>
-      <button className="btn ok" disabled={busy || !ack} onClick={go}>{busy ? 'Running...' : 'Run rate test'}</button>
+      <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} style={{ width: 'auto' }} /> I confirm this burst test on the live site (invalid requests only, stops at first 429)</label>
+      <button className="btn ok" disabled={busy || !ack} onClick={go}>{busy ? 'Running...' : burst ? 'Run burst' : 'Run rate test'}</button>
     </div>
   )
 }
@@ -171,13 +173,15 @@ export default function Agent3Panel() {
   const [busy, setBusy] = useState('')
   const [text, setText] = useState('')
   const [ratePath, setRatePath] = useState('')
+  const [burstOn, setBurstOn] = useState(false) // default OFF, never remembered
+  const [burstN, setBurstN] = useState('40')
   const [where, setWhere] = useState('vercel')
   const [queuedId, setQueuedId] = useState('')
 
   useEffect(() => { callAgent3('heartbeat').then(setHb).catch(e => setErr(e.message)) }, [])
   const { data: ready, reload } = usePoll(() =>
     q(supabase.from('approvals').select('*').eq('status', 'approved').order('decided_at', { ascending: false }).limit(30)), [], 15000)
-  const rows = (ready || []).filter(a => a.details && a.details.kind === 'rate_test' && !a.details.executed_at)
+  const rows = (ready || []).filter(a => a.details && ['rate_test', 'ads_burst'].includes(a.details.kind) && !a.details.executed_at)
   const localRows = (ready || []).filter(a => a.details && a.details.kind === 'local_command' && !a.details.executed_at)
   const targets = (hb && hb.targets) || []
   const repos = (hb && hb.repos) || []
@@ -221,7 +225,7 @@ export default function Agent3Panel() {
       )}
       <BranchSelector agent="agent3" repos={repos} initialRepo={repos[0] || ''} call={callAgent3} />
       {res && <Report res={res} onRetest={id => run('retest', { task_id: id })} />}
-      <PendingInline kinds={['rate_test', 'local_command']} onDone={reload} />
+      <PendingInline kinds={['rate_test', 'ads_burst', 'local_command']} onDone={reload} />
       {rows.length > 0 && <><div className="sec-title">Approved - ready to run</div>{rows.map(a => <Apply key={a.id} a={a} onDone={reload} onResult={setRes} setErr={setErr} />)}</>}
       <div className="card">
         <b>Run a test</b> <span className="sub">(read-only; nothing is billed or written)</span>
@@ -244,6 +248,12 @@ export default function Agent3Panel() {
         <b>Ask Agent 3</b> <span className="sub">(supported checks only; unsupported requests are BLOCKED)</span>
         <textarea rows={2} placeholder="e.g. api test karo / security check chalao" value={text} onChange={e => setText(e.target.value)} />
         <button className="btn" disabled={!!busy || !text.trim()} onClick={async () => { setBusy('ask'); setErr(''); try { setRes(await callAgent3('ai_command', { text })); setText('') } catch (e) { setErr(e.message) } setBusy('') }}>{busy === 'ask' ? 'Thinking...' : 'Do it'}</button>
+      </div>
+      <div className="card">
+        <b>Rate-limit burst</b> <span className="sub">(OFF by default; ads impression + click; invalid requests only; stops at first 429; hard cap 40; approval every run)</span>
+        <label className="sub" style={{ display: 'block', margin: '8px 0' }}><input type="checkbox" checked={burstOn} onChange={e => setBurstOn(e.target.checked)} style={{ width: 'auto' }} /> Enable burst test (this visit only)</label>
+        <input type="number" min="2" max="40" value={burstN} onChange={e => setBurstN(e.target.value)} disabled={!burstOn} />
+        <button className="btn ghost" disabled={!!busy || !burstOn} onClick={async () => { await run('request_ads_burst', { enabled: true, requests: Math.min(40, Math.max(2, Number(burstN) || 40)) }); setBurstOn(false) }}>{busy === 'request_ads_burst' ? 'Requesting...' : 'Rate-limit burst'}</button>
       </div>
       <div className="card">
         <b>Optional burst test</b> <span className="sub">(OFF by default; separate approval + confirmation; hard cap 40 requests)</span>

@@ -768,3 +768,87 @@ test('Agent 3 marks unreachable route BLOCKED without retrying', async () => {
     assert.equal(r.result.evidence.length, 1)
   } finally { globalThis.fetch = original }
 })
+
+// ---------------------------------------------------------------- Rate-limit burst (ads impression + click)
+async function approvedBurst(requests?: number) {
+  const req = await runAction(ctx(), 'request_ads_burst', { enabled: true, ...(requests === undefined ? {} : { requests }) })
+  Object.assign(db.approvals.find(a => a.id === req.result.approval_id)!, { status: 'approved', decided_at: new Date().toISOString() })
+  return req.result.approval_id as string
+}
+const ACK = { production_ack: 'APPROVE-PRODUCTION' }
+function limitAt(n: number | null, status = 429, extra: Record<string, string> = { 'retry-after': '30' }) {
+  let c = 0; const original = globalThis.fetch
+  globalThis.fetch = (async (input: any, init: any = {}) => {
+    const u = new URL(String(input))
+    if (u.origin === 'https://blisscco.online' && n && ++c >= n) {
+      siteCalls.push({ method: String(init.method || 'GET').toUpperCase(), path: u.pathname + u.search, headers: {} })
+      return new Response('{}', { status, headers: extra })
+    }
+    return fake(input, init)
+  }) as any
+  return () => { globalThis.fetch = original }
+}
+test('Burst is OFF by default: no request, no approval, no traffic unless explicitly enabled', async () => {
+  await assert.rejects(() => runAction(ctx(), 'request_ads_burst', {}), (e: any) => e.code === 'burst_off')
+  await assert.rejects(() => runAction(ctx(), 'request_ads_burst', { enabled: false, requests: 10 }), (e: any) => e.code === 'burst_off')
+  assert.equal(siteCalls.length, 0); assert.equal((db.approvals || []).length, 0)
+})
+test('Burst needs approval every run + production ack, is single-use, and request count is capped at 40', async () => {
+  const req = await runAction(ctx(), 'request_ads_burst', { enabled: true, requests: 500 })
+  assert.equal(req.status, 'awaiting_approval'); assert.equal(siteCalls.length, 0)
+  assert.equal(db.approvals[0].details.requests, 40); assert.equal(db.approvals[0].details.kind, 'ads_burst')
+  const id = req.result.approval_id
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK }), /Not approved/)
+  Object.assign(db.approvals[0], { status: 'approved', decided_at: new Date().toISOString() })
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id }), /confirmation/)
+  assert.equal(siteCalls.length, 0)
+  const run = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
+  assert.ok(run.result.requests_sent <= 40)
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK }), /Already executed/)
+})
+test('Burst stops immediately at the first 429 and reports status counts + Retry-After', async () => {
+  const id = await approvedBurst(40)
+  const restore = limitAt(7)
+  try {
+    const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
+    assert.equal(siteCalls.length, 7)
+    assert.deepEqual(r.result.status_counts, { 400: 3, 404: 3, 429: 1 })
+    assert.equal(r.result.retry_after, '30'); assert.match(r.result.rate_limit, /429 at request 7.*Retry-After 30/)
+    assert.match(r.result.stopped, /first 429/); assert.equal(r.result.verdict, 'PASS')
+    assert.ok(r.result.evidence.every((e: any) => /time /.test(e.detail)))
+    assert.deepEqual([...new Set(siteCalls.map(c => c.path.split('?')[0]))].sort(), ['/api/v1/ads/click', '/api/v1/ads/impression'])
+    assert.ok(siteCalls.every(c => !c.headers.authorization && !c.headers['x-api-key']))
+  } finally { restore() }
+})
+test('Burst never exceeds 40 requests even if the stored approval says more; no 429 -> ATTENTION', async () => {
+  const id = await approvedBurst(10)
+  db.approvals[0].details.requests = 100000
+  const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
+  assert.equal(siteCalls.length, 40); assert.equal(r.result.requests_sent, 40)
+  assert.deepEqual(r.result.status_counts, { 400: 20, 404: 20 })
+  assert.equal(r.result.verdict, 'ATTENTION'); assert.match(r.result.rate_limit, /NOT DETECTED/)
+  assert.ok(r.result.findings.some((f: any) => f.id === 'rate.none'))
+})
+test('Burst stops at once and FAILS (critical) on 200 or 302; 5xx also stops', async () => {
+  for (const status of [200, 302, 503]) {
+    siteCalls = []; db.approvals = []
+    const id = await approvedBurst(40)
+    const restore = limitAt(1, status, {})
+    try {
+      const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK })
+      assert.equal(siteCalls.length, 1, 'status ' + status); assert.equal(r.result.verdict, 'FAIL')
+      if (status !== 503) assert.equal(r.result.findings[0].severity, 'critical')
+    } finally { restore() }
+  }
+})
+test('Burst refuses a non-production target in the approval and never exposes secrets', async () => {
+  const id = await approvedBurst(10)
+  db.approvals[0].details.target = 'https://evil.example'
+  await assert.rejects(() => runAction(ctx(), 'apply_ads_burst', { approval_id: id, ...ACK }), (e: any) => e.code === 'route_blocked')
+  assert.equal(siteCalls.length, 0); assert.deepEqual(otherHostCalls, [])
+  siteCalls = []; db.approvals = []; db.tasks = []
+  const id2 = await approvedBurst(6)
+  const r = await runAction(ctx(), 'apply_ads_burst', { approval_id: id2, ...ACK })
+  const out = JSON.stringify([r, db.tasks, db.activity_logs, db.api_usage, db.approvals])
+  for (const secret of [SERVICE, GEMKEY, TESTKEY, ENV.AGENT3_GITHUB_TOKEN, ENV.AGENT3_SUPABASE_ACCESS_TOKEN]) assert.ok(!out.includes(secret))
+})
